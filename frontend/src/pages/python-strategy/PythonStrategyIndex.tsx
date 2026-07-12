@@ -12,6 +12,7 @@ import {
   Play,
   Plus,
   RefreshCw,
+  Square,
   Trash2,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'

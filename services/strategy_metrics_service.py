@@ -44,7 +44,9 @@ def _period_start(period: str):
 def _resolve_owner(strategy_id, strategy_configs):
     """(display_name, underlying_upper) for a strategy_id, or (None, None)."""
     cfg = strategy_configs.get(strategy_id) or {}
-    display = cfg.get("name")
+    display = cfg.get("name") or ""
+    if "(" in display:
+        display = display.split("(", 1)[0].strip()
     underlying = (cfg.get("underlying") or "").upper()
     return display, underlying
 

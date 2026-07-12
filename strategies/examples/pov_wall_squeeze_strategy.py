@@ -63,6 +63,9 @@ def _option_exchange(underlying: str) -> str:
 COOLDOWN_MINUTES = 15  # POV signal dedup cooldown (per-symbol action change)
 LOSS_STREAK_LIMIT = int(os.getenv('LOSS_STREAK_LIMIT', '3'))
 DAILY_LOSS_LIMIT_RS = float(os.getenv('DAILY_LOSS_LIMIT_RS', '10000'))
+# Safety-net exits (prevent slow-bleed when SL is cancelled/orphaned by restart)
+MAX_HOLD_MINUTES = int(os.getenv('MAX_HOLD_MINUTES', '45'))  # close if held longer than this without hitting T1
+DECAY_EXIT_PCT = float(os.getenv('DECAY_EXIT_PCT', '0.60'))  # close if LTP < this fraction of entry price
 
 # Symbol lock dir (shared across all strategies on this host)
 LOCKS_DIR = Path("log") / "strategies" / "locks"
@@ -647,6 +650,46 @@ def run_strategy():
                             release_symbol_lock(symbol, STRATEGY_NAME)
                             del positions[symbol]
 
+                    # ── Safety-net exits: max-hold-time and premium-decay ──
+                    # Prevents slow-bleed when SL is cancelled (e.g. by RECONCILE on restart)
+                    # and position sits unmonitored. Based on live evidence 2026-07-02:
+                    # 3 SENSEX PE legs held 3+ hours lost 75-80% because SLs were cancelled
+                    # at process restart and nobody closed them until premiums hit near-zero.
+                    if symbol in positions and len(df_opt) >= 2:
+                        opt_ltp = float(df_opt.iloc[-2]["close"])
+                        entry_opt_price = pos.get("entry_opt_price")
+                        entry_time = pos.get("entry_time")
+                        _force_exit = None
+                        # Max-hold: close if held > MAX_HOLD_MINUTES without hitting T1
+                        if entry_time is not None:
+                            hold_mins = (datetime.now() - entry_time).total_seconds() / 60.0
+                            if hold_mins >= MAX_HOLD_MINUTES:
+                                _force_exit = f"Max-hold exit ({hold_mins:.0f}min ≥ {MAX_HOLD_MINUTES}min)"
+                        # Premium-decay: close if LTP < DECAY_EXIT_PCT of entry
+                        if _force_exit is None and entry_opt_price is not None and entry_opt_price > 0:
+                            if opt_ltp < entry_opt_price * DECAY_EXIT_PCT:
+                                _force_exit = f"Decay exit (LTP {opt_ltp:.2f} < {DECAY_EXIT_PCT:.0%} of entry {entry_opt_price:.2f})"
+                        if _force_exit:
+                            log.warning(f"!!! {_force_exit} !!! Closing {symbol}...")
+                            if sl_oid:
+                                safe_cancel_order(sl_oid, context=f"force-exit-{symbol}")
+                            exit_resp = client.placeorder(
+                                strategy=STRATEGY_NAME, symbol=symbol, action="SELL",
+                                exchange=opt_exchange, price_type="MARKET",
+                                product=PRODUCT, quantity=pos.get("qty", QUANTITY)
+                            )
+                            log.info(f"Force-exit order response: {exit_resp}")
+                            if entry_opt_price is not None:
+                                trade_pnl = (opt_ltp - entry_opt_price) * pos.get("qty", QUANTITY)
+                                if trade_pnl < 0:
+                                    consecutive_losses += 1
+                                    daily_loss_rs += abs(trade_pnl)
+                                    log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak: {consecutive_losses} | Daily losses: ₹{daily_loss_rs:.0f}")
+                                else:
+                                    consecutive_losses = 0
+                                    log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak reset")
+                            release_symbol_lock(symbol, STRATEGY_NAME)
+                            del positions[symbol]
                     continue  # skip entry check while in a position
 
                 # 5. Trigger trades on STRONG / WATCH transitions
@@ -714,6 +757,7 @@ def run_strategy():
                                 "sl_orderid": sl_orderid,
                                 "target_price": res["t1"],
                                 "entry_opt_price": entry_opt_price,
+                                "entry_time": datetime.now(),
                             }
                             log.info(f"Trade entered: {symbol} | SL: {res['sl']} | T1: {res['t1']} | T2: {res['t2']} | T3: {res['t3']} | Opt entry: {entry_opt_price}")
                         else:

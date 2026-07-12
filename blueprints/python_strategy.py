@@ -2889,6 +2889,34 @@ def api_get_strategy_status(strategy_id):
     })
 
 
+@python_strategy_bp.route("/api/strategy/<strategy_id>/metrics")
+@check_session_validity
+def api_get_strategy_metrics(strategy_id):
+    """API: Strategy-wise performance / trades / positions.
+    Query param: period=today|week|month|all (default week)."""
+    if strategy_id not in STRATEGY_CONFIGS:
+        return jsonify({"status": "error", "message": "Strategy not found"}), 404
+
+    period = request.args.get("period", "week")
+    try:
+        from services.strategy_metrics_service import get_strategy_metrics
+        # Resolve an API key for live-mode data source (analyzer mode ignores it)
+        api_key = None
+        try:
+            from database.auth_db import get_first_available_api_key
+            api_key = get_first_available_api_key()
+        except Exception:
+            pass
+        user_id = STRATEGY_CONFIGS[strategy_id].get("user_id", "nikhil")
+        result = get_strategy_metrics(
+            strategy_id, STRATEGY_CONFIGS, user_id=user_id,
+            period=period, api_key=api_key,
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.exception(f"Error computing metrics for {strategy_id}: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 @python_strategy_bp.route("/api/strategy/<strategy_id>/max-lots", methods=["POST"])
 @check_session_validity
 def api_save_max_lots(strategy_id):

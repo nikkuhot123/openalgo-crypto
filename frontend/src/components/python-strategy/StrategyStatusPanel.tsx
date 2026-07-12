@@ -12,7 +12,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Collapsible, CollapsibleTrigger, CollapsibleContent } from '@/components/ui/collapsible'
 import { pythonStrategyApi } from '@/api/python-strategy'
-import type { PythonStrategy, StrategyStatus, ActiveTrade } from '@/types/python-strategy'
+import type { PythonStrategy, StrategyStatus, ActiveTrade, StrategyMetrics } from '@/types/python-strategy'
 
 const STATE_BADGE_CLASSES: Record<string, string> = {
   IDLE: 'bg-blue-500/15 text-blue-700 border-blue-500/25 dark:text-blue-400',
@@ -140,7 +140,17 @@ interface StrategyStatusPanelProps {
 export default function StrategyStatusPanel({ strategy }: StrategyStatusPanelProps) {
   const [isOpen, setIsOpen] = useState(false)
   const [status, setStatus] = useState<StrategyStatus | null>(null)
+  const [metrics, setMetrics] = useState<StrategyMetrics | null>(null)
+  const [period, setPeriod] = useState<'today' | 'week' | 'all'>('week')
 
+  const fetchMetrics = useCallback(async () => {
+    try {
+      const data = await pythonStrategyApi.getStrategyMetrics(strategy.id, period)
+      setMetrics(data)
+    } catch {
+      // ignore
+    }
+  }, [strategy.id, period])
   const fetchStatus = useCallback(async () => {
     try {
       const data = await pythonStrategyApi.getStrategyStatus(strategy.id)
@@ -155,10 +165,15 @@ export default function StrategyStatusPanel({ strategy }: StrategyStatusPanelPro
 
     // Fetch immediately on open
     fetchStatus()
+    fetchMetrics()
 
     const intervalId = setInterval(fetchStatus, 3000)
-    return () => clearInterval(intervalId)
-  }, [isOpen, fetchStatus])
+    const metricsIntervalId = setInterval(fetchMetrics, 15000)
+    return () => {
+      clearInterval(intervalId)
+      clearInterval(metricsIntervalId)
+    }
+  }, [isOpen, fetchStatus, fetchMetrics])
 
   const isRunning = strategy.status === 'running'
   const state = status?.state ?? (isRunning ? 'IDLE' : 'INACTIVE')
@@ -237,6 +252,138 @@ export default function StrategyStatusPanel({ strategy }: StrategyStatusPanelPro
                       <code className="text-xs text-green-400 font-mono whitespace-pre">
                         {status.last_log_message}
                       </code>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Performance, Trades, and Positions sections */}
+            {metrics && (
+              <div className="border-t pt-4 mt-4 space-y-4">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-sm font-semibold flex items-center gap-2">
+                    <Target className="h-4 w-4 text-blue-500" />
+                    Performance &amp; History
+                  </h4>
+                  <div className="flex gap-1 bg-muted p-0.5 rounded-md text-xs">
+                    {(['today', 'week', 'all'] as const).map((p) => (
+                      <button
+                        key={p}
+                        type="button"
+                        onClick={() => setPeriod(p)}
+                        className={`px-2.5 py-1 rounded-sm capitalize transition-colors ${
+                          period === p
+                            ? 'bg-background text-foreground shadow-sm'
+                            : 'text-muted-foreground hover:text-foreground'
+                        }`}
+                      >
+                        {p}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Metrics Grid */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  <div className="rounded-md border p-3">
+                    <p className="text-xs text-muted-foreground font-medium">Realized P&amp;L</p>
+                    <span className={`text-sm font-semibold mt-0.5 block ${
+                      metrics.performance.realized_pnl >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'
+                    }`}>
+                      ₹{metrics.performance.realized_pnl >= 0 ? '+' : ''}{metrics.performance.realized_pnl.toFixed(2)}
+                    </span>
+                  </div>
+                  <div className="rounded-md border p-3">
+                    <p className="text-xs text-muted-foreground font-medium">Win Rate</p>
+                    <span className="text-sm font-semibold mt-0.5 block">
+                      {metrics.performance.win_rate.toFixed(1)}% ({metrics.performance.wins}W / {metrics.performance.losses}L)
+                    </span>
+                  </div>
+                  <div className="rounded-md border p-3">
+                    <p className="text-xs text-muted-foreground font-medium">Profit Factor</p>
+                    <span className="text-sm font-semibold mt-0.5 block">
+                      {metrics.performance.profit_factor === null ? '—' : 
+                       metrics.performance.profit_factor === Infinity ? '∞' : 
+                       metrics.performance.profit_factor.toFixed(2)}
+                    </span>
+                  </div>
+                  <div className="rounded-md border p-3">
+                    <p className="text-xs text-muted-foreground font-medium">Total Trades</p>
+                    <span className="text-sm font-semibold mt-0.5 block">
+                      {metrics.performance.trades}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Open Positions (Database / Live) */}
+                {metrics.positions.length > 0 && (
+                  <div className="space-y-2">
+                    <h5 className="text-xs font-semibold uppercase text-muted-foreground tracking-wider">Open Positions (DB)</h5>
+                    <div className="rounded-md border overflow-hidden">
+                      <table className="w-full text-xs text-left">
+                        <thead className="bg-muted text-muted-foreground font-medium border-b">
+                          <tr>
+                            <th className="px-3 py-2">Symbol</th>
+                            <th className="px-3 py-2 text-right">Qty</th>
+                            <th className="px-3 py-2 text-right">Avg Price</th>
+                            <th className="px-3 py-2 text-right">LTP</th>
+                            <th className="px-3 py-2 text-right">P&amp;L</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y">
+                          {metrics.positions.map((p) => (
+                            <tr key={p.symbol}>
+                              <td className="px-3 py-2 font-mono">{p.symbol}</td>
+                              <td className={`px-3 py-2 text-right font-medium ${p.qty >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>{p.qty}</td>
+                              <td className="px-3 py-2 text-right">₹{p.avg_price.toFixed(2)}</td>
+                              <td className="px-3 py-2 text-right">₹{p.ltp.toFixed(2)}</td>
+                              <td className={`px-3 py-2 text-right font-semibold ${p.pnl >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>₹{p.pnl >= 0 ? '+' : ''}{p.pnl.toFixed(2)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                {/* Recent Completed Trades */}
+                <div className="space-y-2">
+                  <h5 className="text-xs font-semibold uppercase text-muted-foreground tracking-wider">Recent Completed Trades</h5>
+                  {metrics.trades.length === 0 ? (
+                    <p className="text-xs text-muted-foreground py-1">No completed trades in this period</p>
+                  ) : (
+                    <div className="rounded-md border overflow-hidden">
+                      <table className="w-full text-xs text-left">
+                        <thead className="bg-muted text-muted-foreground font-medium border-b">
+                          <tr>
+                            <th className="px-3 py-2">Date</th>
+                            <th className="px-3 py-2">Symbol</th>
+                            <th className="px-3 py-2 text-center">Dir</th>
+                            <th className="px-3 py-2 text-right">Qty</th>
+                            <th className="px-3 py-2 text-right">Entry</th>
+                            <th className="px-3 py-2 text-right">Exit</th>
+                            <th className="px-3 py-2 text-right">P&amp;L</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y">
+                          {metrics.trades.map((t, idx) => (
+                            <tr key={`${t.symbol}-${idx}`}>
+                              <td className="px-3 py-2 whitespace-nowrap">{t.date} <span className="text-muted-foreground text-[10px]">{t.exit_time}</span></td>
+                              <td className="px-3 py-2 font-mono">{t.symbol}</td>
+                              <td className="px-3 py-2 text-center">
+                                <Badge variant="outline" className={t.dir === 'CE' ? 'bg-green-500/10 text-green-700 border-green-500/20' : 'bg-red-500/10 text-red-700 border-red-500/20'}>
+                                  {t.dir}
+                                </Badge>
+                              </td>
+                              <td className="px-3 py-2 text-right">{t.qty}</td>
+                              <td className="px-3 py-2 text-right">₹{t.entry.toFixed(2)}</td>
+                              <td className="px-3 py-2 text-right">₹{t.exit.toFixed(2)}</td>
+                              <td className={`px-3 py-2 text-right font-semibold ${t.pnl >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>₹{t.pnl >= 0 ? '+' : ''}{t.pnl.toFixed(2)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
                     </div>
                   )}
                 </div>

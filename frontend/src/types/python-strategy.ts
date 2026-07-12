@@ -137,3 +137,39 @@ export interface StrategyStatus {
     spot?: string
   }
 }
+
+export interface StrategyMetrics {
+  status: 'success' | 'error'
+  strategy_id: string
+  period: string
+  mode: 'analyze' | 'live'
+  performance: {
+    realized_pnl: number
+    trades: number
+    wins: number
+    losses: number
+    win_rate: number
+    avg_win: number
+    avg_loss: number
+    profit_factor: number | null
+    daily: Array<{ date: string; pnl: number }>
+  }
+  trades: Array<{
+    date: string
+    symbol: string
+    dir: 'CE' | 'PE' | 'UNKNOWN'
+    qty: number
+    entry: number
+    exit: number
+    pnl: number
+    exit_time: string
+  }>
+  positions: Array<{
+    symbol: string
+    qty: number
+    avg_price: number
+    ltp: number
+    pnl: number
+    dir: 'CE' | 'PE' | 'UNKNOWN'
+  }>
+}

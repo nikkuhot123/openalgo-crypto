@@ -7,6 +7,7 @@ import type {
   PythonStrategyContent,
   ScheduleConfig,
   StrategyStatus,
+  StrategyMetrics,
 } from '@/types/python-strategy'
 import type { ApiResponse } from '@/types/trading'
 import { webClient } from './client'
@@ -243,7 +244,25 @@ export const pythonStrategyApi = {
     lot_mode: string
     risk_pct_per_trade: number
   }> => {
-    const response = await webClient.post(`/python/api/strategy/${strategyId}/max-lots`, settings)
-    return response.data as any
+    const response = await webClient.post<{
+      status: string
+      max_lots_nifty: number
+      max_lots_sensex: number
+      underlying: string
+      lot_mode: string
+      risk_pct_per_trade: number
+    }>(`/python/api/strategy/${strategyId}/max-lots`, settings)
+    return response.data
+  },
+
+  /**
+   * Get strategy-wise performance, trades, and positions metrics
+   */
+  getStrategyMetrics: async (strategyId: string, period = 'week'): Promise<StrategyMetrics> => {
+    const response = await webClient.get<StrategyMetrics>(
+      `/python/api/strategy/${strategyId}/metrics`,
+      { params: { period } }
+    )
+    return response.data
   },
 }

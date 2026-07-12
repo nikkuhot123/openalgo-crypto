@@ -488,12 +488,10 @@ def run_strategy():
                     # Release symbol lock
                     release_symbol_lock(symbol, STRATEGY_NAME)
 
-                    # EOD squareoff → done for the day; SL/target → back to IDLE for re-entry
-                    if current_time >= EXIT_TIME:
-                        state = "DONE"
-                    else:
-                        state = "IDLE"
-                        log.info("Returning to IDLE — waiting for new signal candle")
+                    # Single-entry per day: ANY exit (SL/Target/EOD) ends the day.
+                    # Matches the faithful Volrix backtest (re-entry chop removed).
+                    state = "DONE"
+                    log.info("Trade closed — single-entry mode, done for the day.")
                     active_trade = {}
                     _active_trade = {}
                 else:

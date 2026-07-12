@@ -14,6 +14,7 @@ import {
   Layers,
   LayoutDashboard,
   type LucideIcon,
+  MessageCircle,
   MessageSquare,
   Search,
   Settings,
@@ -21,6 +22,7 @@ import {
   User,
   Workflow,
   Wrench,
+  Zap,
 } from 'lucide-react'
 
 export interface NavItem {
@@ -65,8 +67,10 @@ export const profileMenuItems: NavItem[] = [
   { href: '/apikey', label: 'API Key', icon: Key },
   { href: '/master-contract', label: 'Master Contract', icon: FileStack },
   { href: '/telegram', label: 'Telegram Bot', icon: MessageSquare },
+  { href: '/whatsapp', label: 'WhatsApp Bot', icon: MessageCircle },
   { href: '/holdings', label: 'Holdings', icon: ClipboardList },
   { href: '/flow', label: 'Flow Editor', icon: Workflow },
+  { href: '/scalping', label: 'Scalping', icon: Zap },
   { href: '/python', label: 'Python Strategies', icon: Code2 },
   { href: '/pnl-tracker', label: 'PnL Tracker', icon: BarChart3 },
   { href: '/historify', label: 'Historify', icon: Database },

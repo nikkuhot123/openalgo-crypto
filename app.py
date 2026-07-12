@@ -7,6 +7,27 @@ import os
 import re
 import sys
 
+
+def _ensure_db_directory() -> None:
+    """Create the SQLite database directory before any engine connects.
+
+    On a fresh install ``db/`` does not exist yet, and the database engines (and
+    their background threads) are created/used in parallel during startup. The
+    first connection then fails with ``unable to open database file``, which can
+    leave a database partially initialized. Creating the directory up front, before
+    any database module is imported, removes that race. Derived from DATABASE_URL
+    (all SQLite databases live under the same directory).
+    """
+    db_url = os.getenv("DATABASE_URL", "sqlite:///db/openalgo.db")
+    if db_url.startswith("sqlite:///"):
+        db_path = db_url.replace("sqlite:///", "", 1)
+        db_dir = os.path.dirname(os.path.abspath(db_path))
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+
+
+_ensure_db_directory()
+
 # Show loading indicator early (before heavy imports) so user sees immediate feedback.
 # The full banner with "Ready" status prints later, right before the server accepts connections.
 if __name__ == "__main__":
@@ -35,6 +56,7 @@ from blueprints.broker_credentials import (
     broker_credentials_bp,  # Import the broker credentials blueprint
 )
 from blueprints.chartink import chartink_bp  # Import the chartink blueprint
+from blueprints.chart_test import chart_test_bp  # Standalone chart test page (dev/testing only)
 from blueprints.strategy_portfolio import strategy_portfolio_bp  # Strategy Builder portfolio
 from blueprints.core import core_bp
 from blueprints.dashboard import dashboard_bp
@@ -43,9 +65,12 @@ from blueprints.gc_json import gc_json_bp
 from blueprints.gex import gex_bp  # Import the GEX blueprint
 from blueprints.ivsmile import ivsmile_bp  # Import the IV Smile blueprint
 from blueprints.oiprofile import oiprofile_bp  # Import the OI Profile blueprint
+from blueprints.arbitrage import arbitrage_bp  # Import the Arbitrage blueprint
 from blueprints.historify import historify_bp  # Import the historify blueprint
 from blueprints.ivchart import ivchart_bp  # Import the IV chart blueprint
+from blueprints.scalping import scalping_bp  # Import the Scalping terminal blueprint
 from blueprints.oitracker import oitracker_bp  # Import the OI tracker blueprint
+from blueprints.gamma_density import gamma_density_bp  # Import the Gamma Density blueprint
 from blueprints.straddle_chart import straddle_bp  # Import the straddle chart blueprint
 from blueprints.strategy_chart import strategy_chart_bp  # Import the strategy chart blueprint
 from blueprints.custom_straddle import custom_straddle_bp  # Import custom straddle blueprint
@@ -78,6 +103,7 @@ from blueprints.system_permissions import (
 )
 from blueprints.telegram import telegram_bp  # Import the telegram blueprint
 from blueprints.traffic import traffic_bp  # Import the traffic blueprint
+from blueprints.whatsapp import whatsapp_bp  # Import the WhatsApp blueprint
 from blueprints.tv_json import tv_json_bp
 from blueprints.websocket_example import websocket_bp  # Import the websocket example blueprint
 from cors import cors  # Import the CORS instance
@@ -92,15 +118,20 @@ from database.historify_db import init_database as ensure_historify_tables_exist
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
 from database.leverage_db import init_db as ensure_leverage_tables_exists
 from database.sandbox_db import init_db as ensure_sandbox_tables_exists
+from database.scalping_db import init_db as ensure_scalping_tables_exists
 from database.settings_db import init_db as ensure_settings_tables_exists
 from database.strategy_db import init_db as ensure_strategy_tables_exists
 from database.symbol import init_db as ensure_master_contract_tables_exists
 from database.telegram_db import get_bot_config
 from database.traffic_db import init_logs_db as ensure_traffic_logs_exists
 from database.user_db import init_db as ensure_user_tables_exists
+from database.whatsapp_db import (
+    get_bot_config as get_whatsapp_bot_config,  # noqa: F401  (triggers module-level init_db)
+)
 from extensions import socketio  # Import SocketIO
 from limiter import limiter  # Import the Limiter instance
 from restx_api import api, api_v1_bp
+from services.broker_keepalive_service import start_broker_keepalive
 from services.telegram_bot_service import telegram_bot_service
 from utils.latency_monitor import init_latency_monitoring  # Import latency monitoring
 from utils.health_monitor import init_health_monitoring  # Import health monitoring
@@ -162,7 +193,23 @@ def create_app():
     app.jinja_env.filters["indian_number"] = format_indian_number
 
     # Environment variables
-    app.secret_key = os.getenv("APP_KEY")
+    # Security: Require APP_KEY (fail fast if missing). This is the Flask
+    # secret used to sign session cookies and generate CSRF tokens. If it
+    # were left as None, session/CSRF protection would silently break.
+    # Must be at least 32 characters for cryptographic security.
+    _app_key = os.getenv("APP_KEY")
+    if not _app_key:
+        raise RuntimeError(
+            "CRITICAL: APP_KEY environment variable is not set. "
+            "This is required to sign session cookies and CSRF tokens. "
+            'Generate one using: python -c "import secrets; print(secrets.token_hex(32))"'
+        )
+    if len(_app_key) < 32:
+        raise RuntimeError(
+            f"CRITICAL: APP_KEY must be at least 32 characters (got {len(_app_key)}). "
+            'Generate a secure key using: python -c "import secrets; print(secrets.token_hex(32))"'
+        )
+    app.secret_key = _app_key
     app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
 
     # Dynamic cookie security configuration based on HOST_SERVER
@@ -252,9 +299,11 @@ def create_app():
     app.register_blueprint(strategy_bp)
     app.register_blueprint(master_contract_status_bp)
     app.register_blueprint(websocket_bp)  # Register WebSocket example blueprint
+    app.register_blueprint(chart_test_bp)  # Register standalone chart test page (dev/testing only)
     app.register_blueprint(pnltracker_bp)  # Register PnL tracker blueprint
     app.register_blueprint(python_strategy_bp)  # Register Python strategy blueprint
     app.register_blueprint(telegram_bp)  # Register Telegram blueprint
+    app.register_blueprint(whatsapp_bp)  # Register WhatsApp blueprint
     app.register_blueprint(security_bp)  # Register Security blueprint
     app.register_blueprint(sandbox_bp)  # Register Sandbox blueprint
     app.register_blueprint(playground_bp)  # Register API playground blueprint
@@ -262,7 +311,9 @@ def create_app():
     app.register_blueprint(admin_bp)  # Register Admin blueprint
     app.register_blueprint(historify_bp)  # Register Historify blueprint
     app.register_blueprint(ivchart_bp)  # Register IV chart blueprint
+    app.register_blueprint(scalping_bp)  # Register Scalping terminal blueprint
     app.register_blueprint(oitracker_bp)  # Register OI tracker blueprint
+    app.register_blueprint(gamma_density_bp)  # Register Gamma Density blueprint
     app.register_blueprint(straddle_bp)  # Register straddle chart blueprint
     app.register_blueprint(strategy_chart_bp)  # Register strategy chart blueprint
     app.register_blueprint(custom_straddle_bp)  # Register custom straddle blueprint
@@ -270,6 +321,7 @@ def create_app():
     app.register_blueprint(gex_bp)  # Register GEX blueprint
     app.register_blueprint(ivsmile_bp)  # Register IV Smile blueprint
     app.register_blueprint(oiprofile_bp)  # Register OI Profile blueprint
+    app.register_blueprint(arbitrage_bp)  # Register Arbitrage blueprint
     app.register_blueprint(flow_bp)  # Register Flow blueprint
     app.register_blueprint(broker_credentials_bp)  # Register Broker credentials blueprint
     app.register_blueprint(system_permissions_bp)  # Register System permissions blueprint
@@ -391,6 +443,10 @@ def create_app():
         # Initialize health monitoring (background daemon thread)
         init_health_monitoring(app)
 
+        # Keep the pooled broker HTTP connection warm during market hours so
+        # orders never pay a fresh TCP+TLS handshake after an idle gap
+        start_broker_keepalive()
+
         # NOTE: Python strategy scheduler is initialized in setup_environment()
         # AFTER database tables are created, to avoid "no such table" errors on fresh install
 
@@ -447,7 +503,15 @@ def create_app():
         # Check if user is logged in and session is expired
         if session.get("logged_in") and not is_session_valid():
             logger.info(f"Session expired for user: {session.get('user')} - revoking tokens")
-            revoke_user_tokens(revoke_db_tokens=False)
+            # Revoke the DB broker token at the daily rollover (same as manual logout).
+            # Indian broker tokens are invalidated broker-side at ~3 AM IST, so a
+            # preserved token is dead anyway; keeping it (revoke_db_tokens=False) made
+            # the next login's session-resume path reuse a stale token and skip broker
+            # OAuth, leaving the WebSocket feed dead with 403s until a restart (#1419).
+            # Revoking sets is_revoked=True so _try_resume_broker_session refuses to
+            # resume and forces a fresh broker authentication. Crypto/24-7 brokers never
+            # reach this branch (is_session_valid() stays True when expiry is disabled).
+            revoke_user_tokens(revoke_db_tokens=True)
             session.clear()
             # Don't redirect here, let individual routes handle it
 
@@ -605,6 +669,7 @@ def setup_environment(app):
                 ("Qty Freeze DB", ensure_qty_freeze_tables_exists),
                 ("Historify DB", ensure_historify_tables_exists),
                 ("Flow DB", ensure_flow_tables_exists),
+                ("Scalping DB", ensure_scalping_tables_exists),
                 ("Leverage DB", ensure_leverage_tables_exists),
                 ("Strategy Portfolio DB", ensure_strategy_portfolio_tables_exists),
             ]
@@ -647,6 +712,46 @@ def setup_environment(app):
                 logger.debug("Historify scheduler initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize Historify scheduler: {e}")
+
+            try:
+                # Server-side scalping SL / target / trailing-stop engine. Runs
+                # browser-independently so stops keep working after the user
+                # leaves /scalping or closes the tab. Idles when no SL is set.
+                from services.scalping_risk_monitor_service import start_scalping_risk_monitor
+
+                start_scalping_risk_monitor()
+                logger.debug("Scalping risk monitor initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Scalping risk monitor: {e}")
+
+            # Auto-reconnect the WhatsApp bot if a paired session is persisted.
+            # Without this, every server restart would leave is_ready()=False
+            # and every /notify call would 409 "pair first" — even though the
+            # encrypted session blob is sitting in openalgo.db ready to use.
+            # We do this on a background thread so a slow WhatsApp handshake
+            # never delays the Flask boot.
+            def _autostart_whatsapp_bot():
+                try:
+                    from database.whatsapp_db import get_bot_config
+                    from services.whatsapp_bot_service import whatsapp_bot_service
+
+                    if not get_bot_config().get("is_paired"):
+                        logger.debug("WhatsApp: no paired session, skipping auto-start")
+                        return
+                    ok, msg = whatsapp_bot_service.start_bot()
+                    if ok:
+                        logger.info("WhatsApp bot auto-started from persisted session")
+                    else:
+                        logger.warning("WhatsApp bot auto-start failed: %s", msg)
+                except Exception:
+                    logger.exception("WhatsApp bot auto-start crashed")
+
+            import threading as _threading
+            _threading.Thread(
+                target=_autostart_whatsapp_bot,
+                daemon=True,
+                name="WhatsAppAutoStart",
+            ).start()
 
             # Auto-start analyzer mode services (depends on DB being ready)
             try:
@@ -799,6 +904,7 @@ def shutdown_database_sessions(exception=None):
         ("database.chart_prefs_db", "db_session"),
         ("database.chartink_db", "db_session"),
         ("database.flow_db", "db_session"),
+        ("database.scalping_db", "db_session"),
         ("database.leverage_db", "db_session"),
         ("database.strategy_portfolio_db", "db_session"),
         ("database.market_calendar_db", "db_session"),
@@ -830,7 +936,12 @@ if is_docker:
         "Running in Docker/standalone mode - WebSocket server started separately by start.sh"
     )
 else:
-    logger.debug("Running in local/integrated mode - Starting WebSocket proxy in Flask")
+    # Under gunicorn+eventlet, start_websocket_proxy() spawns a child *process*
+    # (not a thread) so the WS asyncio loop never shares an eventlet hub with
+    # gunicorn — closes the greenlet.error cross-thread crash class entirely
+    # (including GitHub issue #1421). Under the dev server (no eventlet) it
+    # still uses a real OS thread, as before.
+    logger.debug("Starting WebSocket proxy")
     start_websocket_proxy(app)
 
 # Start Flask development server with SocketIO support if directly executed

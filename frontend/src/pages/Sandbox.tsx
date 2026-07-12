@@ -1,7 +1,6 @@
 import { BarChart3, RotateCcw, Save, Settings } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { showToast } from '@/utils/toast'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -22,6 +21,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { showToast } from '@/utils/toast'
 
 async function fetchCSRFToken(): Promise<string> {
   const response = await fetch('/auth/csrf-token', {
@@ -68,7 +68,9 @@ function formatConfigLabel(key: string): string {
     .split('_')
     .map((word) => {
       const upper = word.toUpperCase()
-      if (['NSE', 'BSE', 'CDS', 'BCD', 'MCX', 'NCDEX', 'NCO', 'MIS', 'CNC', 'NRML'].includes(upper)) {
+      if (
+        ['NSE', 'BSE', 'CDS', 'BCD', 'MCX', 'NCDEX', 'NCO', 'MIS', 'CNC', 'NRML'].includes(upper)
+      ) {
         return upper
       }
       return word.charAt(0).toUpperCase() + word.slice(1)
@@ -84,9 +86,9 @@ export default function Sandbox() {
   const [showResetDialog, setShowResetDialog] = useState(false)
 
   // Fetch configs on mount
+  // biome-ignore lint/correctness/useExhaustiveDependencies: one-time config load on mount; fetchConfigs has no reactive inputs
   useEffect(() => {
     fetchConfigs()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const fetchConfigs = async () => {
@@ -100,7 +102,7 @@ export default function Sandbox() {
           setConfigs(data.configs)
         }
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to load configuration', 'analyzer')
     } finally {
       setIsLoading(false)
@@ -163,7 +165,7 @@ export default function Sandbox() {
       } else {
         showToast.error(data.message, 'analyzer')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to save configuration', 'analyzer')
     }
   }
@@ -194,7 +196,7 @@ export default function Sandbox() {
       } else {
         showToast.error(data.message, 'analyzer')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to reset configuration', 'analyzer')
     } finally {
       setIsResetting(false)

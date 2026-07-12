@@ -29,10 +29,11 @@ import {
 } from '@/components/ui/table'
 import { showToast } from '@/utils/toast'
 
-type CopyFormat = 'exchange_symbol' | 'symbol' | 'token' | 'broker_symbol'
+type CopyFormat = 'exchange_symbol' | 'symbol_exchange' | 'symbol' | 'token' | 'broker_symbol'
 
 const COPY_FORMAT_OPTIONS: { value: CopyFormat; label: string; example: string }[] = [
   { value: 'exchange_symbol', label: 'EXCHANGE:SYMBOL', example: 'NSE:RELIANCE' },
+  { value: 'symbol_exchange', label: 'SYMBOL,EXCHANGE (Historify)', example: 'RELIANCE,NSE' },
   { value: 'symbol', label: 'SYMBOL only', example: 'RELIANCE' },
   { value: 'broker_symbol', label: 'Broker symbol', example: 'RELIANCE-EQ' },
   { value: 'token', label: 'Token', example: '2885' },
@@ -89,9 +90,9 @@ export default function Search() {
   const [selected, setSelected] = useState<Set<string>>(() => new Set())
   const [copyFormat, setCopyFormat] = useState<CopyFormat>('exchange_symbol')
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: one-time fetch on mount; fetchResults reads the initial URL searchParams and must not re-run on every render
   useEffect(() => {
     fetchResults()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const fetchResults = async () => {
@@ -136,7 +137,7 @@ export default function Search() {
         showToast.error('Failed to search symbols', 'system')
         setResults([])
       }
-    } catch (err) {
+    } catch (_err) {
       setError('Failed to search symbols. Please check your connection.')
       showToast.error('Failed to search symbols', 'system')
       setResults([])
@@ -234,6 +235,8 @@ export default function Search() {
     switch (format) {
       case 'exchange_symbol':
         return `${r.exchange}:${r.symbol}`
+      case 'symbol_exchange':
+        return `${r.symbol},${r.exchange}`
       case 'symbol':
         return r.symbol
       case 'broker_symbol':
@@ -498,6 +501,7 @@ export default function Search() {
                             className="h-6 w-6 opacity-60 hover:opacity-100"
                             onClick={() => copyToClipboard(row.symbol)}
                             title="Copy symbol"
+                            aria-label="Copy symbol"
                           >
                             <Copy className="h-3 w-3" />
                           </Button>

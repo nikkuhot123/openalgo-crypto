@@ -20,6 +20,11 @@ from utils.logging import get_logger, highlight_url
 
 from .base_adapter import BaseBrokerWebSocketAdapter
 from .broker_factory import create_broker_adapter
+from .mode_utils import (
+    MODE_BY_UPPER_LABEL as _MODE_BY_UPPER_LABEL,
+    normalize_mode,
+    normalize_mode_or_none,
+)
 from .port_check import find_available_port, is_port_in_use
 
 # Initialize logger
@@ -76,8 +81,23 @@ class WebSocketProxy:
         self.last_message_time: dict[tuple[str, str, int], float] = {}
         self.message_throttle_interval = 0.05  # 50ms minimum between messages
 
-        # PERFORMANCE OPTIMIZATION 3: Pre-compute mode mappings
-        self.MODE_MAP = {"LTP": 1, "QUOTE": 2, "DEPTH": 3}
+        # OBSERVABILITY: last time any tick was delivered to each user. Used to
+        # surface "adapter is connected but silent while subscribed" — the
+        # stale-feed symptom behind issues #1226/#1419/#1421. This is a
+        # diagnostic signal only: it is logged and exposed via get_adapter_health(),
+        # never used to auto-evict (a quiet market or illiquid symbol legitimately
+        # produces no ticks, so auto-eviction would churn healthy feeds). Actual
+        # eviction stays with the connected-state check in authenticate_client.
+        self.last_tick_time: dict[str, float] = {}  # user_id -> epoch seconds
+        self._last_stale_warn: dict[str, float] = {}  # user_id -> epoch of last warning
+        self._stale_tick_warn_seconds = int(os.getenv("WS_STALE_TICK_WARN_SECONDS", "120"))
+        self._last_stale_check = time.time()
+        self._stale_check_interval = 30  # evaluate stale-feed warnings at most every 30s
+
+        # MODE_MAP retained for any external consumers that imported it from
+        # this class. New code should call normalize_mode() / normalize_mode_or_none()
+        # at module level — those accept case-insensitive strings AND ints.
+        self.MODE_MAP = dict(_MODE_BY_UPPER_LABEL)
 
         # RESOURCE MONITORING: Track metrics for health checks
         self._stats_lock = aio.Lock() if hasattr(aio, 'Lock') else None
@@ -86,16 +106,26 @@ class WebSocketProxy:
         self._cleanup_interval = 300  # Clean stale entries every 5 minutes
         self._throttle_entry_max_age = 60  # Remove throttle entries older than 60 seconds
 
-        # ZeroMQ context for subscribing to broker adapters
+        # ZeroMQ bus for market data + cache-invalidation events.
         self.context = zmq.asyncio.Context()
         self.socket = self.context.socket(zmq.SUB)
-        # Connecting to ZMQ
+        # Fan-in topology: this SUB is the SINGLE binder on the ZMQ bus and every
+        # publisher CONNECTs to it — the broker market-data adapters (this process)
+        # and the cache-invalidation publisher (the Flask/gunicorn process). The
+        # publishers used to bind and the SUB used to connect, which raced across
+        # those two processes once the proxy moved out-of-process (#1421): whoever
+        # bound the configured port first won, the loser silently slid to the next
+        # port (5556...), and the SUB — fixed on the configured port — heard nothing
+        # from it. Auth + subscribe succeeded but no ticks were delivered. Binding
+        # the SUB makes the rendezvous port deterministic regardless of process
+        # start order. Publisher side: base_adapter._connect_to_zmq_bus and
+        # connection_manager.SharedZmqPublisher.connect.
         ZMQ_HOST = os.getenv("ZMQ_HOST", "127.0.0.1")
-        ZMQ_PORT = os.getenv("ZMQ_PORT")
-        self.socket.connect(f"tcp://{ZMQ_HOST}:{ZMQ_PORT}")  # Connect to broker adapter publisher
+        ZMQ_PORT = os.getenv("ZMQ_PORT", "5555")
+        self.socket.bind(f"tcp://{ZMQ_HOST}:{ZMQ_PORT}")
 
-        # Set up ZeroMQ subscriber to receive all messages
-        self.socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all topics
+        # Receive all topics (market data + CACHE_INVALIDATE_*)
+        self.socket.setsockopt(zmq.SUBSCRIBE, b"")
 
     async def start(self):
         """Start the WebSocket server and ZeroMQ listener"""
@@ -121,6 +151,11 @@ class WebSocketProxy:
                 stop.set_result(None)
 
             monitor_task = aio.create_task(monitor_shutdown())
+
+            # Periodic stats snapshot for the Flask-side health monitor. The
+            # proxy runs in its own process, so utils/health_monitor.py cannot
+            # read the in-process pools; it falls back to this file (#1301).
+            stats_task = aio.create_task(self._stats_file_writer())
 
             # Handle graceful shutdown
             # Windows doesn't support add_signal_handler, so we'll use a simpler approach
@@ -185,6 +220,12 @@ class WebSocketProxy:
                 except aio.CancelledError:
                     pass
 
+                stats_task.cancel()
+                try:
+                    await stats_task
+                except aio.CancelledError:
+                    pass
+
                 # Properly stop the server and release the port.
                 # This calls server.wait_closed() which ensures the socket
                 # is fully released before the event loop shuts down.
@@ -240,11 +281,11 @@ class WebSocketProxy:
             # Wait for all connections to close with timeout
             if close_tasks:
                 try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*close_tasks, return_exceptions=True),
+                    await aio.wait_for(
+                        aio.gather(*close_tasks, return_exceptions=True),
                         timeout=2.0,  # 2 second timeout
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     logger.warning("Timeout waiting for client connections to close")
 
             # Disconnect all broker adapters
@@ -310,6 +351,39 @@ class WebSocketProxy:
             self._cleanup_zmq_sync()
         except Exception:
             pass  # Cannot raise in __del__
+
+    # Seconds between stats-file snapshots for the cross-process health monitor.
+    STATS_FILE_INTERVAL = 10
+
+    async def _stats_file_writer(self):
+        """Periodically write a compact stats snapshot for the Flask process.
+
+        The health monitor (utils/health_monitor.py) used to read the proxy's
+        connection pools in-process; since the proxy moved to its own process
+        that always reads empty, so the Health Monitor page showed no
+        WebSocket details (GitHub issue #1301). This file is its data source
+        now. Written atomically (tmp + os.replace) so readers never see a
+        partial file.
+        """
+        stats_path = os.getenv("WS_PROXY_STATS_FILE", os.path.join("log", "ws_proxy_stats.json"))
+        tmp_path = f"{stats_path}.tmp"
+        while self.running:
+            try:
+                health = self.get_health_stats()
+                snapshot = {
+                    "timestamp": time.time(),
+                    "total_connections": health["broker_adapters"]["active_count"],
+                    "total_symbols": health["subscriptions"]["unique_symbols"],
+                    "clients_connected": health["clients"]["connected_count"],
+                    "brokers": health["broker_adapters"]["brokers"],
+                }
+                with open(tmp_path, "w") as f:
+                    json.dump(snapshot, f)
+                os.replace(tmp_path, stats_path)
+            except Exception as e:
+                # Never let stats writing affect the feed path.
+                logger.debug(f"Stats snapshot write failed: {e}")
+            await aio.sleep(self.STATS_FILE_INTERVAL)
 
     def get_health_stats(self) -> dict:
         """
@@ -401,6 +475,79 @@ class WebSocketProxy:
                 f"{total_subs} unique subscriptions, "
                 f"{len(self.last_message_time)} throttle entries"
             )
+
+    def _users_with_active_subscriptions(self) -> set:
+        """Return the set of user_ids that currently have at least one client
+        subscribed to at least one symbol."""
+        active_users = set()
+        for client_set in self.subscription_index.values():
+            for client_id in client_set:
+                user_id = self.user_mapping.get(client_id)
+                if user_id:
+                    active_users.add(user_id)
+        return active_users
+
+    def _log_stale_adapters(self):
+        """Observability only: warn when a broker adapter reports connected but
+        has delivered no ticks for longer than the threshold while the user still
+        has active subscriptions. This surfaces the stale-feed symptom of issues
+        #1226/#1419/#1421 without auto-evicting (a quiet market legitimately has
+        no ticks). Actual recovery is handled by the connected-state eviction in
+        authenticate_client.
+        """
+        current_time = time.time()
+        if current_time - self._last_stale_check < self._stale_check_interval:
+            return
+        self._last_stale_check = current_time
+
+        threshold = self._stale_tick_warn_seconds
+        if threshold <= 0:
+            return
+
+        active_users = self._users_with_active_subscriptions()
+        for user_id, adapter in list(self.broker_adapters.items()):
+            if user_id not in active_users:
+                continue  # no subscriptions => no ticks expected
+            if not bool(getattr(adapter, "connected", False)):
+                continue  # disconnected adapters are handled on next auth
+            last_tick = self.last_tick_time.get(user_id)
+            if last_tick is None:
+                continue  # never delivered yet (just connected) — don't flag
+            silent_for = current_time - last_tick
+            if silent_for < threshold:
+                continue
+            # Throttle repeat warnings per user to once per threshold window
+            if current_time - self._last_stale_warn.get(user_id, 0) < threshold:
+                continue
+            self._last_stale_warn[user_id] = current_time
+            broker = self.user_broker_mapping.get(user_id, "unknown")
+            logger.warning(
+                f"Stale feed: {broker} adapter for user {user_id} reports connected "
+                f"but no ticks for {silent_for:.0f}s while subscribed. If this persists, "
+                f"the broker WebSocket may be silently dead (reconnect/restart may be needed)."
+            )
+
+    def get_adapter_health(self) -> dict:
+        """Per-user adapter health snapshot for diagnostics (#1432).
+
+        Returns connected state, seconds since last tick, and whether the user
+        has active subscriptions — enough to triage the stale-feed class of bug
+        from /admin/diagnostics without a code dive.
+        """
+        current_time = time.time()
+        active_users = self._users_with_active_subscriptions()
+        health = {}
+        for user_id, adapter in self.broker_adapters.items():
+            last_tick = self.last_tick_time.get(user_id)
+            health[user_id] = {
+                "broker": self.user_broker_mapping.get(user_id, "unknown"),
+                "connected": bool(getattr(adapter, "connected", False)),
+                "has_subscriptions": user_id in active_users,
+                "seconds_since_last_tick": (
+                    round(current_time - last_tick, 1) if last_tick is not None else None
+                ),
+            }
+        return health
 
     async def handle_client(self, websocket):
         """
@@ -603,23 +750,12 @@ class WebSocketProxy:
             dict: Broker configuration containing broker_name and credentials
         """
         try:
-            from sqlalchemy import text
+            from database.auth_db import Auth
 
-            from database.auth_db import get_broker_name
+            auth_obj = Auth.query.filter_by(name=user_id).first()
 
-            # Get user's connected broker from database
-            # This queries the auth_token table to find the user's active broker
-            query = text("""
-                SELECT broker FROM auth_token 
-                WHERE user_id = :user_id 
-                ORDER BY id DESC 
-                LIMIT 1
-            """)
-
-            result = db.session.execute(query, {"user_id": user_id}).fetchone()
-
-            if result and result.broker:
-                broker_name = result.broker
+            if auth_obj and not auth_obj.is_revoked and auth_obj.broker:
+                broker_name = auth_obj.broker
                 logger.info(f"Found broker '{broker_name}' for user {user_id} from database")
             else:
                 # Fallback to environment variable
@@ -699,8 +835,46 @@ class WebSocketProxy:
             )
             return
 
+        previous_broker_name = self.user_broker_mapping.get(user_id)
+
         # Store the broker mapping for this user
         self.user_broker_mapping[user_id] = broker_name
+
+        # A successful API-key auth is not enough: the cached broker adapter/pool
+        # can be disconnected or still hold a previous day's broker token. Evict
+        # it before the normal create/connect path runs so the fresh DB token is
+        # used immediately after broker re-login.
+        if user_id in self.broker_adapters:
+            cached_adapter = self.broker_adapters[user_id]
+            cached_connected = bool(getattr(cached_adapter, "connected", False))
+            broker_changed = bool(previous_broker_name and previous_broker_name != broker_name)
+
+            if broker_changed or not cached_connected:
+                reason = (
+                    f"broker changed {previous_broker_name}->{broker_name}"
+                    if broker_changed
+                    else "cached adapter disconnected"
+                )
+                logger.info(
+                    f"Cached {broker_name} adapter for user {user_id} is stale ({reason}) - "
+                    "evicting to rebuild with fresh credentials"
+                )
+                try:
+                    cached_adapter.disconnect()
+                except Exception as adapter_error:
+                    logger.warning(
+                        f"Error disconnecting stale adapter for user {user_id}: {adapter_error}"
+                    )
+                self.broker_adapters.pop(user_id, None)
+
+                try:
+                    from .broker_factory import cleanup_pools_for_user
+
+                    cleanup_pools_for_user(user_id, broker_name=previous_broker_name or broker_name)
+                except Exception as pool_error:
+                    logger.warning(
+                        f"Error cleaning stale connection pools for user {user_id}: {pool_error}"
+                    )
 
         # Create or reuse broker adapter
         if user_id not in self.broker_adapters:
@@ -984,14 +1158,24 @@ class WebSocketProxy:
 
         # Get subscription parameters
         symbols = data.get("symbols") or []  # Handle array of symbols
-        mode_str = data.get("mode", "Quote")  # Get mode as string (LTP, Quote, Depth)
+        raw_mode = data.get("mode", "Quote")  # Accepts 1/2/3 or LTP/Quote/Depth (any case)
         depth_level = data.get("depth", 5)  # Default to 5 levels
+        # Optional request_id (issue #1376): when the client supplies one, we
+        # echo it back in the response so the client can correlate this ack
+        # with the originating request and learn per-symbol success/failure
+        # rather than guessing from tick activity.
+        request_id = data.get("request_id")
 
-        # Map string mode to numeric mode
-        mode_mapping = {"LTP": 1, "Quote": 2, "Depth": 3}
-
-        # Convert string mode to numeric if needed
-        mode = mode_mapping.get(mode_str, mode_str) if isinstance(mode_str, str) else mode_str
+        # Normalize mode through the single source of truth. Previously the
+        # in-handler mapping was Title-Case-only and silently passed through
+        # unknown strings (e.g. documented "QUOTE") — broker adapters then
+        # received the raw string instead of a numeric mode. See issue #1375.
+        try:
+            mode, mode_label = normalize_mode(raw_mode)
+        except (ValueError, TypeError) as e:
+            await self.send_error(client_id, "INVALID_MODE", str(e))
+            return
+        mode_str = mode_label  # Canonical label echoed back in subscribe response
 
         # Handle case where a single symbol is passed directly instead of as an array
         if not symbols and (data.get("symbol") and data.get("exchange")):
@@ -1070,16 +1254,16 @@ class WebSocketProxy:
                 )
 
         # Send combined response
-        await self.send_message(
-            client_id,
-            {
-                "type": "subscribe",
-                "status": "success" if subscription_success else "partial",
-                "subscriptions": subscription_responses,
-                "message": "Subscription processing complete",
-                "broker": broker_name,
-            },
-        )
+        response = {
+            "type": "subscribe",
+            "status": "success" if subscription_success else "partial",
+            "subscriptions": subscription_responses,
+            "message": "Subscription processing complete",
+            "broker": broker_name,
+        }
+        if request_id is not None:
+            response["request_id"] = request_id
+        await self.send_message(client_id, response)
 
     async def unsubscribe_client(self, client_id, data):
         """
@@ -1101,14 +1285,22 @@ class WebSocketProxy:
 
         # Get unsubscription parameters for specific symbols
         symbols = data.get("symbols") or []
+        # Optional request_id (issue #1376) — echoed in the response so callers
+        # can correlate this ack with the originating unsubscribe request.
+        request_id = data.get("request_id")
 
         # Handle single symbol format
         if not symbols and not is_unsubscribe_all and (data.get("symbol") and data.get("exchange")):
+            try:
+                _mode_int, _ = normalize_mode(data.get("mode", 2))
+            except (ValueError, TypeError) as e:
+                await self.send_error(client_id, "INVALID_MODE", str(e))
+                return
             symbols = [
                 {
                     "symbol": data.get("symbol"),
                     "exchange": data.get("exchange"),
-                    "mode": data.get("mode", 2),  # Default to Quote mode
+                    "mode": _mode_int,
                 }
             ]
 
@@ -1197,7 +1389,21 @@ class WebSocketProxy:
             for symbol_info in symbols:
                 symbol = symbol_info.get("symbol")
                 exchange = symbol_info.get("exchange")
-                mode = symbol_info.get("mode", 2)  # Default to Quote mode
+                # Normalize mode (accepts 1/2/3 or LTP/Quote/Depth case-insensitive).
+                # Default to Quote mode (2) if absent.
+                try:
+                    mode, _ = normalize_mode(symbol_info.get("mode", 2))
+                except (ValueError, TypeError) as e:
+                    failed_unsubscriptions.append(
+                        {
+                            "symbol": symbol,
+                            "exchange": exchange,
+                            "status": "error",
+                            "message": str(e),
+                            "broker": broker_name,
+                        }
+                    )
+                    continue
 
                 if not symbol or not exchange:
                     continue  # Skip invalid symbols
@@ -1266,17 +1472,17 @@ class WebSocketProxy:
         elif len(failed_unsubscriptions) > 0 and len(successful_unsubscriptions) == 0:
             status = "error"
 
-        await self.send_message(
-            client_id,
-            {
-                "type": "unsubscribe",
-                "status": status,
-                "message": "Unsubscription processing complete",
-                "successful": successful_unsubscriptions,
-                "failed": failed_unsubscriptions,
-                "broker": broker_name,
-            },
-        )
+        unsub_response = {
+            "type": "unsubscribe",
+            "status": status,
+            "message": "Unsubscription processing complete",
+            "successful": successful_unsubscriptions,
+            "failed": failed_unsubscriptions,
+            "broker": broker_name,
+        }
+        if request_id is not None:
+            unsub_response["request_id"] = request_id
+        await self.send_message(client_id, unsub_response)
 
     async def send_message(self, client_id, message):
         """
@@ -1380,6 +1586,23 @@ class WebSocketProxy:
                 except Exception as adapter_error:
                     logger.warning(f"Error disconnecting adapter for user {user_id}: {adapter_error}")
 
+            # broker_adapters only tracks the wrapper currently attached to a
+            # client. The global connection-pool registry may still contain an
+            # old per-user pool after logout/re-login, especially when the
+            # invalidation races with a dashboard reconnect. Purge it too.
+            try:
+                from .broker_factory import cleanup_pools_for_user
+
+                removed_pools = cleanup_pools_for_user(user_id)
+                if removed_pools:
+                    logger.info(
+                        f"Disconnected {removed_pools} cached connection pool(s) for user {user_id}"
+                    )
+            except Exception as pool_error:
+                logger.warning(
+                    f"Error cleaning connection pools for user {user_id}: {pool_error}"
+                )
+
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse cache invalidation message: {e}")
         except Exception as e:
@@ -1478,6 +1701,9 @@ class WebSocketProxy:
                 # RESOURCE CLEANUP: Periodically clean stale throttle entries
                 self._cleanup_stale_throttle_entries()
 
+                # OBSERVABILITY: periodically warn on connected-but-silent feeds
+                self._log_stale_adapters()
+
                 # OPTIMIZATION 1: Increased timeout to reduce busy-waiting
                 try:
                     [topic, data] = await aio.wait_for(
@@ -1531,11 +1757,12 @@ class WebSocketProxy:
                 remaining = parts[:-1]  # everything except mode
 
                 # Detect two-segment exchange prefixes (NSE_INDEX, BSE_INDEX,
-                # GLOBAL_INDEX, NSEIX_INDEX). Add new index/multi-segment
+                # MCX_INDEX, GLOBAL_INDEX, NSEIX_INDEX). Add new index/multi-segment
                 # exchanges here when introducing them.
                 _MULTI_SEGMENT_EXCHANGE_PREFIXES = (
                     ("NSE", "INDEX"),
                     ("BSE", "INDEX"),
+                    ("MCX", "INDEX"),
                     ("GLOBAL", "INDEX"),
                 )
                 if len(remaining) >= 2 and (remaining[0], remaining[1]) in _MULTI_SEGMENT_EXCHANGE_PREFIXES:
@@ -1549,12 +1776,13 @@ class WebSocketProxy:
                     logger.warning(f"Invalid topic format (no symbol): {topic_str}")
                     continue
 
-                # OPTIMIZATION: Use pre-computed mode map
-                mode = self.MODE_MAP.get(mode_str)
-
-                if not mode:
+                # Route through the single normalizer so topic parsing stays
+                # consistent with client-side mode handling.
+                normalized = normalize_mode_or_none(mode_str)
+                if normalized is None:
                     logger.warning(f"Invalid mode in topic: {mode_str}")
                     continue
+                mode, _ = normalized
 
                 # No server-side LTP throttling: the previous time-based
                 # throttle dropped intra-window ticks instead of coalescing
@@ -1617,6 +1845,11 @@ class WebSocketProxy:
                     user_id = self.user_mapping.get(client_id)
                     if not user_id:
                         continue
+
+                    # OBSERVABILITY: record that this user's feed is live (a tick
+                    # was delivered). Cheap dict write; lets _log_stale_adapters()
+                    # detect connected-but-silent adapters.
+                    self.last_tick_time[user_id] = current_time
 
                     # Check broker match (important for multi-broker setups)
                     client_broker = self.user_broker_mapping.get(user_id)

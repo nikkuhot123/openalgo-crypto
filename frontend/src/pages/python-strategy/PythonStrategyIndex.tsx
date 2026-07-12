@@ -16,7 +16,6 @@ import {
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { showToast } from '@/utils/toast'
 import { pythonStrategyApi } from '@/api/python-strategy'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Input } from '@/components/ui/input'
@@ -40,11 +39,11 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Switch } from '@/components/ui/switch'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import type { MasterContractStatus, PythonStrategy } from '@/types/python-strategy'
 import { SCHEDULE_DAYS, STATUS_COLORS, STATUS_LABELS } from '@/types/python-strategy'
 import StrategyStatusPanel from '@/components/python-strategy/StrategyStatusPanel'
+import { showToast } from '@/utils/toast'
 
 export default function PythonStrategyIndex() {
   const navigate = useNavigate()
@@ -139,13 +138,14 @@ export default function PythonStrategyIndex() {
       ])
       setStrategies(strategiesData)
       setMasterStatus(statusData)
-    } catch (error) {
+    } catch (_error) {
       if (!silent) showToast.error('Failed to load strategies', 'pythonStrategy')
     } finally {
       if (!silent) setLoading(false)
     }
   }
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only init of the 1s timer and SSE subscription; adding fetchData would tear down and recreate the EventSource on every render
   useEffect(() => {
     fetchData()
     // Update current time every second
@@ -165,19 +165,17 @@ export default function PythonStrategyIndex() {
         if (data.strategy_id && data.status) {
           fetchData(true) // Silent refresh
         }
-      } catch (e) {
+      } catch (_e) {
         // Ignore parse errors (heartbeat messages)
       }
     }
 
-    eventSource.onerror = () => {
-    }
+    eventSource.onerror = () => {}
 
     return () => {
       clearInterval(timer)
       eventSource.close()
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const handleStart = async (strategy: PythonStrategy) => {
@@ -212,7 +210,7 @@ export default function PythonStrategyIndex() {
       } else {
         showToast.error(response.message || 'Failed to stop strategy', 'pythonStrategy')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to stop strategy', 'pythonStrategy')
     } finally {
       setActionLoading(null)
@@ -229,7 +227,7 @@ export default function PythonStrategyIndex() {
       } else {
         showToast.error(response.message || 'Failed to clear error', 'pythonStrategy')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to clear error', 'pythonStrategy')
     } finally {
       setActionLoading(null)
@@ -247,7 +245,7 @@ export default function PythonStrategyIndex() {
       } else {
         showToast.error(response.message || 'Failed to delete strategy', 'pythonStrategy')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to delete strategy', 'pythonStrategy')
     } finally {
       setActionLoading(null)
@@ -268,7 +266,7 @@ export default function PythonStrategyIndex() {
       document.body.removeChild(a)
       URL.revokeObjectURL(url)
       showToast.success('Strategy exported', 'pythonStrategy')
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to export strategy', 'pythonStrategy')
     }
   }
@@ -284,7 +282,7 @@ export default function PythonStrategyIndex() {
       } else {
         showToast.error(response.message || 'Failed to check contracts', 'pythonStrategy')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to check contracts', 'pythonStrategy')
     } finally {
       setActionLoading(null)
@@ -476,7 +474,7 @@ export default function PythonStrategyIndex() {
                     </Tooltip>
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="icon">
+                        <Button variant="ghost" size="icon" aria-label="Strategy actions menu">
                           <MoreVertical className="h-4 w-4" />
                         </Button>
                       </DropdownMenuTrigger>
@@ -520,7 +518,11 @@ export default function PythonStrategyIndex() {
                     )}
                   </div>
                   <p className="text-xs text-muted-foreground mt-1">
-                    {formatScheduleDays(strategy.schedule_days?.length ? strategy.schedule_days : ['mon', 'tue', 'wed', 'thu', 'fri'])}
+                    {formatScheduleDays(
+                      strategy.schedule_days?.length
+                        ? strategy.schedule_days
+                        : ['mon', 'tue', 'wed', 'thu', 'fri']
+                    )}
                   </p>
                 </div>
 
@@ -623,16 +625,43 @@ export default function PythonStrategyIndex() {
 
                 {/* Action Buttons */}
                 <div className="flex gap-2 pt-2 mt-auto">
-                  <div className="flex items-center gap-2">
-                    <Switch
-                      checked={strategy.status === 'running' || strategy.status === 'scheduled'}
-                      onCheckedChange={(checked) => checked ? handleStart(strategy) : handleStop(strategy)}
-                      disabled={actionLoading === strategy.id}
-                    />
-                    <span className="text-sm font-medium">
-                      {strategy.status === 'running' || strategy.status === 'scheduled' ? 'Enabled' : 'Disabled'}
-                    </span>
-                  </div>
+                  {strategy.status === 'running' || strategy.status === 'scheduled' ? (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant={strategy.status === 'running' ? 'destructive' : 'outline'}
+                          size="sm"
+                          className={`flex-1 ${strategy.status === 'scheduled' ? 'border-orange-500 text-orange-600 hover:bg-orange-50 dark:text-orange-400 dark:hover:bg-orange-950' : ''}`}
+                          onClick={() => handleStop(strategy)}
+                          disabled={actionLoading === strategy.id}
+                        >
+                          <Square className="h-4 w-4 mr-2" />
+                          {strategy.status === 'running' ? 'Stop' : 'Cancel'}
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        {strategy.status === 'running'
+                          ? 'Stop running strategy'
+                          : 'Cancel scheduled auto-start'}
+                      </TooltipContent>
+                    </Tooltip>
+                  ) : (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="default"
+                          size="sm"
+                          className="flex-1 bg-green-600 hover:bg-green-700"
+                          onClick={() => handleStart(strategy)}
+                          disabled={actionLoading === strategy.id}
+                        >
+                          <Play className="h-4 w-4 mr-2" />
+                          Start
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>Start strategy</TooltipContent>
+                    </Tooltip>
+                  )}
 
                   <Tooltip>
                     <TooltipTrigger asChild>

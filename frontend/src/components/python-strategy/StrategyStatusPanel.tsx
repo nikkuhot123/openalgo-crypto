@@ -146,7 +146,8 @@ export default function StrategyStatusPanel({ strategy }: StrategyStatusPanelPro
   const fetchMetrics = useCallback(async () => {
     try {
       const data = await pythonStrategyApi.getStrategyMetrics(strategy.id, period)
-      setMetrics(data)
+      // Only store if the response has the expected shape; discard error payloads
+      if (data?.performance) setMetrics(data)
     } catch {
       // ignore
     }
@@ -285,36 +286,38 @@ export default function StrategyStatusPanel({ strategy }: StrategyStatusPanelPro
                 </div>
 
                 {/* Metrics Grid */}
+                {metrics.performance && (
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                   <div className="rounded-md border p-3">
                     <p className="text-xs text-muted-foreground font-medium">Realized P&amp;L</p>
                     <span className={`text-sm font-semibold mt-0.5 block ${
-                      metrics.performance.realized_pnl >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'
+                      (metrics.performance.realized_pnl ?? 0) >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'
                     }`}>
-                      ₹{metrics.performance.realized_pnl >= 0 ? '+' : ''}{metrics.performance.realized_pnl.toFixed(2)}
+                      ₹{(metrics.performance.realized_pnl ?? 0) >= 0 ? '+' : ''}{(metrics.performance.realized_pnl ?? 0).toFixed(2)}
                     </span>
                   </div>
                   <div className="rounded-md border p-3">
                     <p className="text-xs text-muted-foreground font-medium">Win Rate</p>
                     <span className="text-sm font-semibold mt-0.5 block">
-                      {metrics.performance.win_rate.toFixed(1)}% ({metrics.performance.wins}W / {metrics.performance.losses}L)
+                      {(metrics.performance.win_rate ?? 0).toFixed(1)}% ({metrics.performance.wins ?? 0}W / {metrics.performance.losses ?? 0}L)
                     </span>
                   </div>
                   <div className="rounded-md border p-3">
                     <p className="text-xs text-muted-foreground font-medium">Profit Factor</p>
                     <span className="text-sm font-semibold mt-0.5 block">
-                      {metrics.performance.profit_factor === null ? '—' : 
-                       metrics.performance.profit_factor === Infinity ? '∞' : 
+                      {metrics.performance.profit_factor === null || metrics.performance.profit_factor === undefined ? '—' :
+                       metrics.performance.profit_factor === Infinity ? '∞' :
                        metrics.performance.profit_factor.toFixed(2)}
                     </span>
                   </div>
                   <div className="rounded-md border p-3">
                     <p className="text-xs text-muted-foreground font-medium">Total Trades</p>
                     <span className="text-sm font-semibold mt-0.5 block">
-                      {metrics.performance.trades}
+                      {metrics.performance.trades ?? 0}
                     </span>
                   </div>
                 </div>
+                )}
 
                 {/* Open Positions (Database / Live) */}
                 {metrics.positions.length > 0 && (

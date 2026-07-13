@@ -257,8 +257,8 @@ def get_strategy_metrics(strategy_id, strategy_configs, user_id="nikhil",
     if period not in _PERIODS:
         period = "week"
     display, underlying = _resolve_owner(strategy_id, strategy_configs)
-    if display is None:
-        return {"status": "error", "message": "Strategy not found"}
+    if not display:
+        raise ValueError(f"Strategy not found: {strategy_id}")
 
     try:
         from database.settings_db import get_analyze_mode

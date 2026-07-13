@@ -9,6 +9,7 @@ import sys
 import signal
 import time
 import logging
+import json
 from datetime import datetime, date
 from pathlib import Path
 import pandas as pd
@@ -100,6 +101,45 @@ def release_symbol_lock(symbol, strategy_name):
     except Exception:
         pass
 
+# ── Position state persistence (survive restarts with full SL/target context) ──
+# Bug 2026-07-13: a service restart orphaned an open position; the old adoption
+# path only knew entry price -> "EOD-exit-only" (no SL, no target). The state
+# file lets a restarted process re-arm full management on its own positions.
+STATE_DIR = Path("log") / "strategies" / "state"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+STATE_FILE = STATE_DIR / f"pov_wall_squeeze_{UNDERLYING.upper()}.json"
+
+def persist_positions(positions):
+    """Snapshot tracked positions to disk (called on every open/close)."""
+    try:
+        snap = {}
+        for sym, pos in positions.items():
+            p = dict(pos)
+            et = p.get("entry_time")
+            if isinstance(et, datetime):
+                p["entry_time"] = et.isoformat()
+            snap[sym] = p
+        STATE_FILE.write_text(json.dumps(snap))
+    except Exception as e:
+        log.debug(f"persist_positions failed: {e}")
+
+def load_persisted_positions():
+    """Load the position snapshot from a previous run. {} when absent/corrupt."""
+    try:
+        if STATE_FILE.exists():
+            data = json.loads(STATE_FILE.read_text())
+            for p in data.values():
+                et = p.get("entry_time")
+                if isinstance(et, str):
+                    try:
+                        p["entry_time"] = datetime.fromisoformat(et)
+                    except ValueError:
+                        p["entry_time"] = None
+            return data
+    except Exception as e:
+        log.warning(f"load_persisted_positions failed: {e}")
+    return {}
+
 def reconcile_orphan_positions(underlying):
     """Check positionbook for open positions matching this underlying. Returns list of dicts."""
     found = []
@@ -184,6 +224,7 @@ def sync_positions_with_book(positions, underlying):
                 log.warning(f"RECONCILE: {symbol} not in positionbook; dropping from tracking")
             release_symbol_lock(symbol, STRATEGY_NAME)
             del positions[symbol]
+            persist_positions(positions)
             pruned += 1
     return pruned
 
@@ -399,16 +440,26 @@ def _graceful_shutdown(signum, frame):
 
     if _positions and _opt_exchange:
         # Fetch positionbook ONCE so we can verify each tracked position before closing
-        broker_qtys = {}  # symbol_upper -> qty (signed)
+        broker_qtys = None  # None = UNKNOWN (API unreachable / non-success) — touch nothing
         try:
             pb = client.positionbook()
             if isinstance(pb, dict) and pb.get("status") == "success":
+                broker_qtys = {}
                 for pos in pb.get("data", []):
                     sym_u = (pos.get("symbol", "") or "").upper()
                     if sym_u:
                         broker_qtys[sym_u] = int(pos.get("quantity", 0) or 0)
+            else:
+                log.error("Shutdown: positionbook returned non-success — position state UNKNOWN")
         except Exception as e:
-            log.error(f"Shutdown: positionbook fetch failed: {e} — skipping all closes to avoid naked shorts")
+            log.error(f"Shutdown: positionbook fetch failed: {e} — position state UNKNOWN")
+
+        if broker_qtys is None:
+            # CRITICAL: cannot verify positions (e.g. app restarting -> 502).
+            # Do NOT cancel SLs, do NOT assume flat. Leave everything intact for
+            # state-file adoption on next boot. (Bug 2026-07-13: an empty dict
+            # here mis-read an open position as flat and orphaned it unmanaged.)
+            log.error("Shutdown: leaving positions and SL orders untouched for restart adoption.")
             log.info("Shutdown complete. Exiting.")
             sys.exit(0)
 
@@ -486,19 +537,58 @@ def run_strategy():
     trade_date_pov = None
     trades_today = 0
 
-    # Adopt orphan positions on boot
+    # Adopt orphan positions on boot — restore full SL/target context when we
+    # have a persisted snapshot for the symbol; EOD-exit-only otherwise.
+    persisted = load_persisted_positions()
     orphans = reconcile_orphan_positions(UNDERLYING)
     for orphan in orphans:
-        log.warning(f"Adopting orphan position: {orphan['symbol']} qty={orphan['qty']} @ {orphan['entry_price']}")
-        positions[orphan["symbol"]] = {
-            "qty": orphan["qty"],
-            "sl_orderid": None,
-            "target_price": None,
-            "entry_opt_price": orphan["entry_price"],
-            "entry_candle_fp": None,
-            "adopted": True,
-        }
-        acquire_symbol_lock(orphan["symbol"], STRATEGY_NAME)
+        sym = orphan["symbol"]
+        saved = persisted.get(sym)
+        if saved:
+            pos = dict(saved)
+            pos["qty"] = orphan["qty"]  # broker is authoritative on qty
+            # Verify the persisted SL order is still working; re-arm if not
+            sl_oid = pos.get("sl_orderid")
+            sl_ok = False
+            if sl_oid:
+                try:
+                    st = client.orderstatus(order_id=sl_oid, strategy=STRATEGY_NAME)
+                    o_st = ((st.get("data") or {}).get("order_status") or "").lower()
+                    sl_ok = st.get("status") == "success" and o_st in ("open", "trigger pending", "pending")
+                except Exception:
+                    sl_ok = False
+            if not sl_ok and pos.get("sl_price"):
+                pos["sl_orderid"] = None
+                try:
+                    sl_resp = client.placeorder(
+                        strategy=STRATEGY_NAME, symbol=sym, action="SELL",
+                        exchange=opt_exchange, price_type="SL-M",
+                        trigger_price=pos["sl_price"], product=PRODUCT,
+                        quantity=pos["qty"])
+                    if sl_resp.get("status") == "success":
+                        pos["sl_orderid"] = sl_resp.get("orderid")
+                        log.info(f"Re-armed SL for {sym} @ {pos['sl_price']}")
+                    else:
+                        log.error(f"Re-arm SL for {sym} rejected: {sl_resp}")
+                except Exception as e:
+                    log.error(f"Failed to re-arm SL for {sym}: {e}")
+            log.warning(
+                f"Adopting position with RESTORED context: {sym} qty={pos['qty']} "
+                f"@ {pos.get('entry_opt_price')} | SL: {pos.get('sl_price')} | T1: {pos.get('target_price')}")
+            positions[sym] = pos
+        else:
+            log.warning(f"Adopting unknown orphan (EOD-exit-only): {sym} qty={orphan['qty']} @ {orphan['entry_price']}")
+            positions[sym] = {
+                "qty": orphan["qty"],
+                "sl_orderid": None,
+                "target_price": None,
+                "entry_opt_price": orphan["entry_price"],
+                "entry_candle_fp": None,
+                "adopted": True,
+            }
+        acquire_symbol_lock(sym, STRATEGY_NAME)
+    # Rewrite snapshot to current reality (drops stale entries broker no longer holds)
+    persist_positions(positions)
 
     while True:
         try:
@@ -619,6 +709,7 @@ def run_strategy():
                                 log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak reset")
                         release_symbol_lock(symbol, STRATEGY_NAME)
                         del positions[symbol]
+                        persist_positions(positions)
                         continue
 
                     # Check if option LTP has reached target — use smart order to close
@@ -654,6 +745,7 @@ def run_strategy():
                                     log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak reset")
                             release_symbol_lock(symbol, STRATEGY_NAME)
                             del positions[symbol]
+                            persist_positions(positions)
 
                     # ── Safety-net exits: max-hold-time and premium-decay ──
                     # Prevents slow-bleed when SL is cancelled (e.g. by RECONCILE on restart)
@@ -695,6 +787,7 @@ def run_strategy():
                                     log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak reset")
                             release_symbol_lock(symbol, STRATEGY_NAME)
                             del positions[symbol]
+                            persist_positions(positions)
                     continue  # skip entry check while in a position
 
                 # 5. Trigger trades on STRONG / WATCH transitions
@@ -763,11 +856,13 @@ def run_strategy():
                             positions[symbol] = {
                                 "qty": entry_qty,
                                 "sl_orderid": sl_orderid,
+                                "sl_price": res["sl"],
                                 "target_price": res["t1"],
                                 "entry_opt_price": entry_opt_price,
                                 "entry_time": datetime.now(),
                             }
                             trades_today += 1
+                            persist_positions(positions)
                             log.info(f"Trade entered: {symbol} | SL: {res['sl']} | T1: {res['t1']} | T2: {res['t2']} | T3: {res['t3']} | Opt entry: {entry_opt_price}")
                         else:
                             # Entry failed — release lock so other strategies can try

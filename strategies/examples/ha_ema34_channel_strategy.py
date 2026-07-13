@@ -9,6 +9,7 @@ import sys
 import signal
 import time
 import logging
+import json
 from datetime import datetime, date, timedelta, time as dtime
 from pathlib import Path
 import pandas as pd
@@ -97,6 +98,29 @@ def release_symbol_lock(symbol, strategy_name):
                 lock_file.unlink()
     except Exception:
         pass
+
+# ── Position state persistence (survive restarts with full SL/target context) ──
+# Bug 2026-07-13: a service restart orphaned an open position; old adoption only
+# knew entry price -> "EOD-exit-only". The snapshot lets a restart re-arm SL/target.
+STATE_DIR = Path("log") / "strategies" / "state"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+STATE_FILE = STATE_DIR / f"ha_ema34_channel_{UNDERLYING.upper()}.json"
+
+def persist_trade(trade):
+    """Snapshot the active trade to disk ({} when flat)."""
+    try:
+        STATE_FILE.write_text(json.dumps(trade or {}))
+    except Exception as e:
+        log.debug(f"persist_trade failed: {e}")
+
+def load_persisted_trade():
+    """Load the trade snapshot from a previous run. {} when absent/corrupt."""
+    try:
+        if STATE_FILE.exists():
+            return json.loads(STATE_FILE.read_text())
+    except Exception as e:
+        log.warning(f"load_persisted_trade failed: {e}")
+    return {}
 
 def reconcile_orphan_position(underlying):
     """Check positionbook for an open position matching this underlying. Returns adopted trade dict or None."""
@@ -286,7 +310,13 @@ def _graceful_shutdown(signum, frame):
                 log.info("Shutdown complete. Exiting.")
                 sys.exit(0)
 
-            if broker_qty is None or broker_qty <= 0:
+            if broker_qty is None:
+                # UNKNOWN (positionbook non-success, e.g. app restarting -> 502).
+                # Do NOT assume flat; keep lock + state so restart adoption re-arms it.
+                log.error(f"Shutdown: cannot verify {symbol} position — leaving untouched for restart adoption")
+                log.info("Shutdown complete. Exiting.")
+                sys.exit(0)
+            if broker_qty <= 0:
                 log.info(f"Shutdown: broker reports {symbol} qty={broker_qty} — already flat, no SELL")
                 release_symbol_lock(symbol, STRATEGY_NAME)
             else:
@@ -348,20 +378,32 @@ def run_strategy():
     # Adopt orphan position on boot (e.g. after restart while position was open)
     orphan = reconcile_orphan_position(UNDERLYING)
     if orphan:
-        log.warning(f"Adopting orphan position: {orphan['symbol']} qty={orphan['qty']} @ {orphan['entry_price']}")
-        active_trade = {
-            "symbol": orphan["symbol"],
-            "direction": orphan["direction"],
-            "entry_spot": None,        # unknown — orphan from prior session
-            "sl_spot": None,
-            "target_spot": None,
-            "qty": orphan["qty"],
-            "adopted": True,
-        }
+        saved = load_persisted_trade()
+        if saved and saved.get("symbol") == orphan["symbol"] and saved.get("sl_spot") is not None:
+            active_trade = dict(saved)
+            active_trade["qty"] = orphan["qty"]  # broker is authoritative on qty
+            active_trade.pop("adopted", None)
+            log.warning(
+                f"Adopting position with RESTORED context: {orphan['symbol']} qty={orphan['qty']} "
+                f"| SL: {active_trade.get('sl_spot')} | Target: {active_trade.get('target_spot')}")
+        else:
+            log.warning(f"Adopting unknown orphan (EOD-exit-only): {orphan['symbol']} qty={orphan['qty']} @ {orphan['entry_price']}")
+            active_trade = {
+                "symbol": orphan["symbol"],
+                "direction": orphan["direction"],
+                "entry_spot": None,        # unknown — orphan from prior session
+                "sl_spot": None,
+                "target_spot": None,
+                "qty": orphan["qty"],
+                "adopted": True,
+            }
         _active_trade = active_trade
         state = "IN_TRADE"
         acquire_symbol_lock(orphan["symbol"], STRATEGY_NAME)
         trade_date = date.today()  # seed so the new-day reset on first iteration does NOT wipe the adopted IN_TRADE state
+        persist_trade(active_trade)
+    else:
+        persist_trade({})  # broker holds nothing — clear any stale snapshot
 
     while True:
         try:
@@ -371,6 +413,7 @@ def run_strategy():
                 state = "IDLE"
                 active_trade = {}
                 _active_trade = {}
+                persist_trade({})
                 last_entry_candle_fp = None
                 consecutive_losses = 0
                 daily_loss_rs = 0.0
@@ -494,6 +537,7 @@ def run_strategy():
                     log.info("Trade closed — single-entry mode, done for the day.")
                     active_trade = {}
                     _active_trade = {}
+                    persist_trade({})
                 else:
                     time.sleep(5)  # Fast poll when in trade
                     continue
@@ -640,6 +684,7 @@ def run_strategy():
                             "entry_opt_price": entry_opt_price,
                         }
                         _active_trade = active_trade
+                        persist_trade(active_trade)
                         last_entry_candle_fp = current_candle_fp
                         log.info(f"Entered Trade! Spot Entry: {entry_spot:.2f} | SL: {sl_spot:.2f} | Target: {target_spot:.2f} | Opt entry: {entry_opt_price}")
                     else:

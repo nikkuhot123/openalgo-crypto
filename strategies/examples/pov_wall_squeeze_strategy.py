@@ -60,9 +60,12 @@ def _option_exchange(underlying: str) -> str:
     return "BFO" if underlying.upper() in _BSE_UNDERLYINGS else "NFO"
 
 # POV constants
-COOLDOWN_MINUTES = 15  # POV signal dedup cooldown (per-symbol action change)
+COOLDOWN_MINUTES = int(os.getenv('POV_COOLDOWN_MINUTES', '30'))  # POV signal dedup cooldown (per-symbol action change)
 LOSS_STREAK_LIMIT = int(os.getenv('LOSS_STREAK_LIMIT', '3'))
 DAILY_LOSS_LIMIT_RS = float(os.getenv('DAILY_LOSS_LIMIT_RS', '10000'))
+# High-conviction gating (cut over-trading / charge bleed — see cost analysis 2026-07-13)
+POV_MIN_SCORE = int(os.getenv('POV_MIN_SCORE', '5'))  # 5=STRONG only (all 5 conditions); 4 also allows WATCH
+POV_MAX_TRADES_PER_DAY = int(os.getenv('POV_MAX_TRADES_PER_DAY', '4'))  # hard daily entry cap per underlying (backstop)
 # Safety-net exits (prevent slow-bleed when SL is cancelled/orphaned by restart)
 MAX_HOLD_MINUTES = int(os.getenv('MAX_HOLD_MINUTES', '45'))  # close if held longer than this without hitting T1
 DECAY_EXIT_PCT = float(os.getenv('DECAY_EXIT_PCT', '0.60'))  # close if LTP < this fraction of entry price
@@ -481,6 +484,7 @@ def run_strategy():
     daily_loss_rs = 0.0
     halted = False
     trade_date_pov = None
+    trades_today = 0
 
     # Adopt orphan positions on boot
     orphans = reconcile_orphan_positions(UNDERLYING)
@@ -504,6 +508,7 @@ def run_strategy():
                 consecutive_losses = 0
                 daily_loss_rs = 0.0
                 halted = False
+                trades_today = 0
                 log.info(f"--- New trading day initialized: {trade_date_pov} ---")
 
             # Circuit breaker — once halted, only manage existing positions, no new entries
@@ -697,7 +702,10 @@ def run_strategy():
                 if halted:
                     continue
 
-                if res["action"] in {"STRONG", "WATCH"} and res["is_new"]:
+                if res["score"] >= POV_MIN_SCORE and res["is_new"] and res["entry"] is not None:
+                    if trades_today >= POV_MAX_TRADES_PER_DAY:
+                        log.info(f"Daily trade cap reached ({trades_today}/{POV_MAX_TRADES_PER_DAY}) for {UNDERLYING}. Skipping {symbol} entry.")
+                        continue
                     if not positions.get(symbol):
                         # Symbol lock: skip if another strategy holds this symbol
                         if not acquire_symbol_lock(symbol, STRATEGY_NAME):
@@ -759,6 +767,7 @@ def run_strategy():
                                 "entry_opt_price": entry_opt_price,
                                 "entry_time": datetime.now(),
                             }
+                            trades_today += 1
                             log.info(f"Trade entered: {symbol} | SL: {res['sl']} | T1: {res['t1']} | T2: {res['t2']} | T3: {res['t3']} | Opt entry: {entry_opt_price}")
                         else:
                             # Entry failed — release lock so other strategies can try

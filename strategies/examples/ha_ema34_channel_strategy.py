@@ -144,6 +144,20 @@ def reconcile_orphan_position(underlying):
         log.debug(f"Reconcile failed: {e}")
     return None
 
+def live_position_qty(underlying, symbol):
+    """Broker's current qty on `symbol`: >0 held, 0 absent, None if unverifiable."""
+    try:
+        pb = client.positionbook()
+        if not isinstance(pb, dict) or pb.get("status") != "success":
+            return None
+        for pos in pb.get("data", []):
+            if (pos.get("symbol", "") or "").upper() == symbol.upper():
+                return abs(int(pos.get("quantity", 0) or 0))
+        return 0
+    except Exception as e:
+        log.debug(f"live_position_qty failed for {symbol}: {e}")
+        return None
+
 def fetch_available_capital():
     """Query funds API for current available cash. Returns float or None."""
     try:
@@ -502,31 +516,40 @@ def run_strategy():
 
                 if exit_triggered:
                     log.info(f"!!! {exit_reason} !!! Closing position on {symbol}...")
+                    # Sell only what the broker ACTUALLY holds — prevents naked-short
+                    # exit SELLs (paper entry + live exit after mode toggle, rejected
+                    # entry, already-closed position — bug 2026-07-14).
+                    bq = live_position_qty(UNDERLYING, symbol)
+                    if bq is None:
+                        log.warning(f"{exit_reason}: cannot verify broker position for {symbol} — deferring exit")
+                        time.sleep(5)
+                        continue
                     # Capture option LTP before exit to compute trade P&L (validated against spot)
                     pre_exit_opt_ltp = fetch_option_ltp(symbol, opt_exchange, underlying_ltp=underlying_ltp)
-
-                    order_resp = client.placeorder(
-                        strategy=STRATEGY_NAME,
-                        symbol=symbol,
-                        action="SELL",
-                        exchange=opt_exchange,
-                        price_type="MARKET",
-                        product=PRODUCT,
-                        quantity=qty
-                    )
-                    log.info(f"Exit Order Response: {order_resp}")
-
-                    # Compute trade P&L (option BUY entry → SELL exit)
-                    entry_opt_price = active_trade.get("entry_opt_price")
-                    if entry_opt_price is not None and pre_exit_opt_ltp is not None:
-                        trade_pnl = (pre_exit_opt_ltp - entry_opt_price) * qty
-                        if trade_pnl < 0:
-                            consecutive_losses += 1
-                            daily_loss_rs += abs(trade_pnl)
-                            log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak: {consecutive_losses} | Daily losses: ₹{daily_loss_rs:.0f}")
-                        else:
-                            consecutive_losses = 0
-                            log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak reset")
+                    if bq > 0:
+                        order_resp = client.placeorder(
+                            strategy=STRATEGY_NAME,
+                            symbol=symbol,
+                            action="SELL",
+                            exchange=opt_exchange,
+                            price_type="MARKET",
+                            product=PRODUCT,
+                            quantity=min(bq, qty)
+                        )
+                        log.info(f"Exit Order Response: {order_resp}")
+                        # Compute trade P&L (option BUY entry → SELL exit)
+                        entry_opt_price = active_trade.get("entry_opt_price")
+                        if entry_opt_price is not None and pre_exit_opt_ltp is not None:
+                            trade_pnl = (pre_exit_opt_ltp - entry_opt_price) * qty
+                            if trade_pnl < 0:
+                                consecutive_losses += 1
+                                daily_loss_rs += abs(trade_pnl)
+                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak: {consecutive_losses} | Daily losses: ₹{daily_loss_rs:.0f}")
+                            else:
+                                consecutive_losses = 0
+                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak reset")
+                    else:
+                        log.warning(f"{exit_reason}: broker flat on {symbol} — no long to close; skipping SELL to avoid naked short")
 
                     # Release symbol lock
                     release_symbol_lock(symbol, STRATEGY_NAME)

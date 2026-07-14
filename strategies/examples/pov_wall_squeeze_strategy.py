@@ -203,6 +203,30 @@ def safe_cancel_order(order_id, context=""):
 
     return False, f"{resp.get('message', resp)}"
 
+def verified_exit_sell(symbol, opt_exchange, qty, sl_oid, reason):
+    """Cancel the protective SL and SELL only what the broker ACTUALLY holds.
+    Prevents naked-short exit SELLs (paper entry + live exit after a mode toggle,
+    rejected/partial entry, or an already-closed position — bug 2026-07-14).
+    Returns 'sold' | 'flat' (broker holds nothing) | 'unknown' (unverifiable).
+    """
+    bq = live_position_qty(UNDERLYING, symbol)
+    if bq is None:
+        log.warning(f"{reason}: cannot verify broker position for {symbol} — deferring exit")
+        return "unknown"
+    if sl_oid:
+        ok, msg = safe_cancel_order(sl_oid, context=f"{reason}-{symbol}")
+        (log.info if ok else log.warning)(f"{reason}: cancel SL {sl_oid} → {msg}")
+    if bq <= 0:
+        log.warning(f"{reason}: broker flat on {symbol} — no long to close; skipping SELL to avoid naked short")
+        return "flat"
+    close_qty = min(bq, qty)
+    resp = client.placeorder(
+        strategy=STRATEGY_NAME, symbol=symbol, action="SELL",
+        exchange=opt_exchange, price_type="MARKET",
+        product=PRODUCT, quantity=close_qty)
+    log.info(f"{reason} exit response for {symbol}: {resp}")
+    return "sold"
+
 def sync_positions_with_book(positions, underlying):
     """Drop tracked positions that are no longer open on the broker side.
     Cancels any associated SL order and releases the symbol lock.
@@ -717,32 +741,20 @@ def run_strategy():
                         opt_ltp = df_opt.iloc[-2]["close"]  # last completed candle close
                         if opt_ltp >= target_price:
                             log.info(f"Target reached for {symbol}! LTP {opt_ltp:.2f} >= T1 {target_price:.2f}")
-                            # Cancel the SL order first
-                            if sl_oid:
-                                ok, msg = safe_cancel_order(sl_oid, context=f"target-{symbol}")
-                                level = log.info if ok else log.warning
-                                level(f"Target-exit: cancel SL {sl_oid} → {msg}")
-                            # Close position with explicit quantity
-                            exit_resp = client.placeorder(
-                                strategy=STRATEGY_NAME,
-                                symbol=symbol,
-                                action="SELL",
-                                exchange=opt_exchange,
-                                price_type="MARKET",
-                                product=PRODUCT,
-                                quantity=pos.get("qty", QUANTITY)
-                            )
-                            # Compute P&L
-                            entry_opt_price = pos.get("entry_opt_price")
-                            if entry_opt_price is not None:
-                                trade_pnl = (float(opt_ltp) - entry_opt_price) * pos.get("qty", QUANTITY)
-                                if trade_pnl < 0:
-                                    consecutive_losses += 1
-                                    daily_loss_rs += abs(trade_pnl)
-                                    log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak: {consecutive_losses} | Daily losses: ₹{daily_loss_rs:.0f}")
-                                else:
-                                    consecutive_losses = 0
-                                    log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak reset")
+                            outcome = verified_exit_sell(symbol, opt_exchange, pos.get("qty", QUANTITY), sl_oid, "Target-exit")
+                            if outcome == "unknown":
+                                continue  # broker unverifiable — keep tracking, retry next cycle
+                            if outcome == "sold":
+                                entry_opt_price = pos.get("entry_opt_price")
+                                if entry_opt_price is not None:
+                                    trade_pnl = (float(opt_ltp) - entry_opt_price) * pos.get("qty", QUANTITY)
+                                    if trade_pnl < 0:
+                                        consecutive_losses += 1
+                                        daily_loss_rs += abs(trade_pnl)
+                                        log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak: {consecutive_losses} | Daily losses: ₹{daily_loss_rs:.0f}")
+                                    else:
+                                        consecutive_losses = 0
+                                        log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak reset")
                             release_symbol_lock(symbol, STRATEGY_NAME)
                             del positions[symbol]
                             persist_positions(positions)
@@ -768,15 +780,10 @@ def run_strategy():
                                 _force_exit = f"Decay exit (LTP {opt_ltp:.2f} < {DECAY_EXIT_PCT:.0%} of entry {entry_opt_price:.2f})"
                         if _force_exit:
                             log.warning(f"!!! {_force_exit} !!! Closing {symbol}...")
-                            if sl_oid:
-                                safe_cancel_order(sl_oid, context=f"force-exit-{symbol}")
-                            exit_resp = client.placeorder(
-                                strategy=STRATEGY_NAME, symbol=symbol, action="SELL",
-                                exchange=opt_exchange, price_type="MARKET",
-                                product=PRODUCT, quantity=pos.get("qty", QUANTITY)
-                            )
-                            log.info(f"Force-exit order response: {exit_resp}")
-                            if entry_opt_price is not None:
+                            outcome = verified_exit_sell(symbol, opt_exchange, pos.get("qty", QUANTITY), sl_oid, "Force-exit")
+                            if outcome == "unknown":
+                                continue  # broker unverifiable — keep tracking, retry next cycle
+                            if outcome == "sold" and entry_opt_price is not None:
                                 trade_pnl = (opt_ltp - entry_opt_price) * pos.get("qty", QUANTITY)
                                 if trade_pnl < 0:
                                     consecutive_losses += 1

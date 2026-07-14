@@ -222,11 +222,11 @@ def _live_trade_rows(api_key, start_date):
 
 
 def _live_open_positions(api_key, underlying):
-    from services.positionbook_service import get_positions
+    from services.positionbook_service import get_positionbook
 
     out = []
     try:
-        ok, resp, _ = get_positions(api_key=api_key)
+        ok, resp, _ = get_positionbook(api_key=api_key)
         if not ok:
             return out
         for p in resp.get("data", []) or []:

@@ -68,6 +68,11 @@ BREAKOUT_MULT = float(os.getenv('BREAKOUT_MULT', '1.0'))
 # Circuit breaker config (replaces COOLDOWN_MINUTES / MAX_TRADES_PER_DAY)
 LOSS_STREAK_LIMIT = int(os.getenv('LOSS_STREAK_LIMIT', '3'))
 DAILY_LOSS_LIMIT_RS = float(os.getenv('DAILY_LOSS_LIMIT_RS', '10000'))
+# Option-premium stop (POV-style broker SL-M on the option itself) — catches
+# premium decay/bleed that the spot-based SL misses (bug 2026-07-16: a CE bled
+# 169->82, -51%, while spot held above the spot-SL). Exit if the option premium
+# falls >= this % below entry. Broker-side, so it also protects across restarts.
+PREMIUM_SL_PCT = float(os.getenv('PREMIUM_SL_PCT', '35'))
 
 # Symbol lock dir (shared across all strategies on this host)
 LOCKS_DIR = Path("log") / "strategies" / "locks"
@@ -293,6 +298,21 @@ _shutdown_requested = False
 _active_trade = {}
 _opt_exchange = None
 
+def safe_cancel_order(order_id, context=""):
+    """Cancel an order; treat already complete/cancelled/rejected/not-found as success."""
+    try:
+        resp = client.cancelorder(order_id=order_id, strategy=STRATEGY_NAME)
+        if isinstance(resp, dict):
+            if resp.get("status") == "success":
+                return True
+            msg = str(resp.get("message", resp)).lower()
+            if any(k in msg for k in ("complete", "cancel", "reject", "not found", "not open", "no order")):
+                return True
+        return False
+    except Exception as e:
+        log.debug(f"cancel {order_id} ({context}) failed: {e}")
+        return False
+
 def _graceful_shutdown(signum, frame):
     """Handle Ctrl+C / SIGTERM: close active position, then exit."""
     global _shutdown_requested
@@ -330,6 +350,10 @@ def _graceful_shutdown(signum, frame):
                 log.error(f"Shutdown: cannot verify {symbol} position — leaving untouched for restart adoption")
                 log.info("Shutdown complete. Exiting.")
                 sys.exit(0)
+            # Position state known — cancel any resting option SL-M (avoid lingering naked short)
+            _sl_oid = _active_trade.get("opt_sl_orderid")
+            if _sl_oid:
+                safe_cancel_order(_sl_oid, context=f"shutdown-{symbol}")
             if broker_qty <= 0:
                 log.info(f"Shutdown: broker reports {symbol} qty={broker_qty} — already flat, no SELL")
                 release_symbol_lock(symbol, STRATEGY_NAME)
@@ -484,6 +508,36 @@ def run_strategy():
                 target_spot = active_trade["target_spot"]
                 qty = active_trade["qty"]
 
+                # Premium SL-M (POV-style broker stop on the option) — did it fill?
+                opt_sl_oid = active_trade.get("opt_sl_orderid")
+                if opt_sl_oid:
+                    o_st = ""
+                    try:
+                        st = client.orderstatus(order_id=opt_sl_oid, strategy=STRATEGY_NAME)
+                        if isinstance(st, dict):
+                            o_st = ((st.get("data") or {}).get("order_status") or "").lower()
+                    except Exception:
+                        o_st = ""
+                    if o_st == "complete":
+                        exit_px = active_trade.get("opt_sl_price")
+                        entry_opt_price = active_trade.get("entry_opt_price")
+                        log.info(f"!!! Premium SL Hit !!! Option SL-M filled on {symbol} @ ~{exit_px}")
+                        if entry_opt_price is not None and exit_px is not None:
+                            trade_pnl = (exit_px - entry_opt_price) * qty
+                            if trade_pnl < 0:
+                                consecutive_losses += 1
+                                daily_loss_rs += abs(trade_pnl)
+                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak: {consecutive_losses} | Daily losses: ₹{daily_loss_rs:.0f}")
+                            else:
+                                consecutive_losses = 0
+                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak reset")
+                        release_symbol_lock(symbol, STRATEGY_NAME)
+                        state = "DONE"
+                        active_trade = {}
+                        _active_trade = {}
+                        persist_trade({})
+                        continue
+
                 # Adopted orphans from prior sessions have no SL/target — log a marker and only do EOD exit
                 is_adopted = active_trade.get("adopted") and (sl_spot is None or target_spot is None)
                 if is_adopted:
@@ -516,6 +570,10 @@ def run_strategy():
 
                 if exit_triggered:
                     log.info(f"!!! {exit_reason} !!! Closing position on {symbol}...")
+                    # Cancel the resting premium SL-M first (avoid lingering naked short)
+                    opt_sl_oid = active_trade.get("opt_sl_orderid")
+                    if opt_sl_oid:
+                        safe_cancel_order(opt_sl_oid, context=f"{exit_reason}-{symbol}")
                     # Sell only what the broker ACTUALLY holds — prevents naked-short
                     # exit SELLs (paper entry + live exit after mode toggle, rejected
                     # entry, already-closed position — bug 2026-07-14).
@@ -697,6 +755,31 @@ def run_strategy():
 
                     if order_resp.get("status") == "success":
                         state = "IN_TRADE"
+                        # POV-style premium stop: SL-M SELL on the option at
+                        # entry_premium * (1 - PREMIUM_SL_PCT%), tick-aligned to 0.05.
+                        opt_sl_orderid = None
+                        opt_sl_price = None
+                        if entry_opt_price is not None:
+                            _raw = entry_opt_price * (1.0 - PREMIUM_SL_PCT / 100.0)
+                            opt_sl_price = round(round(_raw / 0.05) * 0.05, 2)
+                            try:
+                                sl_resp = client.placeorder(
+                                    strategy=STRATEGY_NAME,
+                                    symbol=opt_symbol,
+                                    action="SELL",
+                                    exchange=opt_exchange,
+                                    price_type="SL-M",
+                                    trigger_price=opt_sl_price,
+                                    product=PRODUCT,
+                                    quantity=entry_qty
+                                )
+                                if isinstance(sl_resp, dict) and sl_resp.get("status") == "success":
+                                    opt_sl_orderid = sl_resp.get("orderid")
+                                    log.info(f"Premium SL-M placed @ {opt_sl_price} ({PREMIUM_SL_PCT:.0f}% below entry {entry_opt_price}) — order {opt_sl_orderid}")
+                                else:
+                                    log.warning(f"Premium SL-M order rejected: {sl_resp}")
+                            except Exception as e:
+                                log.error(f"Failed to place premium SL-M: {e}")
                         active_trade = {
                             "symbol": opt_symbol,
                             "direction": signal,
@@ -705,11 +788,13 @@ def run_strategy():
                             "target_spot": target_spot,
                             "qty": entry_qty,
                             "entry_opt_price": entry_opt_price,
+                            "opt_sl_orderid": opt_sl_orderid,
+                            "opt_sl_price": opt_sl_price,
                         }
                         _active_trade = active_trade
                         persist_trade(active_trade)
                         last_entry_candle_fp = current_candle_fp
-                        log.info(f"Entered Trade! Spot Entry: {entry_spot:.2f} | SL: {sl_spot:.2f} | Target: {target_spot:.2f} | Opt entry: {entry_opt_price}")
+                        log.info(f"Entered Trade! Spot Entry: {entry_spot:.2f} | SL: {sl_spot:.2f} | Target: {target_spot:.2f} | Opt entry: {entry_opt_price} | Prem SL: {opt_sl_price}")
                     else:
                         # Entry failed — release lock so other strategies can try
                         release_symbol_lock(opt_symbol, STRATEGY_NAME)

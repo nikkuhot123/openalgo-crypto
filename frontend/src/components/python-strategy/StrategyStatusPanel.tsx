@@ -1,18 +1,23 @@
-import { useEffect, useState, useCallback } from 'react'
 import {
+  Activity,
   ChevronDown,
   ChevronUp,
-  Activity,
-  TrendingUp,
-  TrendingDown,
-  Target,
   Shield,
+  Target,
+  TrendingDown,
+  TrendingUp,
 } from 'lucide-react'
-import { Card, CardContent } from '@/components/ui/card'
-import { Badge } from '@/components/ui/badge'
-import { Collapsible, CollapsibleTrigger, CollapsibleContent } from '@/components/ui/collapsible'
+import { useCallback, useEffect, useState } from 'react'
 import { pythonStrategyApi } from '@/api/python-strategy'
-import type { PythonStrategy, StrategyStatus, ActiveTrade, StrategyMetrics } from '@/types/python-strategy'
+import { Badge } from '@/components/ui/badge'
+import { Card, CardContent } from '@/components/ui/card'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
+import type {
+  ActiveTrade,
+  PythonStrategy,
+  StrategyMetrics,
+  StrategyStatus,
+} from '@/types/python-strategy'
 
 const STATE_BADGE_CLASSES: Record<string, string> = {
   IDLE: 'bg-blue-500/15 text-blue-700 border-blue-500/25 dark:text-blue-400',
@@ -67,7 +72,9 @@ function TradeGauge({ trade }: { trade: ActiveTrade }) {
   const progress = computeGaugeProgress(trade)
   const entryPct = entryMarkerPercent(trade)
   const profitable = isProfit(trade)
-  const pnlColor = profitable ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'
+  const pnlColor = profitable
+    ? 'text-green-600 dark:text-green-400'
+    : 'text-red-600 dark:text-red-400'
   const dotColor = profitable ? 'bg-green-500' : 'bg-red-500'
 
   return (
@@ -146,10 +153,10 @@ export default function StrategyStatusPanel({ strategy }: StrategyStatusPanelPro
   const fetchMetrics = useCallback(async () => {
     try {
       const data = await pythonStrategyApi.getStrategyMetrics(strategy.id, period)
-      // Only store if the response has the expected shape; discard error payloads
-      if (data?.performance) setMetrics(data)
+      // Keep the last good snapshot on transient errors; only replace on success.
+      if (data?.status === 'success') setMetrics(data)
     } catch {
-      // ignore
+      // ignore — retain last-good metrics
     }
   }, [strategy.id, period])
   const fetchStatus = useCallback(async () => {
@@ -161,24 +168,29 @@ export default function StrategyStatusPanel({ strategy }: StrategyStatusPanelPro
     }
   }, [strategy.id])
 
+  // Poll status even while collapsed (slower cadence) so the header shows armed
+  // trades at a glance; poll fast + pull metrics only while expanded.
   useEffect(() => {
-    if (!isOpen) return
+    const runningNow = strategy.status === 'running'
+    if (!runningNow && !isOpen) return
 
-    // Fetch immediately on open
     fetchStatus()
-    fetchMetrics()
+    if (isOpen) fetchMetrics()
 
-    const intervalId = setInterval(fetchStatus, 3000)
-    const metricsIntervalId = setInterval(fetchMetrics, 15000)
+    const statusMs = isOpen ? 3000 : 12000
+    const intervalId = setInterval(fetchStatus, statusMs)
+    const metricsIntervalId = isOpen ? setInterval(fetchMetrics, 15000) : null
     return () => {
       clearInterval(intervalId)
-      clearInterval(metricsIntervalId)
+      clearInterval(metricsIntervalId ?? undefined)
     }
-  }, [isOpen, fetchStatus, fetchMetrics])
+  }, [isOpen, strategy.status, fetchStatus, fetchMetrics])
 
   const isRunning = strategy.status === 'running'
   const state = status?.state ?? (isRunning ? 'IDLE' : 'INACTIVE')
   const badgeClasses = STATE_BADGE_CLASSES[state] ?? STATE_BADGE_CLASSES.INACTIVE
+  const activeTrades = status?.active_trades ?? []
+  const headerTrade = activeTrades[0]
 
   return (
     <Collapsible open={isOpen} onOpenChange={setIsOpen}>
@@ -188,14 +200,32 @@ export default function StrategyStatusPanel({ strategy }: StrategyStatusPanelPro
             type="button"
             className="flex w-full items-center justify-between px-4 py-3 text-left hover:bg-muted/50 transition-colors"
           >
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-3 min-w-0">
               <Activity
-                className={`h-4 w-4 ${isRunning ? 'text-green-500 animate-pulse' : 'text-muted-foreground'}`}
+                className={`h-4 w-4 shrink-0 ${isRunning ? 'text-green-500 animate-pulse' : 'text-muted-foreground'}`}
               />
-              <span className="text-sm font-medium">{strategy.name}</span>
+              <span className="text-sm font-medium truncate">{strategy.name}</span>
               <Badge variant="outline" className={badgeClasses}>
                 {state.replace('_', ' ')}
               </Badge>
+              {headerTrade && (
+                <Badge
+                  variant="outline"
+                  className={
+                    headerTrade.direction === 'CE'
+                      ? 'bg-green-500/15 text-green-700 border-green-500/25 dark:text-green-400 font-mono'
+                      : 'bg-red-500/15 text-red-700 border-red-500/25 dark:text-red-400 font-mono'
+                  }
+                >
+                  {headerTrade.symbol}
+                  {activeTrades.length > 1 ? ` +${activeTrades.length - 1}` : ''}
+                </Badge>
+              )}
+              {metrics?.mode && (
+                <span className="text-[10px] uppercase tracking-wider text-muted-foreground border rounded px-1.5 py-0.5">
+                  {metrics.mode === 'analyze' ? 'Paper' : 'Live'}
+                </span>
+              )}
             </div>
             {isOpen ? (
               <ChevronUp className="h-4 w-4 text-muted-foreground" />
@@ -287,42 +317,53 @@ export default function StrategyStatusPanel({ strategy }: StrategyStatusPanelPro
 
                 {/* Metrics Grid */}
                 {metrics.performance && (
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                  <div className="rounded-md border p-3">
-                    <p className="text-xs text-muted-foreground font-medium">Realized P&amp;L</p>
-                    <span className={`text-sm font-semibold mt-0.5 block ${
-                      (metrics.performance.realized_pnl ?? 0) >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'
-                    }`}>
-                      ₹{(metrics.performance.realized_pnl ?? 0) >= 0 ? '+' : ''}{(metrics.performance.realized_pnl ?? 0).toFixed(2)}
-                    </span>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div className="rounded-md border p-3">
+                      <p className="text-xs text-muted-foreground font-medium">Realized P&amp;L</p>
+                      <span
+                        className={`text-sm font-semibold mt-0.5 block ${
+                          (metrics.performance.realized_pnl ?? 0) >= 0
+                            ? 'text-green-600 dark:text-green-400'
+                            : 'text-red-600 dark:text-red-400'
+                        }`}
+                      >
+                        ₹{(metrics.performance.realized_pnl ?? 0) >= 0 ? '+' : ''}
+                        {(metrics.performance.realized_pnl ?? 0).toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="rounded-md border p-3">
+                      <p className="text-xs text-muted-foreground font-medium">Win Rate</p>
+                      <span className="text-sm font-semibold mt-0.5 block">
+                        {(metrics.performance.win_rate ?? 0).toFixed(1)}% (
+                        {metrics.performance.wins ?? 0}W / {metrics.performance.losses ?? 0}L)
+                      </span>
+                    </div>
+                    <div className="rounded-md border p-3">
+                      <p className="text-xs text-muted-foreground font-medium">Profit Factor</p>
+                      <span className="text-sm font-semibold mt-0.5 block">
+                        {metrics.performance.profit_factor === null ||
+                        metrics.performance.profit_factor === undefined
+                          ? '—'
+                          : metrics.performance.profit_factor === Infinity
+                            ? '∞'
+                            : metrics.performance.profit_factor.toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="rounded-md border p-3">
+                      <p className="text-xs text-muted-foreground font-medium">Total Trades</p>
+                      <span className="text-sm font-semibold mt-0.5 block">
+                        {metrics.performance.trades ?? 0}
+                      </span>
+                    </div>
                   </div>
-                  <div className="rounded-md border p-3">
-                    <p className="text-xs text-muted-foreground font-medium">Win Rate</p>
-                    <span className="text-sm font-semibold mt-0.5 block">
-                      {(metrics.performance.win_rate ?? 0).toFixed(1)}% ({metrics.performance.wins ?? 0}W / {metrics.performance.losses ?? 0}L)
-                    </span>
-                  </div>
-                  <div className="rounded-md border p-3">
-                    <p className="text-xs text-muted-foreground font-medium">Profit Factor</p>
-                    <span className="text-sm font-semibold mt-0.5 block">
-                      {metrics.performance.profit_factor === null || metrics.performance.profit_factor === undefined ? '—' :
-                       metrics.performance.profit_factor === Infinity ? '∞' :
-                       metrics.performance.profit_factor.toFixed(2)}
-                    </span>
-                  </div>
-                  <div className="rounded-md border p-3">
-                    <p className="text-xs text-muted-foreground font-medium">Total Trades</p>
-                    <span className="text-sm font-semibold mt-0.5 block">
-                      {metrics.performance.trades ?? 0}
-                    </span>
-                  </div>
-                </div>
                 )}
 
                 {/* Open Positions (Database / Live) */}
                 {metrics.positions.length > 0 && (
                   <div className="space-y-2">
-                    <h5 className="text-xs font-semibold uppercase text-muted-foreground tracking-wider">Open Positions (DB)</h5>
+                    <h5 className="text-xs font-semibold uppercase text-muted-foreground tracking-wider">
+                      Open Positions (DB)
+                    </h5>
                     <div className="rounded-md border overflow-hidden">
                       <table className="w-full text-xs text-left">
                         <thead className="bg-muted text-muted-foreground font-medium border-b">
@@ -338,10 +379,19 @@ export default function StrategyStatusPanel({ strategy }: StrategyStatusPanelPro
                           {metrics.positions.map((p) => (
                             <tr key={p.symbol}>
                               <td className="px-3 py-2 font-mono">{p.symbol}</td>
-                              <td className={`px-3 py-2 text-right font-medium ${p.qty >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>{p.qty}</td>
+                              <td
+                                className={`px-3 py-2 text-right font-medium ${p.qty >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}
+                              >
+                                {p.qty}
+                              </td>
                               <td className="px-3 py-2 text-right">₹{p.avg_price.toFixed(2)}</td>
                               <td className="px-3 py-2 text-right">₹{p.ltp.toFixed(2)}</td>
-                              <td className={`px-3 py-2 text-right font-semibold ${p.pnl >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>₹{p.pnl >= 0 ? '+' : ''}{p.pnl.toFixed(2)}</td>
+                              <td
+                                className={`px-3 py-2 text-right font-semibold ${p.pnl >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}
+                              >
+                                ₹{p.pnl >= 0 ? '+' : ''}
+                                {p.pnl.toFixed(2)}
+                              </td>
                             </tr>
                           ))}
                         </tbody>
@@ -352,9 +402,13 @@ export default function StrategyStatusPanel({ strategy }: StrategyStatusPanelPro
 
                 {/* Recent Completed Trades */}
                 <div className="space-y-2">
-                  <h5 className="text-xs font-semibold uppercase text-muted-foreground tracking-wider">Recent Completed Trades</h5>
+                  <h5 className="text-xs font-semibold uppercase text-muted-foreground tracking-wider">
+                    Recent Completed Trades
+                  </h5>
                   {metrics.trades.length === 0 ? (
-                    <p className="text-xs text-muted-foreground py-1">No completed trades in this period</p>
+                    <p className="text-xs text-muted-foreground py-1">
+                      No completed trades in this period
+                    </p>
                   ) : (
                     <div className="rounded-md border overflow-hidden">
                       <table className="w-full text-xs text-left">
@@ -372,17 +426,34 @@ export default function StrategyStatusPanel({ strategy }: StrategyStatusPanelPro
                         <tbody className="divide-y">
                           {metrics.trades.map((t, idx) => (
                             <tr key={`${t.symbol}-${idx}`}>
-                              <td className="px-3 py-2 whitespace-nowrap">{t.date} <span className="text-muted-foreground text-[10px]">{t.exit_time}</span></td>
+                              <td className="px-3 py-2 whitespace-nowrap">
+                                {t.date}{' '}
+                                <span className="text-muted-foreground text-[10px]">
+                                  {t.exit_time}
+                                </span>
+                              </td>
                               <td className="px-3 py-2 font-mono">{t.symbol}</td>
                               <td className="px-3 py-2 text-center">
-                                <Badge variant="outline" className={t.dir === 'CE' ? 'bg-green-500/10 text-green-700 border-green-500/20' : 'bg-red-500/10 text-red-700 border-red-500/20'}>
+                                <Badge
+                                  variant="outline"
+                                  className={
+                                    t.dir === 'CE'
+                                      ? 'bg-green-500/10 text-green-700 border-green-500/20'
+                                      : 'bg-red-500/10 text-red-700 border-red-500/20'
+                                  }
+                                >
                                   {t.dir}
                                 </Badge>
                               </td>
                               <td className="px-3 py-2 text-right">{t.qty}</td>
                               <td className="px-3 py-2 text-right">₹{t.entry.toFixed(2)}</td>
                               <td className="px-3 py-2 text-right">₹{t.exit.toFixed(2)}</td>
-                              <td className={`px-3 py-2 text-right font-semibold ${t.pnl >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>₹{t.pnl >= 0 ? '+' : ''}{t.pnl.toFixed(2)}</td>
+                              <td
+                                className={`px-3 py-2 text-right font-semibold ${t.pnl >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}
+                              >
+                                ₹{t.pnl >= 0 ? '+' : ''}
+                                {t.pnl.toFixed(2)}
+                              </td>
                             </tr>
                           ))}
                         </tbody>

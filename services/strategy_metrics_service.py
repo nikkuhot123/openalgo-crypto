@@ -16,8 +16,10 @@ requested strategy by (display_name, underlying-prefix). This makes the SELL tag
 irrelevant and reconciles to the account-level daily P&L.
 """
 
+import re
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from utils.logging import get_logger
 
@@ -66,6 +68,44 @@ def _direction(symbol):
     if s.endswith("PE"):
         return "PE"
     return "?"
+
+
+# ── per-strategy symbol ownership (from each strategy's own log files) ────────
+
+_OPT_SYMBOL_RE = re.compile(r"\b([A-Z]{3,}\d{2}[A-Z0-9]*(?:CE|PE))\b")
+
+
+def _strategy_log_symbols(strategy_id, start_date, logs_dir):
+    """Set of option symbols THIS strategy traded, read from its own log files.
+
+    Each strategy writes `{strategy_id}_{YYYYMMDD_HHMMSS}_IST.log`, so the log is
+    an authoritative per-strategy record. This is the attribution key that works
+    in BOTH modes: the live broker tradebook carries no strategy tag, and two
+    same-underlying variants share a display name — only the log distinguishes
+    which symbols each actually traded. Empty set => caller falls back to the
+    opener strategy tag (analyzer-only)."""
+    symbols = set()
+    if not logs_dir:
+        return symbols
+    try:
+        files = list(Path(logs_dir).glob(f"{strategy_id}_[0-9]*.log"))
+    except Exception:
+        return symbols
+    cutoff = None
+    if start_date is not None:
+        # one-day slack: a leg opened just before the window is still ours
+        cutoff = datetime.combine(start_date - timedelta(days=1), datetime.min.time())
+    for fp in files:
+        try:
+            if cutoff is not None and datetime.fromtimestamp(fp.stat().st_mtime) < cutoff:
+                continue
+            with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if "CE" in line or "PE" in line:
+                        symbols.update(_OPT_SYMBOL_RE.findall(line))
+        except Exception:
+            continue
+    return symbols
 
 
 # ── core FIFO attribution ────────────────────────────────────────────────────
@@ -249,7 +289,7 @@ def _live_open_positions(api_key, underlying):
 # ── public entry point ───────────────────────────────────────────────────────
 
 def get_strategy_metrics(strategy_id, strategy_configs, user_id="nikhil",
-                         period="week", api_key=None, trade_limit=50):
+                         period="week", api_key=None, trade_limit=50, logs_dir=None):
     """Return {performance, trades, positions, meta} for one strategy_id.
 
     strategy_configs: the live STRATEGY_CONFIGS dict (passed in to avoid import cycle).
@@ -277,11 +317,27 @@ def get_strategy_metrics(strategy_id, strategy_configs, user_id="nikhil",
 
     round_trips, open_legs = _fifo_round_trips(rows)
 
-    # 1. Filter to this strategy's variant
-    mine = [
-        rt for rt in round_trips
-        if (rt["opener"] == display or rt["opener"] is None) and _owns(rt["symbol"], underlying)
-    ]
+    # Per-strategy symbol ownership from this strategy's own log files —
+    # authoritative in both modes (empty => fall back to opener tag below).
+    log_syms = _strategy_log_symbols(strategy_id, start_date, logs_dir)
+
+    # 1. Filter to THIS strategy: underlying prefix AND (traded in its own log OR
+    #    tagged to this exact display). The removed `opener is None` clause used
+    #    to fan every untagged round-trip (ALL live trades) onto every
+    #    same-underlying strategy — that was the cross-strategy leak.
+    def _mine(rt):
+        if not _owns(rt["symbol"], underlying):
+            return False
+        if rt["symbol"] in log_syms:
+            return True
+        return rt["opener"] is not None and rt["opener"] == display
+
+    mine = [rt for rt in round_trips if _mine(rt)]
+
+    # Open positions carry no strategy tag; attribute by the log symbol set so
+    # one strategy's legs don't show on every same-underlying card.
+    if log_syms:
+        positions = [p for p in positions if p["symbol"] in log_syms]
 
     # 2. Filter to period start_date (by exit day)
     if start_date is not None:

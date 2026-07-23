@@ -2582,41 +2582,41 @@ def tail_file(filepath, lines_count=200):
                 return []
 
             chunk_size = 8192
-            lines = []
+            data = b""
             remaining = file_size
 
-            while remaining > 0 and len(lines) <= lines_count:
+            # Accumulate raw bytes (not pre-split) so a line straddling a chunk
+            # boundary is never torn into two fragments — that used to yield a
+            # truncated symbol on the first retained line.
+            while remaining > 0 and data.count(b"\n") <= lines_count:
                 read_size = min(chunk_size, remaining)
                 remaining -= read_size
                 f.seek(remaining)
-                chunk = f.read(read_size)
-                lines = chunk.split(b"\n") + lines
+                data = f.read(read_size) + data
 
-            # Decode and return last N non-empty lines
-            decoded = []
-            for raw in lines:
-                try:
-                    decoded.append(raw.decode("utf-8", errors="replace"))
-                except Exception:
-                    decoded.append(raw.decode("latin-1", errors="replace"))
-            # Filter empty trailing lines and return last lines_count
-            decoded = [l for l in decoded if l.strip()]
+            text = data.decode("utf-8", errors="replace")
+            decoded = [ln for ln in text.split("\n") if ln.strip()]
             return decoded[-lines_count:]
     except Exception:
         return []
 
 
 def parse_strategy_log_file(filepath, is_running):
-    """Parse the last 200 lines of a strategy log file to extract live state."""
+    """Parse the last 300 lines of a strategy log file to extract live state.
+
+    Each strategy writes its own log file, so symbols found here belong to THIS
+    strategy only — `seen_symbols` is used downstream to attribute broker
+    positions without leaking other strategies' trades."""
     result = {
         "state": "INACTIVE" if not is_running else "IDLE",
         "active_trades": [],
         "indicators": {},
         "last_updated": None,
         "last_log_message": None,
+        "seen_symbols": set(),
     }
 
-    lines = tail_file(filepath, 200)
+    lines = tail_file(filepath, 300)
     if not lines:
         return result
 
@@ -2646,11 +2646,12 @@ def parse_strategy_log_file(filepath, is_running):
             result["state"] = "DONE"
             active_trade = None
 
-        # --- Symbol capture from BUY order ---
-        elif "Placing BUY order for" in msg:
-            sym_match = re.search(r"Placing BUY order for\s+(\S+)", msg)
+        # --- Symbol capture from BUY order (HA-EMA / Regime: "...for SYM"; POV: "SQUEEZE DETECTED on SYM") ---
+        elif "Placing BUY order for" in msg or "SHORT SQUEEZE DETECTED on" in msg or "Tracking leg:" in msg:
+            sym_match = re.search(r"(?:Placing BUY order for|SHORT SQUEEZE DETECTED on|Tracking leg:)\s+(\S+)", msg)
             if sym_match:
-                pending_symbol = sym_match.group(1).rstrip(".")
+                pending_symbol = sym_match.group(1).rstrip(".!")
+                result["seen_symbols"].add(pending_symbol)
 
         # --- Entry detection ---
         elif "Entered Trade!" in msg or "Trade entered:" in msg:
@@ -2672,7 +2673,7 @@ def parse_strategy_log_file(filepath, is_running):
                     key, _, val = part.partition(":")
                     key = key.strip().lower()
                     val = val.strip()
-                    if key in ("spot entry", "entry", "entry_spot"):
+                    if key.endswith("spot entry") or key in ("entry", "entry_spot"):
                         try:
                             trade["entry_price"] = float(val)
                         except (ValueError, TypeError):
@@ -2691,42 +2692,66 @@ def parse_strategy_log_file(filepath, is_running):
                         trade["direction"] = val.upper()
                     elif key in ("type", "option_type"):
                         trade["type"] = val.upper()
-            # Infer direction from type if not set
-            if not trade["direction"] and trade["type"]:
-                if trade["type"] == "CE":
-                    trade["direction"] = "LONG"
-                elif trade["type"] == "PE":
-                    trade["direction"] = "SHORT"
+            # Direction from the option symbol suffix — authoritative for the spot
+            # gauge (CE = upside target above entry, PE = downside target below).
+            sym = trade["symbol"] or ""
+            if sym.upper().endswith("CE"):
+                trade["direction"] = "CE"
+            elif sym.upper().endswith("PE"):
+                trade["direction"] = "PE"
+            elif trade["type"] in ("CE", "PE"):
+                trade["direction"] = trade["type"]
+            if sym and sym != "UNKNOWN":
+                result["seen_symbols"].add(sym)
             active_trade = trade
             result["active_trades"] = [trade]
 
         # --- Monitoring: update current price ---
         elif "Monitoring Trade:" in msg or "Monitoring:" in msg:
-            if active_trade:
-                result["state"] = "IN_TRADE"
-                parts = msg.split("|")
-                for part in parts:
-                    part = part.strip()
-                    if ":" in part:
-                        key, _, val = part.partition(":")
-                        key = key.strip().lower()
-                        val = val.strip()
-                        if key == "spot":
-                            try:
-                                active_trade["current_price"] = float(val)
-                            except (ValueError, TypeError):
-                                pass
-                        elif key in ("sl", "stop_loss"):
-                            try:
-                                active_trade["stop_loss"] = float(val)
-                            except (ValueError, TypeError):
-                                pass
-                        elif key in ("target", "t1"):
-                            try:
-                                active_trade["target"] = float(val)
-                            except (ValueError, TypeError):
-                                pass
-                result["active_trades"] = [active_trade]
+            result["state"] = "IN_TRADE"
+            mon_sym = None
+            m = re.search(r"Monitoring(?:\s+Trade)?:\s*(\S+)", msg)
+            if m:
+                mon_sym = m.group(1).rstrip(".!")
+            # Reconstruct the trade if its entry line has scrolled out of the tail
+            # window (long-held trades): the monitoring line carries symbol + spot
+            # + SL + target — enough to keep the live gauge rendering.
+            if active_trade is None:
+                _s = mon_sym or pending_symbol or "UNKNOWN"
+                active_trade = {
+                    "symbol": _s,
+                    "direction": "CE" if _s.upper().endswith("CE") else "PE" if _s.upper().endswith("PE") else "UNKNOWN",
+                    "entry_price": None,
+                    "stop_loss": None,
+                    "target": None,
+                    "current_price": None,
+                    "type": "spot_based",
+                }
+            if mon_sym:
+                result["seen_symbols"].add(mon_sym)
+            parts = msg.split("|")
+            for part in parts:
+                part = part.strip()
+                if ":" in part:
+                    key, _, val = part.partition(":")
+                    key = key.strip().lower()
+                    val = val.strip()
+                    if key == "spot":
+                        try:
+                            active_trade["current_price"] = float(val)
+                        except (ValueError, TypeError):
+                            pass
+                    elif key in ("sl", "stop_loss"):
+                        try:
+                            active_trade["stop_loss"] = float(val)
+                        except (ValueError, TypeError):
+                            pass
+                    elif key in ("target", "t1"):
+                        try:
+                            active_trade["target"] = float(val)
+                        except (ValueError, TypeError):
+                            pass
+            result["active_trades"] = [active_trade]
 
         # --- Exit detection ---
         elif any(x in msg for x in ("Stop-Loss Hit", "Target Hit", "SL filled", "Target reached", "Closing position")):
@@ -2847,14 +2872,16 @@ def api_get_strategy_status(strategy_id):
 
     parsed = parse_strategy_log_file(str(log_files[0]), is_running)
 
-    # Cross-reference with live positionbook for orphaned positions
-    # (positions that exist but the strategy lost track of after restart)
+    # Cross-reference the live positionbook ONLY for symbols THIS strategy itself
+    # logged (seen_symbols). The broker positionbook is global — matching by
+    # underlying alone would show another strategy's NIFTY/SENSEX legs on every
+    # same-underlying strategy card. seen_symbols keeps attribution strict.
     if is_running and not parsed["active_trades"]:
         try:
-            underlying = config.get("underlying", "NIFTY")
+            own_symbols = parsed.get("seen_symbols") or set()
             from database.auth_db import get_first_available_api_key
             live_api_key = get_first_available_api_key()
-            if live_api_key:
+            if live_api_key and own_symbols:
                 from services.positionbook_service import get_positions
                 success, pos_data, _ = get_positions(api_key=live_api_key)
                 if success:
@@ -2862,7 +2889,7 @@ def api_get_strategy_status(strategy_id):
                     for pos in positions:
                         qty = pos.get("quantity", 0)
                         sym = pos.get("symbol", "")
-                        if qty != 0 and underlying.upper() in sym.upper():
+                        if qty != 0 and sym in own_symbols:
                             direction = "CE" if "CE" in sym.upper() else "PE" if "PE" in sym.upper() else "UNKNOWN"
                             parsed["active_trades"].append({
                                 "symbol": sym,
@@ -2910,7 +2937,7 @@ def api_get_strategy_metrics(strategy_id):
         user_id = STRATEGY_CONFIGS[strategy_id].get("user_id", "nikhil")
         result = get_strategy_metrics(
             strategy_id, STRATEGY_CONFIGS, user_id=user_id,
-            period=period, api_key=api_key,
+            period=period, api_key=api_key, logs_dir=LOGS_DIR,
         )
         return jsonify(result)
     except Exception as e:

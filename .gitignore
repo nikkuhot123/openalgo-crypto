@@ -98,3 +98,5 @@ venv/
 .env.bak.pre-backtest
 backtesting/data/
 *.duckdb
+backtesting/autoresearch/run.log
+backtesting/autoresearch/results.tsv

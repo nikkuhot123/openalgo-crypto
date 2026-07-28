@@ -203,29 +203,84 @@ def safe_cancel_order(order_id, context=""):
 
     return False, f"{resp.get('message', resp)}"
 
+def fetch_fill_price(order_id, context="", max_retries=4, retry_delay=0.7):
+    """Actual average fill price for an order, or None if unreadable.
+
+    P&L must be booked from the broker's fill, never from a quote. A MARKET exit
+    decided off a price the strategy merely *observed* can fill points away
+    (bug 2026-07-28: target seen at 48.90, filled 37.80 -> logged +1056 vs real
+    +348), and daily_loss_rs / consecutive_losses inherit the error, so the
+    circuit breaker ends up armed on fictional numbers.
+    """
+    if not order_id:
+        return None
+    for attempt in range(max_retries):
+        try:
+            st = client.orderstatus(order_id=order_id, strategy=STRATEGY_NAME)
+            if isinstance(st, dict) and st.get("status") == "success":
+                d = st.get("data", {}) or {}
+                for key in ("average_price", "averageprice", "avg_price", "price"):
+                    try:
+                        px = float(d.get(key) or 0)
+                    except (TypeError, ValueError):
+                        px = 0.0
+                    if px > 0:
+                        return px
+                if str(d.get("order_status", "")).lower() in ("rejected", "cancelled", "canceled"):
+                    return None
+        except Exception as e:
+            log.debug(f"fetch_fill_price {order_id} attempt {attempt + 1}: {e}")
+        if attempt < max_retries - 1:
+            time.sleep(retry_delay)
+    log.warning(f"Could not read fill price for order {order_id} {context}".strip())
+    return None
+
+def book_trade_pnl(symbol, exit_px, entry_px, qty, consecutive_losses, daily_loss_rs, source="fill"):
+    """Book realized P&L and update the circuit-breaker counters.
+
+    `source` records whether the price is a broker fill or a degraded estimate so
+    the log states which. Returns the updated (consecutive_losses, daily_loss_rs).
+    """
+    if exit_px is None or entry_px is None:
+        log.warning(f"P&L not booked for {symbol}: exit={exit_px} entry={entry_px} (unverifiable)")
+        return consecutive_losses, daily_loss_rs
+    trade_pnl = (float(exit_px) - float(entry_px)) * qty
+    detail = f"[{source} {float(exit_px):.2f} vs entry {float(entry_px):.2f}]"
+    if trade_pnl < 0:
+        consecutive_losses += 1
+        daily_loss_rs += abs(trade_pnl)
+        log.info(f"Trade P&L: ₹{trade_pnl:+.2f} {detail} | Loss streak: {consecutive_losses} | Daily losses: ₹{daily_loss_rs:.0f}")
+    else:
+        consecutive_losses = 0
+        log.info(f"Trade P&L: ₹{trade_pnl:+.2f} {detail} | Loss streak reset")
+    return consecutive_losses, daily_loss_rs
+
 def verified_exit_sell(symbol, opt_exchange, qty, sl_oid, reason):
     """Cancel the protective SL and SELL only what the broker ACTUALLY holds.
     Prevents naked-short exit SELLs (paper entry + live exit after a mode toggle,
     rejected/partial entry, or an already-closed position — bug 2026-07-14).
-    Returns 'sold' | 'flat' (broker holds nothing) | 'unknown' (unverifiable).
+    Returns ('sold' | 'flat' | 'unknown', fill_price_or_None).
     """
     bq = live_position_qty(UNDERLYING, symbol)
     if bq is None:
         log.warning(f"{reason}: cannot verify broker position for {symbol} — deferring exit")
-        return "unknown"
+        return "unknown", None
     if sl_oid:
         ok, msg = safe_cancel_order(sl_oid, context=f"{reason}-{symbol}")
         (log.info if ok else log.warning)(f"{reason}: cancel SL {sl_oid} → {msg}")
     if bq <= 0:
         log.warning(f"{reason}: broker flat on {symbol} — no long to close; skipping SELL to avoid naked short")
-        return "flat"
+        return "flat", None
     close_qty = min(bq, qty)
     resp = client.placeorder(
         strategy=STRATEGY_NAME, symbol=symbol, action="SELL",
         exchange=opt_exchange, price_type="MARKET",
         product=PRODUCT, quantity=close_qty)
     log.info(f"{reason} exit response for {symbol}: {resp}")
-    return "sold"
+    fill_px = None
+    if isinstance(resp, dict) and resp.get("status") == "success":
+        fill_px = fetch_fill_price(resp.get("orderid"), context=f"({reason} {symbol})")
+    return "sold", fill_px
 
 def sync_positions_with_book(positions, underlying):
     """Drop tracked positions that are no longer open on the broker side.
@@ -719,53 +774,54 @@ def run_strategy():
 
                     if sl_filled:
                         log.info(f"SL filled for {symbol}. Position closed by system.")
-                        # Compute P&L using SL trigger as exit price proxy
-                        entry_opt_price = pos.get("entry_opt_price")
-                        if entry_opt_price is not None and len(df_opt) >= 2:
-                            exit_price = float(df_opt.iloc[-2]["close"])
-                            trade_pnl = (exit_price - entry_opt_price) * pos.get("qty", QUANTITY)
-                            if trade_pnl < 0:
-                                consecutive_losses += 1
-                                daily_loss_rs += abs(trade_pnl)
-                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak: {consecutive_losses} | Daily losses: ₹{daily_loss_rs:.0f}")
-                            else:
-                                consecutive_losses = 0
-                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak reset")
+                        sl_fill = fetch_fill_price(sl_oid, context=f"(SL {symbol})")
+                        _src = "fill"
+                        if sl_fill is None:
+                            sl_fill = pos.get("sl_price")  # trigger price as last resort
+                            _src = "est-trigger"
+                        consecutive_losses, daily_loss_rs = book_trade_pnl(
+                            symbol, sl_fill, pos.get("entry_opt_price"),
+                            pos.get("qty", QUANTITY), consecutive_losses, daily_loss_rs,
+                            source=_src)
                         release_symbol_lock(symbol, STRATEGY_NAME)
                         del positions[symbol]
                         persist_positions(positions)
                         continue
 
-                    # Check if option LTP has reached target — use smart order to close
-                    if target_price is not None and len(df_opt) >= 2:
-                        opt_ltp = df_opt.iloc[-2]["close"]  # last completed candle close
-                        if opt_ltp >= target_price:
-                            log.info(f"Target reached for {symbol}! LTP {opt_ltp:.2f} >= T1 {target_price:.2f}")
-                            outcome = verified_exit_sell(symbol, opt_exchange, pos.get("qty", QUANTITY), sl_oid, "Target-exit")
-                            if outcome == "unknown":
-                                continue  # broker unverifiable — keep tracking, retry next cycle
-                            if outcome == "sold":
-                                entry_opt_price = pos.get("entry_opt_price")
-                                if entry_opt_price is not None:
-                                    trade_pnl = (float(opt_ltp) - entry_opt_price) * pos.get("qty", QUANTITY)
-                                    if trade_pnl < 0:
-                                        consecutive_losses += 1
-                                        daily_loss_rs += abs(trade_pnl)
-                                        log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak: {consecutive_losses} | Daily losses: ₹{daily_loss_rs:.0f}")
-                                    else:
-                                        consecutive_losses = 0
-                                        log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak reset")
-                            release_symbol_lock(symbol, STRATEGY_NAME)
-                            del positions[symbol]
-                            persist_positions(positions)
+                    # Live option LTP, fetched once per cycle for this position.
+                    # Exit checks MUST use the live price, not df_opt.iloc[-2]["close"]:
+                    # the completed-candle close left the strategy blind for ~1-2 min, so
+                    # T1 was only seen long after it was crossed (bug 2026-07-28: T1 40.10
+                    # first observed at 48.90; the market exit then filled at 37.80).
+                    # fetch_option_ltp() spot-sanity-checks the quote before returning it.
+                    live_ltp = fetch_option_ltp(symbol, opt_exchange, underlying_ltp=underlying_ltp)
+                    if live_ltp is None and len(df_opt) >= 2:
+                        live_ltp = float(df_opt.iloc[-2]["close"])  # degraded fallback
+
+                    # Target hit -> close and book P&L from the ACTUAL fill
+                    if target_price is not None and live_ltp is not None and live_ltp >= target_price:
+                        log.info(f"Target reached for {symbol}! LTP {live_ltp:.2f} >= T1 {target_price:.2f}")
+                        outcome, fill_px = verified_exit_sell(
+                            symbol, opt_exchange, pos.get("qty", QUANTITY), sl_oid, "Target-exit")
+                        if outcome == "unknown":
+                            continue  # broker unverifiable — keep tracking, retry next cycle
+                        if outcome == "sold":
+                            consecutive_losses, daily_loss_rs = book_trade_pnl(
+                                symbol, fill_px if fill_px is not None else live_ltp,
+                                pos.get("entry_opt_price"), pos.get("qty", QUANTITY),
+                                consecutive_losses, daily_loss_rs,
+                                source="fill" if fill_px is not None else "est-ltp")
+                        release_symbol_lock(symbol, STRATEGY_NAME)
+                        del positions[symbol]
+                        persist_positions(positions)
 
                     # ── Safety-net exits: max-hold-time and premium-decay ──
                     # Prevents slow-bleed when SL is cancelled (e.g. by RECONCILE on restart)
                     # and position sits unmonitored. Based on live evidence 2026-07-02:
                     # 3 SENSEX PE legs held 3+ hours lost 75-80% because SLs were cancelled
                     # at process restart and nobody closed them until premiums hit near-zero.
-                    if symbol in positions and len(df_opt) >= 2:
-                        opt_ltp = float(df_opt.iloc[-2]["close"])
+                    if symbol in positions and live_ltp is not None:
+                        opt_ltp = live_ltp
                         entry_opt_price = pos.get("entry_opt_price")
                         entry_time = pos.get("entry_time")
                         _force_exit = None
@@ -780,18 +836,16 @@ def run_strategy():
                                 _force_exit = f"Decay exit (LTP {opt_ltp:.2f} < {DECAY_EXIT_PCT:.0%} of entry {entry_opt_price:.2f})"
                         if _force_exit:
                             log.warning(f"!!! {_force_exit} !!! Closing {symbol}...")
-                            outcome = verified_exit_sell(symbol, opt_exchange, pos.get("qty", QUANTITY), sl_oid, "Force-exit")
+                            outcome, fill_px = verified_exit_sell(
+                                symbol, opt_exchange, pos.get("qty", QUANTITY), sl_oid, "Force-exit")
                             if outcome == "unknown":
                                 continue  # broker unverifiable — keep tracking, retry next cycle
-                            if outcome == "sold" and entry_opt_price is not None:
-                                trade_pnl = (opt_ltp - entry_opt_price) * pos.get("qty", QUANTITY)
-                                if trade_pnl < 0:
-                                    consecutive_losses += 1
-                                    daily_loss_rs += abs(trade_pnl)
-                                    log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak: {consecutive_losses} | Daily losses: ₹{daily_loss_rs:.0f}")
-                                else:
-                                    consecutive_losses = 0
-                                    log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak reset")
+                            if outcome == "sold":
+                                consecutive_losses, daily_loss_rs = book_trade_pnl(
+                                    symbol, fill_px if fill_px is not None else opt_ltp,
+                                    entry_opt_price, pos.get("qty", QUANTITY),
+                                    consecutive_losses, daily_loss_rs,
+                                    source="fill" if fill_px is not None else "est-ltp")
                             release_symbol_lock(symbol, STRATEGY_NAME)
                             del positions[symbol]
                             persist_positions(positions)
@@ -842,6 +896,12 @@ def run_strategy():
                         )
                         log.info(f"Entry Order Response: {order_resp}")
                         if order_resp.get("status") == "success":
+                            # Book the ACTUAL entry fill for P&L; the pre-trade quote
+                            # was only needed for auto-lot sizing (bug 2026-07-28:
+                            # quote said 32.65, the real fill was 32.45).
+                            _fill_entry = fetch_fill_price(order_resp.get("orderid"), context=f"(entry {symbol})")
+                            if _fill_entry is not None:
+                                entry_opt_price = _fill_entry
                             sl_orderid = None
 
                             # Place SL-M exit order (system fills automatically)

@@ -100,3 +100,6 @@ backtesting/data/
 *.duckdb
 backtesting/autoresearch/run.log
 backtesting/autoresearch/results.tsv
+backtesting/**/*.html
+backtesting/**/*.csv
+backtesting/**/report_summary.json

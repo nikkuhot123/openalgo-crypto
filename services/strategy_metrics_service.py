@@ -75,15 +75,28 @@ def _direction(symbol):
 _OPT_SYMBOL_RE = re.compile(r"\b([A-Z]{3,}\d{2}[A-Z0-9]*(?:CE|PE))\b")
 
 
+# Only lines that evidence an ORDER (or holding) may contribute a symbol. POV
+# logs every leg it merely scans ("Tracking leg:", "Action: WAIT | Score:"), so
+# scanning all lines made a strategy claim contracts it never traded (bug
+# 2026-07-28: POV SENSEX, which traded nothing, claimed HA-EMA SENSEX's trade).
+_TRADE_LINE_MARKERS = (
+    "placing buy order", "squeeze detected", "reversal detected", "breakout signal",
+    "trade entered", "entered trade", "closing position", "exit response",
+    "order response", "orderid", "target reached", "target hit", "stop-loss hit",
+    "premium sl hit", "monitoring trade", "monitoring:", "adopting",
+)
+
+
 def _strategy_log_symbols(strategy_id, start_date, logs_dir):
-    """Set of option symbols THIS strategy traded, read from its own log files.
+    """Set of option symbols THIS strategy actually TRADED or HELD, from its own logs.
 
     Each strategy writes `{strategy_id}_{YYYYMMDD_HHMMSS}_IST.log`, so the log is
-    an authoritative per-strategy record. This is the attribution key that works
-    in BOTH modes: the live broker tradebook carries no strategy tag, and two
-    same-underlying variants share a display name — only the log distinguishes
-    which symbols each actually traded. Empty set => caller falls back to the
-    opener strategy tag (analyzer-only)."""
+    an authoritative per-strategy record — the live broker tradebook carries no
+    strategy tag, and two same-underlying variants share a display name. Symbols
+    are approximate (two strategies can trade one contract the same day), so this
+    is only the fallback behind order-id matching; it is still the sole key
+    available for open positions.
+    """
     symbols = set()
     if not logs_dir:
         return symbols
@@ -101,11 +114,50 @@ def _strategy_log_symbols(strategy_id, start_date, logs_dir):
                 continue
             with open(fp, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
-                    if "CE" in line or "PE" in line:
+                    if "CE" not in line and "PE" not in line:
+                        continue
+                    low = line.lower()
+                    if any(m in low for m in _TRADE_LINE_MARKERS):
                         symbols.update(_OPT_SYMBOL_RE.findall(line))
         except Exception:
             continue
     return symbols
+
+
+_ORDERID_RE = re.compile(r"['\"]orderid['\"]\s*:\s*['\"]?(\d{6,})['\"]?")
+
+
+def _strategy_log_orderids(strategy_id, start_date, logs_dir):
+    """Set of broker order IDs THIS strategy placed, from its own log files.
+
+    Order ID is the only EXACT attribution key. Symbols are not sufficient: all
+    strategies trade ATM options on the same two indices, so the same contract is
+    routinely traded by two strategies on one day (bug 2026-07-28: HA-EMA bought
+    NIFTY28JUL2624000CE at 09:45 and Judas bought the same symbol at 10:07 —
+    symbol matching credited both round-trips to both strategies). Empty set =>
+    caller falls back to symbols, then to the opener tag.
+    """
+    oids = set()
+    if not logs_dir:
+        return oids
+    try:
+        files = list(Path(logs_dir).glob(f"{strategy_id}_[0-9]*.log"))
+    except Exception:
+        return oids
+    cutoff = None
+    if start_date is not None:
+        cutoff = datetime.combine(start_date - timedelta(days=1), datetime.min.time())
+    for fp in files:
+        try:
+            if cutoff is not None and datetime.fromtimestamp(fp.stat().st_mtime) < cutoff:
+                continue
+            with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if "orderid" in line:
+                        oids.update(_ORDERID_RE.findall(line))
+        except Exception:
+            continue
+    return oids
 
 
 # ── core FIFO attribution ────────────────────────────────────────────────────
@@ -118,16 +170,16 @@ def _fifo_round_trips(rows):
     books realized P&L on the closing trade).
 
     Returns (round_trips, open_legs). round_trip: {day, symbol, dir, opener, qty,
-    entry, exit, pnl, entry_ts, exit_ts}; open_leg: {day, symbol, dir, opener, qty,
-    entry, entry_ts}.
+    entry, exit, pnl, entry_ts, exit_ts, entry_oid, exit_oid}; open_leg: {day,
+    symbol, dir, opener, qty, entry, entry_ts, entry_oid}.
     """
     ordered = sorted(rows, key=lambda r: r["ts"])
-    books = defaultdict(deque)  # symbol -> deque[[qty, price, strategy, ts]]
+    books = defaultdict(deque)  # symbol -> deque[[qty, price, strategy, ts, orderid]]
     round_trips = []
     for r in ordered:
         sym = r["symbol"]
         if (r["action"] or "").upper() == "BUY":
-            books[sym].append([r["qty"], r["price"], r.get("strategy"), r["ts"]])
+            books[sym].append([r["qty"], r["price"], r.get("strategy"), r["ts"], r.get("orderid")])
         else:  # SELL closes open buys FIFO across days
             rem = r["qty"]
             while rem > 0 and books[sym]:
@@ -140,6 +192,7 @@ def _fifo_round_trips(rows):
                     "opener": lot[2], "qty": m,
                     "entry": float(lot[1]), "exit": float(r["price"]),
                     "pnl": pnl, "entry_ts": lot[3], "exit_ts": r["ts"],
+                    "entry_oid": lot[4], "exit_oid": r.get("orderid"),
                 })
                 lot[0] -= m
                 rem -= m
@@ -154,6 +207,7 @@ def _fifo_round_trips(rows):
                     "day": d, "symbol": sym, "dir": _direction(sym),
                     "opener": lot[2], "qty": lot[0],
                     "entry": float(lot[1]), "entry_ts": lot[3],
+                    "entry_oid": lot[4],
                 })
     return round_trips, open_legs
 
@@ -202,6 +256,7 @@ def _sandbox_trade_rows(user_id, start_date):
             "qty": int(t.quantity or 0),
             "price": float(t.price or 0),
             "strategy": t.strategy,
+            "orderid": str(getattr(t, "orderid", "") or "") or None,
         })
     return rows
 
@@ -228,11 +283,44 @@ def _sandbox_open_positions(user_id, underlying):
     return out
 
 
+_TS_FORMATS = (
+    "%H:%M:%S %d-%m-%Y",   # observed live shape: "13:17:28 28-07-2026"
+    "%d-%m-%Y %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%d/%m/%Y %H:%M:%S",
+    "%d-%b-%Y %H:%M:%S",
+)
+
+
+def _parse_broker_ts(raw):
+    """Broker trade timestamp -> datetime, or None if no known format matches.
+
+    Returning None (and dropping the row) is deliberate: a wrong timestamp is
+    far worse than a missing one. FIFO matching orders BUY->SELL purely by ts,
+    so a bad value silently mis-pairs legs and fabricates P&L. Bug 2026-07-28:
+    fromisoformat() choked on "13:17:28 28-07-2026", every row fell back to
+    now(), and because the tradebook is newest-first the matcher saw each SELL
+    before its BUY -> zero round-trips -> every strategy reported 0 trades / Rs0.
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s[:19])
+    except ValueError:
+        pass
+    for fmt in _TS_FORMATS:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def _live_trade_rows(api_key, start_date):
     """Live broker tradebook. NOTE: broker trades carry no strategy tag, so the
-    opener will be None and attribution collapses to underlying-prefix only.
-    Kept functional so the panel works in live mode; exact per-strategy split in
-    live requires order-time strategy tagging (documented limitation)."""
+    opener is None and per-strategy attribution is resolved by the caller from
+    each strategy's own log symbols."""
     from services.tradebook_service import get_tradebook
 
     rows = []
@@ -240,12 +328,14 @@ def _live_trade_rows(api_key, start_date):
         ok, resp, _ = get_tradebook(api_key=api_key)
         if not ok:
             return rows
+        unparsed = 0
         for t in resp.get("data", []) or []:
-            ts_raw = t.get("timestamp") or t.get("trade_timestamp") or t.get("order_timestamp") or ""
-            try:
-                ts = datetime.fromisoformat(str(ts_raw)[:19])
-            except Exception:
-                ts = datetime.now()
+            ts = _parse_broker_ts(
+                t.get("timestamp") or t.get("trade_timestamp") or t.get("order_timestamp")
+            )
+            if ts is None:
+                unparsed += 1
+                continue
             if start_date is not None and ts.date() < start_date:
                 continue
             rows.append({
@@ -255,7 +345,12 @@ def _live_trade_rows(api_key, start_date):
                 "qty": int(float(t.get("quantity", 0) or 0)),
                 "price": float(t.get("average_price", t.get("price", 0)) or 0),
                 "strategy": t.get("strategy"),
+                "orderid": str(t.get("orderid") or "") or None,
             })
+        if unparsed:
+            logger.warning(
+                f"live tradebook: dropped {unparsed} trade(s) with unrecognised "
+                f"timestamp format — add it to _TS_FORMATS (metrics will under-report)")
     except Exception as e:
         logger.warning(f"live tradebook fetch failed: {e}")
     return rows
@@ -317,27 +412,33 @@ def get_strategy_metrics(strategy_id, strategy_configs, user_id="nikhil",
 
     round_trips, open_legs = _fifo_round_trips(rows)
 
-    # Per-strategy symbol ownership from this strategy's own log files —
-    # authoritative in both modes (empty => fall back to opener tag below).
+    # Per-strategy ownership read from this strategy's OWN log files.
+    # Precedence: order IDs (exact) -> symbols (approximate) -> opener tag.
+    log_oids = _strategy_log_orderids(strategy_id, start_date, logs_dir)
     log_syms = _strategy_log_symbols(strategy_id, start_date, logs_dir)
 
-    # 1. Filter to THIS strategy: underlying prefix AND (traded in its own log OR
-    #    tagged to this exact display). The removed `opener is None` clause used
-    #    to fan every untagged round-trip (ALL live trades) onto every
-    #    same-underlying strategy — that was the cross-strategy leak.
+    # 1. Filter to THIS strategy. Order ID is exact, so when the log yields IDs we
+    #    use only those: symbol matching double-counts whenever two strategies
+    #    trade the same contract on one day (routine — they all buy ATM on the
+    #    same two indices). Symbols remain the fallback for logs predating order-id
+    #    logging. The `opener is None` clause was dropped earlier: it fanned every
+    #    untagged (i.e. every live) round-trip onto every same-underlying strategy.
     def _mine(rt):
         if not _owns(rt["symbol"], underlying):
             return False
+        if log_oids:
+            return rt.get("entry_oid") in log_oids or rt.get("exit_oid") in log_oids
         if rt["symbol"] in log_syms:
             return True
         return rt["opener"] is not None and rt["opener"] == display
 
     mine = [rt for rt in round_trips if _mine(rt)]
 
-    # Open positions carry no strategy tag; attribute by the log symbol set so
-    # one strategy's legs don't show on every same-underlying card.
-    if log_syms:
-        positions = [p for p in positions if p["symbol"] in log_syms]
+    # Open positions carry neither a strategy tag nor an order id in the
+    # positionbook, so symbol is the only key. Gate unconditionally: an empty
+    # allowlist means this strategy has no logged trade/hold, so it cannot own an
+    # open leg — showing every same-underlying position there was the leak.
+    positions = [p for p in positions if p["symbol"] in log_syms]
 
     # 2. Filter to period start_date (by exit day)
     if start_date is not None:

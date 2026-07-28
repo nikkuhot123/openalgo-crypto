@@ -68,11 +68,25 @@ BREAKOUT_MULT = float(os.getenv('BREAKOUT_MULT', '1.0'))
 # Circuit breaker config (replaces COOLDOWN_MINUTES / MAX_TRADES_PER_DAY)
 LOSS_STREAK_LIMIT = int(os.getenv('LOSS_STREAK_LIMIT', '3'))
 DAILY_LOSS_LIMIT_RS = float(os.getenv('DAILY_LOSS_LIMIT_RS', '10000'))
-# Option-premium stop (POV-style broker SL-M on the option itself) — catches
+# Option-premium stop (broker-side stop on the option itself) — catches
 # premium decay/bleed that the spot-based SL misses (bug 2026-07-16: a CE bled
 # 169->82, -51%, while spot held above the spot-SL). Exit if the option premium
 # falls >= this % below entry. Broker-side, so it also protects across restarts.
 PREMIUM_SL_PCT = float(os.getenv('PREMIUM_SL_PCT', '35'))
+# MUST be SL (stop-limit), NOT SL-M. Measured 2026-07-28 from order_logs: SL-M
+# was rejected 33/33 times on NFO+BFO options (0 created) while MARKET on the
+# same symbols/sessions succeeded 114/114 — NSE/BSE discontinued SL-M in the
+# options segment. The service reported those rejections as
+# {"status":"success","orderid":null}, so 33 live positions ran with NO stop
+# while the strategy logged the stop as placed. Stop-limit needs a limit price
+# below the trigger to fill on the way down; this is that buffer.
+SL_LIMIT_BUFFER_PCT = float(os.getenv('SL_LIMIT_BUFFER_PCT', '5'))
+# Round-trip statutory cost as % of option premium turnover (brokerage is zero on
+# Flattrade, but STT/exchange/GST/SEBI/stamp are not). Default 0.12% matches
+# Flattrade's calculator: Rs 103.01 on Rs 84,000 options turnover = 12.3 bps.
+# Subtracted from every logged trade P&L so the circuit breaker and the logs
+# reflect NET money, not gross.
+OPT_COST_PCT = float(os.getenv('OPT_COST_PCT', '0.12'))
 # Minimum stop distance as % of spot (Volrix-validated 2026-07-28).
 # Raw stop = signal candle's extreme, which on a quiet candle is inside the
 # index's noise (live: 5.4-5.9 pt / 0.022% stops died in 12-42 seconds).
@@ -226,6 +240,59 @@ def fetch_option_ltp(opt_symbol, opt_exchange, underlying_ltp=None, max_retries=
             time.sleep(retry_delay)
     log.error(f"Failed to get valid option LTP for {opt_symbol} after {max_retries} attempts")
     return None
+
+def fetch_fill_price(order_id, symbol, max_retries=5, retry_delay=1.2):
+    """Average TRADED price for an order, so P&L is measured on real fills.
+
+    Quote-derived P&L (what this strategy used before 2026-07-29) silently
+    excludes slippage: it prices the exit at the LTP we happened to observe,
+    not at what the broker actually filled. Over 27 live trades that difference
+    is the entire question of whether the edge is real, so it is worth the
+    extra API calls.
+
+    Returns float on success, or None (caller falls back to the quote).
+    """
+    if not order_id:
+        return None
+    for attempt in range(max_retries):
+        try:
+            r = client.orderstatus(order_id=order_id, strategy=STRATEGY_NAME)
+            d = (r.get("data") or {}) if isinstance(r, dict) else {}
+            for k in ("average_price", "averageprice", "avgprice", "avg_price", "price"):
+                v = d.get(k)
+                if v not in (None, "", 0, "0") and float(v) > 0:
+                    return float(v)
+        except Exception as e:
+            log.debug(f"orderstatus {order_id} attempt {attempt+1}: {e}")
+        try:
+            tb = client.tradebook()
+            for t in (tb.get("data") or []):
+                if str(t.get("symbol")) == str(symbol):
+                    for k in ("average_price", "averageprice", "fill_price", "price"):
+                        v = t.get(k)
+                        if v not in (None, "", 0, "0") and float(v) > 0:
+                            return float(v)
+        except Exception:
+            pass
+        time.sleep(retry_delay)
+    log.warning(f"No fill price for order {order_id} ({symbol}); falling back to quote")
+    return None
+
+
+def statutory_cost(entry_px, exit_px, qty):
+    """Round-trip statutory cost in rupees for an option BUY->SELL, premium-based.
+
+    Brokerage is zero on Flattrade, but STT/exchange/GST/SEBI/stamp are not.
+    OPT_COST_PCT is the round-trip charge as a % of premium turnover; the default
+    0.12% matches Flattrade's own calculator (Rs 103.01 of charges on Rs 84,000 of
+    options turnover = 12.3 bps). Configure via OPT_COST_PCT if your contract
+    note differs.
+    """
+    if entry_px is None or exit_px is None or not qty:
+        return 0.0
+    turnover = (float(entry_px) + float(exit_px)) * float(qty)
+    return turnover * OPT_COST_PCT / 100.0
+
 
 def get_nearest_expiry(underlying, exchange):
     try:
@@ -542,18 +609,26 @@ def run_strategy():
                     except Exception:
                         o_st = ""
                     if o_st == "complete":
-                        exit_px = active_trade.get("opt_sl_price")
-                        entry_opt_price = active_trade.get("entry_opt_price")
-                        log.info(f"!!! Premium SL Hit !!! Option SL-M filled on {symbol} @ ~{exit_px}")
+                        # real fill of the stop order, not the trigger level we asked for
+                        exit_px = fetch_fill_price(opt_sl_oid, symbol) \
+                            or active_trade.get("opt_sl_price")
+                        entry_opt_price = active_trade.get("entry_fill_price") \
+                            or active_trade.get("entry_opt_price")
+                        log.info(f"!!! Premium SL Hit !!! stop filled on {symbol} @ {exit_px}")
                         if entry_opt_price is not None and exit_px is not None:
-                            trade_pnl = (exit_px - entry_opt_price) * qty
+                            gross = (exit_px - entry_opt_price) * qty
+                            cost = statutory_cost(entry_opt_price, exit_px, qty)
+                            trade_pnl = gross - cost
                             if trade_pnl < 0:
                                 consecutive_losses += 1
                                 daily_loss_rs += abs(trade_pnl)
-                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak: {consecutive_losses} | Daily losses: ₹{daily_loss_rs:.0f}")
+                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} (gross ₹{gross:+.2f} "
+                                         f"- cost ₹{cost:.2f}) | Loss streak: {consecutive_losses} "
+                                         f"| Daily losses: ₹{daily_loss_rs:.0f}")
                             else:
                                 consecutive_losses = 0
-                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak reset")
+                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} (gross ₹{gross:+.2f} "
+                                         f"- cost ₹{cost:.2f}) | Loss streak reset")
                         release_symbol_lock(symbol, STRATEGY_NAME)
                         state = "DONE"
                         active_trade = {}
@@ -618,17 +693,30 @@ def run_strategy():
                             quantity=min(bq, qty)
                         )
                         log.info(f"Exit Order Response: {order_resp}")
-                        # Compute trade P&L (option BUY entry → SELL exit)
-                        entry_opt_price = active_trade.get("entry_opt_price")
-                        if entry_opt_price is not None and pre_exit_opt_ltp is not None:
-                            trade_pnl = (pre_exit_opt_ltp - entry_opt_price) * qty
+                        # P&L on REAL fills, net of statutory cost. The quote is only
+                        # a fallback: pricing the exit at an observed LTP hides the
+                        # slippage that decides whether this strategy has an edge.
+                        _exit_oid = order_resp.get("orderid") if isinstance(order_resp, dict) else None
+                        exit_fill = fetch_fill_price(_exit_oid, symbol) or pre_exit_opt_ltp
+                        entry_opt_price = active_trade.get("entry_fill_price") \
+                            or active_trade.get("entry_opt_price")
+                        if entry_opt_price is not None and exit_fill is not None:
+                            gross = (exit_fill - entry_opt_price) * qty
+                            cost = statutory_cost(entry_opt_price, exit_fill, qty)
+                            trade_pnl = gross - cost
+                            _src = "fill" if _exit_oid and exit_fill != pre_exit_opt_ltp else "quote"
                             if trade_pnl < 0:
                                 consecutive_losses += 1
                                 daily_loss_rs += abs(trade_pnl)
-                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak: {consecutive_losses} | Daily losses: ₹{daily_loss_rs:.0f}")
+                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} (gross ₹{gross:+.2f} "
+                                         f"- cost ₹{cost:.2f}, exit={_src} {exit_fill}) "
+                                         f"| Loss streak: {consecutive_losses} "
+                                         f"| Daily losses: ₹{daily_loss_rs:.0f}")
                             else:
                                 consecutive_losses = 0
-                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak reset")
+                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} (gross ₹{gross:+.2f} "
+                                         f"- cost ₹{cost:.2f}, exit={_src} {exit_fill}) "
+                                         f"| Loss streak reset")
                     else:
                         log.warning(f"{exit_reason}: broker flat on {symbol} — no long to close; skipping SELL to avoid naked short")
 
@@ -790,34 +878,61 @@ def run_strategy():
                         quantity=entry_qty
                     )
                     log.info(f"Entry Order Response: {order_resp}")
+                    # Actual entry fill, for honest P&L. Keep entry_opt_price (the
+                    # pre-trade quote) for the stop maths, which must be computed
+                    # from a price known before the order goes in.
+                    entry_fill_price = None
+                    if isinstance(order_resp, dict) and order_resp.get("orderid"):
+                        entry_fill_price = fetch_fill_price(order_resp.get("orderid"), opt_symbol)
+                        if entry_fill_price and entry_opt_price:
+                            _slip = (entry_fill_price - entry_opt_price) / entry_opt_price * 1e4
+                            log.info(f"Entry fill {entry_fill_price} vs quote {entry_opt_price} "
+                                     f"→ slippage {_slip:+.0f} bps")
 
                     if order_resp.get("status") == "success":
                         state = "IN_TRADE"
-                        # POV-style premium stop: SL-M SELL on the option at
+                        # Premium stop: SL (stop-LIMIT) SELL on the option at
                         # entry_premium * (1 - PREMIUM_SL_PCT%), tick-aligned to 0.05.
+                        # SL-M is NOT usable here - it is rejected outright for
+                        # options (measured 33/33 failures), so we send a stop-limit
+                        # with the limit set below the trigger so it still fills
+                        # while price is falling.
                         opt_sl_orderid = None
                         opt_sl_price = None
                         if entry_opt_price is not None:
                             _raw = entry_opt_price * (1.0 - PREMIUM_SL_PCT / 100.0)
                             opt_sl_price = round(round(_raw / 0.05) * 0.05, 2)
+                            _lim = opt_sl_price * (1.0 - SL_LIMIT_BUFFER_PCT / 100.0)
+                            opt_sl_limit = max(0.05, round(round(_lim / 0.05) * 0.05, 2))
                             try:
                                 sl_resp = client.placeorder(
                                     strategy=STRATEGY_NAME,
                                     symbol=opt_symbol,
                                     action="SELL",
                                     exchange=opt_exchange,
-                                    price_type="SL-M",
+                                    price_type="SL",
                                     trigger_price=opt_sl_price,
+                                    price=opt_sl_limit,
                                     product=PRODUCT,
                                     quantity=entry_qty
                                 )
-                                if isinstance(sl_resp, dict) and sl_resp.get("status") == "success":
-                                    opt_sl_orderid = sl_resp.get("orderid")
-                                    log.info(f"Premium SL-M placed @ {opt_sl_price} ({PREMIUM_SL_PCT:.0f}% below entry {entry_opt_price}) — order {opt_sl_orderid}")
+                                # An order without an id does NOT exist. The API can
+                                # answer status=success with orderid=null when the
+                                # broker rejected it; trusting that left 33 live
+                                # positions unprotected. Require the id.
+                                _oid = sl_resp.get("orderid") if isinstance(sl_resp, dict) else None
+                                if isinstance(sl_resp, dict) and sl_resp.get("status") == "success" and _oid:
+                                    opt_sl_orderid = _oid
+                                    log.info(f"Premium SL placed @ trigger {opt_sl_price} "
+                                             f"limit {opt_sl_limit} ({PREMIUM_SL_PCT:.0f}% below "
+                                             f"entry {entry_opt_price}) — order {opt_sl_orderid}")
                                 else:
-                                    log.warning(f"Premium SL-M order rejected: {sl_resp}")
+                                    log.error(f"PREMIUM SL NOT PLACED — position is UNPROTECTED "
+                                              f"at the broker; relying on in-process spot/premium "
+                                              f"monitoring only. Response: {sl_resp}")
                             except Exception as e:
-                                log.error(f"Failed to place premium SL-M: {e}")
+                                log.error(f"Failed to place premium SL: {e} — position is "
+                                          f"UNPROTECTED at the broker")
                         active_trade = {
                             "symbol": opt_symbol,
                             "direction": signal,
@@ -826,6 +941,7 @@ def run_strategy():
                             "target_spot": target_spot,
                             "qty": entry_qty,
                             "entry_opt_price": entry_opt_price,
+                            "entry_fill_price": entry_fill_price,
                             "opt_sl_orderid": opt_sl_orderid,
                             "opt_sl_price": opt_sl_price,
                         }

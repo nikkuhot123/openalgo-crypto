@@ -64,6 +64,14 @@ def _option_exchange(underlying: str) -> str:
 COOLDOWN_MINUTES = int(os.getenv('POV_COOLDOWN_MINUTES', '30'))  # POV signal dedup cooldown (per-symbol action change)
 LOSS_STREAK_LIMIT = int(os.getenv('LOSS_STREAK_LIMIT', '3'))
 DAILY_LOSS_LIMIT_RS = float(os.getenv('DAILY_LOSS_LIMIT_RS', '10000'))
+# Protective stops MUST be SL (stop-limit), never SL-M: measured 2026-07-28 from
+# order_logs, SL-M was rejected 33/33 times on NFO+BFO options (0 created) while
+# MARKET on the same symbols/sessions succeeded 114/114 - the exchanges do not
+# accept SL-M in the options segment. Worse, the API reported those rejections as
+# {"status":"success","orderid":null}, so live positions ran with NO stop while
+# the logs claimed one was armed. A stop-limit needs its limit below the trigger
+# to still fill while price falls; this is that buffer, in % of the trigger.
+SL_LIMIT_BUFFER_PCT = float(os.getenv('SL_LIMIT_BUFFER_PCT', '5'))
 # High-conviction gating (cut over-trading / charge bleed — see cost analysis 2026-07-13)
 POV_MIN_SCORE = int(os.getenv('POV_MIN_SCORE', '5'))  # 5=STRONG only (all 5 conditions); 4 also allows WATCH
 POV_MAX_TRADES_PER_DAY = int(os.getenv('POV_MAX_TRADES_PER_DAY', '4'))  # hard daily entry cap per underlying (backstop)
@@ -639,18 +647,24 @@ def run_strategy():
             if not sl_ok and pos.get("sl_price"):
                 pos["sl_orderid"] = None
                 try:
+                    _trg = float(pos["sl_price"])
+                    _lim = max(0.05, round(round((_trg * (1.0 - SL_LIMIT_BUFFER_PCT / 100.0))
+                                                 / 0.05) * 0.05, 2))
                     sl_resp = client.placeorder(
                         strategy=STRATEGY_NAME, symbol=sym, action="SELL",
-                        exchange=opt_exchange, price_type="SL-M",
-                        trigger_price=pos["sl_price"], product=PRODUCT,
+                        exchange=opt_exchange, price_type="SL",
+                        trigger_price=_trg, price=_lim, product=PRODUCT,
                         quantity=pos["qty"])
-                    if sl_resp.get("status") == "success":
-                        pos["sl_orderid"] = sl_resp.get("orderid")
-                        log.info(f"Re-armed SL for {sym} @ {pos['sl_price']}")
+                    _oid = sl_resp.get("orderid") if isinstance(sl_resp, dict) else None
+                    if sl_resp.get("status") == "success" and _oid:
+                        pos["sl_orderid"] = _oid
+                        log.info(f"Re-armed SL for {sym} @ trigger {_trg} limit {_lim} "
+                                 f"— order {_oid}")
                     else:
-                        log.error(f"Re-arm SL for {sym} rejected: {sl_resp}")
+                        log.error(f"Re-arm SL for {sym} FAILED — position UNPROTECTED "
+                                  f"at the broker: {sl_resp}")
                 except Exception as e:
-                    log.error(f"Failed to re-arm SL for {sym}: {e}")
+                    log.error(f"Failed to re-arm SL for {sym}: {e} — position UNPROTECTED")
             log.warning(
                 f"Adopting position with RESTORED context: {sym} qty={pos['qty']} "
                 f"@ {pos.get('entry_opt_price')} | SL: {pos.get('sl_price')} | T1: {pos.get('target_price')}")
@@ -904,21 +918,35 @@ def run_strategy():
                                 entry_opt_price = _fill_entry
                             sl_orderid = None
 
-                            # Place SL-M exit order (system fills automatically)
+                            # Place the protective stop as SL (stop-LIMIT).
+                            # SL-M is rejected outright for options (measured
+                            # 33/33 rejections), and the API used to report that
+                            # as success with orderid=null - which silently left
+                            # positions with no stop at all.
                             if res["sl"] is not None:
+                                _trg = float(res["sl"])
+                                _lim = max(0.05, round(round((_trg * (1.0 - SL_LIMIT_BUFFER_PCT / 100.0))
+                                                             / 0.05) * 0.05, 2))
                                 sl_resp = client.placeorder(
                                     strategy=STRATEGY_NAME,
                                     symbol=symbol,
                                     action="SELL",
                                     exchange=opt_exchange,
-                                    price_type="SL-M",
-                                    trigger_price=res["sl"],
+                                    price_type="SL",
+                                    trigger_price=_trg,
+                                    price=_lim,
                                     product=PRODUCT,
                                     quantity=entry_qty
                                 )
                                 log.info(f"SL Order Response: {sl_resp}")
-                                if sl_resp.get("status") == "success":
-                                    sl_orderid = sl_resp.get("orderid")
+                                _oid = sl_resp.get("orderid") if isinstance(sl_resp, dict) else None
+                                if sl_resp.get("status") == "success" and _oid:
+                                    sl_orderid = _oid
+                                    log.info(f"SL armed for {symbol} @ trigger {_trg} "
+                                             f"limit {_lim} — order {_oid}")
+                                else:
+                                    log.error(f"SL NOT PLACED for {symbol} — position is "
+                                              f"UNPROTECTED at the broker: {sl_resp}")
 
                             positions[symbol] = {
                                 "qty": entry_qty,

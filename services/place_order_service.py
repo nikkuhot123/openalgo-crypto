@@ -216,7 +216,13 @@ def place_order_with_auth(
         ))
         return False, error_response, 500
 
-    if res.status == 200:
+    # A broker can return HTTP 200 while REJECTING the order at the business layer
+    # (Flattrade answers 200 with stat="Not_Ok", which makes place_order_api hand
+    # back order_id=None). Reporting that as success is dangerous: it silently
+    # swallowed 33 protective SL-M orders in live trading, leaving positions
+    # unhedged while the strategy believed a stop was resting at the broker.
+    # An order without an id does not exist, so require one.
+    if res.status == 200 and order_id:
         order_response_data = {"status": "success", "orderid": order_id}
 
         if emit_event:
@@ -238,11 +244,23 @@ def place_order_with_auth(
 
         return True, order_response_data, 200
     else:
-        message = (
-            response_data.get("message", "Failed to place order")
-            if isinstance(response_data, dict)
-            else "Failed to place order"
-        )
+        # Brokers report the reason under different keys; Flattrade uses "emsg"
+        # alongside stat="Not_Ok". Prefer a real reason over a generic string so a
+        # rejected order is diagnosable from the log instead of vanishing.
+        message = "Failed to place order"
+        if isinstance(response_data, dict):
+            for key in ("message", "emsg", "errmsg", "error", "reason", "stat"):
+                val = response_data.get(key)
+                if val and str(val).strip() and str(val) != "Not_Ok":
+                    message = str(val)
+                    break
+        if res.status == 200 and not order_id:
+            message = f"Broker accepted the request but returned no order id: {message}"
+            logger.error(
+                f"Order NOT created despite HTTP 200 - {order_data.get('action')} "
+                f"{order_data.get('quantity')} {order_data.get('symbol')} "
+                f"({order_data.get('pricetype')}): {message}"
+            )
         error_response = {"status": "error", "message": message}
         bus.publish(OrderFailedEvent(
             mode="live",

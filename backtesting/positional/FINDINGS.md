@@ -5,7 +5,7 @@ After every intraday/option mechanism in `../smc/FINDINGS.md` was measured dead
 that unlocked a working strategy was the user's: **Flattrade charges zero
 brokerage**, making a strategy that round-trips daily viable for the first time.
 
-## The result (deterministic, TARGET_VOL=0.04, 3bps/side honest cost)
+## The result (deterministic, TARGET_VOL=0.04, 3bps/side — cost verified vs Flattrade below)
 
 | | CAGR | Sharpe | maxDD | Calmar | years |
 |---|--:|--:|--:|--:|--:|
@@ -69,14 +69,41 @@ SENSEX H1 3.07 / H2 1.38. Both halves out-of-sample positive.
 3. **Execute**: at today's close hold `size` units of the NIFTY/SENSEX **future**
    into the open; exit at tomorrow's open.
 
-## The one live risk: cost
+## The one live risk: cost — VERIFIED against Flattrade's calculator
 
-The book pays the spread twice daily. STT (~2bps sell) + exchange/SEBI/stamp/GST
-make ~3bps/side the honest all-in even at zero brokerage. Edge vs cost
-(trend+VT=0.08): 2bps Sharpe 2.20/3.13 → 3bps 1.54/2.40 → 4bps 0.87/1.68 →
-**5bps 0.20/0.94 (gone)**. Execute against the future near the auction and monitor
-realised slippage; if per-side cost exceeds ~4bps the edge thins fast. This — not
-the signal — is the number to watch in production.
+Reconfirmed 2026-07-28 by driving `flattrade.in/brokerage-calculator/` directly.
+One NIFTY futures round trip (buy 25000, sell 25000, 1 lot = 75, position
+notional Rs 18,75,000):
+
+| line | Rs |
+|---|--:|
+| Brokerage | **0** (genuinely zero) |
+| STT | 937.50 |
+| Exchange txn | 68.63 |
+| GST | 13.70 |
+| SEBI + IPFT | 7.50 |
+| Stamp duty | 37.50 |
+| **Round-trip total** | **1,064.83** = **5.68 bps** = **2.84 bps/side** |
+
+So the deliverable's 3.0 bps/side assumption was slightly CONSERVATIVE; at the
+real statutory 2.84 bps/side the book is stronger — NIFTY CAGR 5.23% / Sharpe
+1.64 / DD −6.53%, SENSEX 8.37% / 2.52 / −7.76% (TARGET_VOL=0.04).
+
+But statutory is a FLOOR — bid/ask slippage rides on top and decides everything.
+All-in per-side sensitivity (TARGET_VOL=0.04):
+
+| real all-in / side | NIFTY Sharpe | SENSEX Sharpe |
+|---|--:|--:|
+| 2.84 (statutory only) | 1.64 | 2.52 |
+| 3.34 (+0.5bp slip) | 1.31 | 2.16 |
+| **3.84 (+1bp slip)** | **0.98** | 1.79 |
+| 4.84 (+2bp slip) | dies | thins |
+
+**NIFTY falls below Sharpe 1.0 once real slippage adds ~1 bp/side; SENSEX holds
+to ~2 bp.** The signal is settled by 15 years of data; the live make-or-break is
+whether your realised close→open fills keep all-in cost under ~3.8 bps/side.
+Execute against the future near the auction and monitor realised slippage — this,
+not the signal, is the number to watch in production.
 
 ## Files
 

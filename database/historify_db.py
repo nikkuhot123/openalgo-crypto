@@ -23,8 +23,24 @@ logger = get_logger(__name__)
 # Load environment variables
 load_dotenv()
 
-# Database path - in /db folder like other OpenAlgo databases
-HISTORIFY_DB_PATH = os.getenv("HISTORIFY_DATABASE_PATH", "db/historify.duckdb")
+# Database path - in /db folder like other OpenAlgo databases.
+# Accept BOTH names: the shipped .env sets HISTORIFY_DATABASE_URL while this
+# module only ever read HISTORIFY_DATABASE_PATH, so the configured value was
+# silently ignored and the default was always used. Anyone relocating the DB via
+# the .env key would have been editing a dead variable.
+def _resolve_historify_path() -> str:
+    raw = (os.getenv("HISTORIFY_DATABASE_PATH")
+           or os.getenv("HISTORIFY_DATABASE_URL")
+           or "db/historify.duckdb").strip()
+    # tolerate a SQLAlchemy-style URL in the *_URL variant
+    for prefix in ("duckdb:///", "duckdb://", "sqlite:///", "sqlite://"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+            break
+    return raw or "db/historify.duckdb"
+
+
+HISTORIFY_DB_PATH = _resolve_historify_path()
 
 
 def get_db_path() -> str:

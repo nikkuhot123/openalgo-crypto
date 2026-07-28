@@ -641,6 +641,15 @@ class BrokerData:
             br_symbol = get_br_symbol(symbol, exchange)
             token = get_token(symbol, exchange)
 
+            # Keep the OpenAlgo-side exchange: `exchange` is rebound below to the
+            # broker segment (NSE_INDEX -> NSE) for the API payload, but symbol
+            # lookups must use the original. Passing the rebound value to
+            # get_quotes() made get_token('NIFTY', 'NSE') return None, which
+            # serialised as "token": null and Flattrade rejected the whole
+            # request with "Invalid Input : One or more input parameters are not
+            # in string format" — so daily downloads never appended today's bar.
+            oa_exchange = exchange
+
             if exchange == "NSE_INDEX":
                 exchange = "NSE"
             elif exchange == "BSE_INDEX":
@@ -793,8 +802,9 @@ class BrokerData:
                 if today_ts >= start_ts and today_ts <= end_ts:
                     if df.empty or df["timestamp"].max() < today_ts:
                         try:
-                            # Get today's data from quotes
-                            quotes = self.get_quotes(symbol, exchange)
+                            # Get today's data from quotes (needs the ORIGINAL
+                            # exchange so the symbol/token lookup resolves)
+                            quotes = self.get_quotes(symbol, oa_exchange)
 
                             if quotes:
                                 today_data = {

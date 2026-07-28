@@ -71,6 +71,20 @@ RR = float(os.getenv('RR', '2.0'))  # reward:risk target multiple (both indices:
 # Circuit breaker config
 LOSS_STREAK_LIMIT = int(os.getenv('LOSS_STREAK_LIMIT', '3'))
 DAILY_LOSS_LIMIT_RS = float(os.getenv('DAILY_LOSS_LIMIT_RS', '10000'))
+# Minimum stop distance as % of spot. Judas' raw stop is the sweep extreme,
+# which on a tight opening range sits inside the index's noise: live stops of
+# 5.4-5.9 pts (0.022-0.025%) were taken out in 12-42 seconds on 2026-07-21 and
+# 2026-07-28. Floors the STOP only — the target keeps using the RAW risk, since
+# scaling the target with the floored risk is strictly worse (validated on the
+# HA-EMA analog: -6.16% scaled vs -2.03% unscaled, same window).
+MIN_SL_PCT = float(os.getenv('MIN_SL_PCT', '0.10'))
+# Skip entries on the traded weekly's own expiry day, for these underlyings.
+# NIFTY (Tue) DTE-0 ATM premium is ~1/3 of a normal day's, so gamma turns a
+# 0.025% adverse move into ~19% premium loss. Not applied to SENSEX (its Thu
+# expiry is its best day in live logs). Validated on the HA-EMA analog only.
+SKIP_EXPIRY_DAY_UNDERLYINGS = {
+    s.strip().upper() for s in os.getenv('SKIP_EXPIRY_DAY_UNDERLYINGS', 'NIFTY').split(',') if s.strip()
+}
 
 # Symbol lock dir (shared across all strategies on this host)
 LOCKS_DIR = Path("log") / "strategies" / "locks"
@@ -237,6 +251,15 @@ def get_option_symbol(underlying, exchange, expiry, offset, option_type):
         log.error(f"Error fetching optionsymbol: {e}")
     return None
 
+def is_expiry_today(expiry_str):
+    """True when `expiry_str` ('28JUL26' from get_nearest_expiry) is today."""
+    if not expiry_str:
+        return False
+    try:
+        return datetime.strptime(expiry_str.upper(), "%d%b%y").date() == date.today()
+    except (ValueError, TypeError):
+        return False
+
 def fetch_lot_size(underlying, idx_exchange, opt_exchange):
     """Fetch actual lot size from option chain. Returns lot size or None."""
     try:
@@ -338,21 +361,23 @@ def compute_judas_signal(df_5m, today):
     if lt < OR_END or lt >= ENTRY_END:
         return status
 
+    risk_floor = c_close * (MIN_SL_PCT / 100.0)
+
     # sweep above -> false bullish break -> reversal down -> buy PE
     if swept_high and c_close < or_high:
-        sl_spot = sweep_extreme_high
-        risk = sl_spot - c_close
-        if risk > 0:
+        raw_risk = sweep_extreme_high - c_close
+        if raw_risk > 0:
             status.update({"signal": "PE", "entry_spot": c_close,
-                           "sl_spot": sl_spot, "target_spot": c_close - RR * risk})
+                           "sl_spot": c_close + max(raw_risk, risk_floor),
+                           "target_spot": c_close - RR * raw_risk})
             return status
     # sweep below -> false bearish break -> reversal up -> buy CE
     if swept_low and c_close > or_low:
-        sl_spot = sweep_extreme_low
-        risk = c_close - sl_spot
-        if risk > 0:
+        raw_risk = c_close - sweep_extreme_low
+        if raw_risk > 0:
             status.update({"signal": "CE", "entry_spot": c_close,
-                           "sl_spot": sl_spot, "target_spot": c_close + RR * risk})
+                           "sl_spot": c_close - max(raw_risk, risk_floor),
+                           "target_spot": c_close + RR * raw_risk})
             return status
     return status
 
@@ -668,6 +693,12 @@ def run_strategy():
                 expiry = get_nearest_expiry(UNDERLYING, opt_exchange)
                 if not expiry:
                     time.sleep(15)
+                    continue
+                # Expiry-day skip: nearest weekly expires today -> stand down.
+                if UNDERLYING.upper() in SKIP_EXPIRY_DAY_UNDERLYINGS and is_expiry_today(expiry):
+                    log.info(f"{UNDERLYING} weekly expires today ({expiry}) — skipping entries for the day "
+                             f"(DTE-0 gamma; validated on the HA-EMA analog)")
+                    state = "DONE"
                     continue
                 opt_symbol = get_option_symbol(UNDERLYING, idx_exchange, expiry, STRIKE_OFFSET, signal_type)
                 if not opt_symbol:

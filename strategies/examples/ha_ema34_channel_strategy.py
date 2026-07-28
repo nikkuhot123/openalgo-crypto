@@ -73,6 +73,20 @@ DAILY_LOSS_LIMIT_RS = float(os.getenv('DAILY_LOSS_LIMIT_RS', '10000'))
 # 169->82, -51%, while spot held above the spot-SL). Exit if the option premium
 # falls >= this % below entry. Broker-side, so it also protects across restarts.
 PREMIUM_SL_PCT = float(os.getenv('PREMIUM_SL_PCT', '35'))
+# Minimum stop distance as % of spot (Volrix-validated 2026-07-28).
+# Raw stop = signal candle's extreme, which on a quiet candle is inside the
+# index's noise (live: 5.4-5.9 pt / 0.022% stops died in 12-42 seconds).
+# Floors the STOP only — the target still uses the raw candle risk.
+MIN_SL_PCT = float(os.getenv('MIN_SL_PCT', '0.10'))
+# Skip entries on the traded weekly's own expiry day, for these underlyings.
+# NIFTY expiry (Tue) is the worst day by a wide margin: DTE-0 ATM premium is
+# ~1/3 of a normal day's, so gamma converts a 0.025% adverse spot move into a
+# ~19% premium loss. Removing those entries was the single biggest improvement
+# in backtest (-3.01% -> +0.24% gross). NOT applied to SENSEX: its own expiry
+# (Thu) is its best day in live logs, and it has no backtest support.
+SKIP_EXPIRY_DAY_UNDERLYINGS = {
+    s.strip().upper() for s in os.getenv('SKIP_EXPIRY_DAY_UNDERLYINGS', 'NIFTY').split(',') if s.strip()
+}
 
 # Symbol lock dir (shared across all strategies on this host)
 LOCKS_DIR = Path("log") / "strategies" / "locks"
@@ -223,6 +237,15 @@ def get_nearest_expiry(underlying, exchange):
     except Exception as e:
         log.error(f"Error fetching expiry: {e}")
     return None
+
+def is_expiry_today(expiry_str):
+    """True when `expiry_str` ('28JUL26' from get_nearest_expiry) is today."""
+    if not expiry_str:
+        return False
+    try:
+        return datetime.strptime(expiry_str.upper(), "%d%b%y").date() == date.today()
+    except (ValueError, TypeError):
+        return False
 
 def get_option_symbol(underlying, exchange, expiry, offset, option_type):
     try:
@@ -693,23 +716,38 @@ def run_strategy():
                 sl_spot = None
                 target_spot = None
 
+                # Stop-distance floor (Volrix-validated 2026-07-28, run a6777437).
+                # The raw stop is the signal candle's extreme, which on a quiet
+                # candle sits inside the index's own noise: live stops of 5.4-5.9
+                # pts (0.022%) were taken out in 12-42 seconds. Floor it.
+                # CRITICAL: the target stays RR x the RAW candle risk. Scaling the
+                # target with the floored risk pushes it out of reach and is
+                # strictly worse (V1: -6.16% vs V2: -2.03% on the same window).
+                risk_floor = entry_spot * (MIN_SL_PCT / 100.0)
+
                 if bias == "GREEN" and candle_close > ema_upper * BREAKOUT_MULT:
-                    sl_spot = candle_low
-                    risk = entry_spot - sl_spot
-                    if risk > 0:
-                        target_spot = entry_spot + 2.0 * risk
+                    raw_risk = entry_spot - candle_low
+                    if raw_risk > 0:
+                        sl_spot = entry_spot - max(raw_risk, risk_floor)
+                        target_spot = entry_spot + 2.0 * raw_risk
                         signal = "CE"
                 elif bias == "RED" and candle_close < ema_lower * (2.0 - BREAKOUT_MULT):
-                    sl_spot = candle_high
-                    risk = sl_spot - entry_spot
-                    if risk > 0:
-                        target_spot = entry_spot - 2.0 * risk
+                    raw_risk = candle_high - entry_spot
+                    if raw_risk > 0:
+                        sl_spot = entry_spot + max(raw_risk, risk_floor)
+                        target_spot = entry_spot - 2.0 * raw_risk
                         signal = "PE"
 
                 if signal:
                     expiry = get_nearest_expiry(UNDERLYING, opt_exchange)
                     if not expiry:
                         time.sleep(15)
+                        continue
+                    # Expiry-day skip: nearest weekly expires today -> stand down.
+                    if UNDERLYING.upper() in SKIP_EXPIRY_DAY_UNDERLYINGS and is_expiry_today(expiry):
+                        log.info(f"{UNDERLYING} weekly expires today ({expiry}) — skipping entries for the day "
+                                 f"(DTE-0 gamma; backtest-validated)")
+                        state = "DONE"
                         continue
                     opt_symbol = get_option_symbol(UNDERLYING, idx_exchange, expiry, STRIKE_OFFSET, signal)
                     if not opt_symbol:

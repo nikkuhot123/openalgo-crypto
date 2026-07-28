@@ -339,3 +339,115 @@ dislocation), since the cache holds 777 days of all four aligned on the same 5m
 grid. That is a different bet - convergence rather than continuation - and it has
 not been tested. Multi-day horizons are also untouched; everything here exits by
 15:15.
+
+
+---
+
+# Part 4 — Markov regime gate + premium selling (the last untested lever)
+
+Ran `markov-hedge-fund-method` (Roan / @RohOnChain) on both indices, 10y daily:
+
+| | Bear->Bear | Sideways->Sideways | Bull->Bull | Bull->Bear | WF Sharpe | WF maxDD |
+|---|--:|--:|--:|--:|--:|--:|
+| NIFTY (^NSEI) | 83.75% | 81.29% | 88.42% | 0.10% | 0.478 | -25.87% |
+| SENSEX (^BSESN) | 84.54% | 80.84% | 88.53% | 0.10% | 0.458 | -28.35% |
+
+Regimes are 81-88% persistent, so the state is predictable enough to gate on.
+The skill's own walk-forward (re-fit every step, no lookahead, no tuning, 2,208
+trades) is the ONLY genuinely out-of-sample positive expectancy found in this
+whole body of work - but ret/DD = 0.24, far below the 0.667 the targets demand.
+
+## The gate's premise is TRUE (3,023 day-observations, 4 indices)
+
+Regime labelled causally (20-day return through t-1 only), then realised range:
+
+| regime | days | realised range | \|close-open\| | seller P(\|move\|<0.5%) |
+|---|--:|--:|--:|--:|
+| Bear | 604 | **1.433%** | 0.756% | 42.7% |
+| Sideways | 1,163 | **1.002%** | 0.492% | 63.2% |
+| Bull | 1,256 | 1.098% | 0.569% | 57.2% |
+
+Sideways vs trending: +0.205pp, **t = 8.9**. Sideways is lowest-range in all 4
+years. Bear days carry 43% more range - they are where a premium seller dies.
+So the premise is sound and statistically strong.
+
+## Building the seller on measured parameters only
+
+Each step below was a measured decision on NIFTY TRAIN, not a guess:
+
+| change | result |
+|---|---|
+| gate ON vs OFF (OTM1, SL40) | -10.58% vs -18.42%; DD 13.9% vs 24.7% |
+| stop 40% -> **100%** -> 400% | -10.58% -> **-1.81%** -> -11.08% (interior optimum) |
+| strikes OTM1 -> OTM2 -> **OTM4** | DD 8.58% -> 7.63% -> **5.19%**, PF 0.9 -> 0.9 -> **1.0** |
+
+Best TRAIN config: OTM4 strangle, 100% premium stop, 50% target, skip DTE-0.
+Breakeven (PF 1.0) - and every TRAIN positive in this repo has died out of sample,
+so it was tested rather than tuned further.
+
+## Out of sample: the strategy is a calendar, not an edge
+
+Same fixed config, both instruments, both windows:
+
+| | TRAIN (Jan-Apr 26) | VAL (May-Jul 26) |
+|---|--:|--:|
+| NIFTY, no gate | **-11.51%** (PF 0.9, DD 20.6%) | **+20.85%** (PF 1.5, DD 4.2%, Sharpe 6.33) |
+| SENSEX, no gate | - | **+8.33%** (PF 1.1, DD 9.6%, Sharpe 1.88) |
+| NIFTY, gated | -0.55% (PF 1.0) | **0 trades** |
+| SENSEX, gated | -16.18% (PF 0.7) | +5.23% (PF 1.1, Sharpe 1.86) |
+
+**Both instruments lose in Jan-Apr and win in May-Jul.** The outcome is set by the
+period, not the instrument and not the parameters. This is short-volatility
+exposure: it harvests premium while realised vol stays low and gives it all back
+in a trend. SENSEX VAL clearing 3 of 4 targets (+5.23%, Sharpe 1.86) is a
+favourable-quarter artifact - the identical config lost 11.5-16.2% one quarter
+earlier.
+
+## The gate is a risk reducer, not an alpha filter
+
+Measured effect of switching the gate on:
+
+| cell | gated | ungated | gate effect |
+|---|--:|--:|--:|
+| NIFTY TRAIN | -0.55% | -11.51% | **+11.0pp (helped)** |
+| NIFTY VAL | 0 trades | +20.85% | **-20.9pp (hurt)** |
+| SENSEX VAL | +5.23% | +8.33% | -3.1pp (hurt) |
+
+It helps when the strategy loses and hurts when it wins - the signature of a
+position-size reducer, not of alpha. It blocked 100% of NIFTY's best quarter. Its
+range premise is real on average over 604 Bear days, but it is not reliable within
+any single quarter, which is the horizon that decides a live P&L.
+
+## Final scoreboard: are the targets reachable?
+
+The invariant: return/DD must be >= 4/6 = **0.667** for any position size to
+satisfy return >= 4% and DD <= 6% together. Measured, per mechanism:
+
+| mechanism | ret/DD | verdict |
+|---|--:|---|
+| SMC debit (sweep, RR gates) | negative | dead - E[R] = -0.007R, t=-0.9, n=35,874 |
+| SMC credit (sweep-fade) | 0.43 train, negative OOS | dead |
+| Blind short ATM straddle | negative | dead |
+| Regime-gated OTM4 strangle | ~0 train, period-dependent OOS | not an edge |
+| Markov directional (10y walk-forward) | **0.24** | real but far too small |
+
+**No mechanism tested reaches 0.667.** The targets are not reliably attainable
+with anything in this repo. Any single cell that clears them (NIFTY VAL +20.85%,
+SENSEX VAL +5.23%) is contradicted by the same configuration in the adjacent
+quarter.
+
+## What would actually be required
+
+1. **Accept a lower bar, or size for survival.** The Markov walk-forward is
+   genuinely OOS-positive at Sharpe ~0.47. Sized to a 6% DD it returns ~1.4%/yr.
+   That is honest and small; it is not 4%.
+2. **Sell vol with a vol forecast, not a trend label.** The gate failed because a
+   20-day trailing RETURN is a poor proxy for forward RANGE. The correct
+   conditioning variable is forward realised volatility (e.g. GARCH/HAR on
+   intraday range, or India VIX term structure). The range study proves range is
+   predictable in-sample; nothing here tested a genuine vol FORECAST.
+3. **Longer option history.** Every option-level conclusion rests on 6 months
+   (Volrix free). The Max plan gives 1,841 days, which would let a vol-forecast
+   gate be tested across multiple vol regimes instead of two quarters.
+
+Do not deploy any configuration in this file on the strength of one quarter.

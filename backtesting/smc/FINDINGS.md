@@ -234,3 +234,108 @@ negative everywhere else.
    real headroom, since a seller's losses concentrate in trend/high-vol days.
 
 Do not deploy any of this.
+
+
+---
+
+# Part 3 — The definitive test: 92,876 events, 4 instruments, 4 years
+
+Part 1 said the concept was "unmeasurable on 6 months". That excuse is now gone.
+`harvest_state.db` supplied 777 trading days x 4 indices of 5m bars (2023-04-05..
+2026-05-27), validated at 98.9% exact close-parity against the live broker feed.
+
+## First: slippage was never the cause
+
+Volrix applies slippage post-run, so the existing backtests were re-priced at the
+measured cost (median 0 bps drift) instead of the assumed 1%:
+
+| run | @1.0% | @0.2% | @0.0% |
+|---|--:|--:|--:|
+| S3 base NIFTY TRAIN | +3.91% | +13.31% (Sharpe 1.79) | +15.65% |
+| S3 base NIFTY VAL | -14.16% | -7.47% | **-5.79%** |
+| S3 base SENSEX VAL | -19.88% | -12.65% | **-10.84%** |
+
+**It still loses out of sample at ZERO transaction cost.** Cost changes the
+magnitude, never the sign. My earlier "slippage dominates" framing was wrong for
+this strategy: the signal breaks down on its own.
+
+## Second: the infographic's core claim is TRUE
+
+"LIQUIDITY SWEEP (breaks a pool then reverses) vs REAL BREAKOUT (breaks and
+continues)" - tested as P(the swept extreme is never exceeded again before 15:15),
+comparing the two groups so both took out the same kind of pool:
+
+| group | events | P(hold) | median MFE |
+|---|--:|--:|--:|
+| sweep | 35,874 | **40.9%** | 55.3 pts |
+| real breakout | 57,002 | 32.7% | 49.9 pts |
+
+**Edge +8.1pp, z = 25.2.** Positive in all 4 instruments (NIFTY +8.7, MIDCPNIFTY
++8.8, BANKNIFTY +7.8, FINNIFTY +7.1) and all 4 years (+5.8, +8.4, +9.4, +8.3).
+The distinction the material rests on is real and stable. That is a genuine
+validation of the source material.
+
+It also explains the credit model's PF exactly: 40.9% hold at the 1.25:1 payoff
+of a 50%-target/40%-stop gives 0.409*1.25/0.591 = **0.87**, versus the 0.9
+measured. The edge was real; the payoff structure was wrong.
+
+## Third: but it does NOT translate into tradable expectancy
+
+Median MFE of 55 pts against a ~19-pt stop implied ~2.3:1 was available, so the
+actual bar path was walked for every event: enter at the sweep close, stop just
+beyond the swept extreme, target at k x risk. Stop wins ties; unresolved by 15:15
+exits at the close.
+
+| target k | sweep E[R] | win% | breakout E[R] |
+|---|--:|--:|--:|
+| 1.0 | -0.019 | 49.0% | +0.006 |
+| 1.5 | -0.025 | 41.1% | +0.005 |
+| 2.0 | -0.023 | 37.5% | -0.001 |
+| 2.5 | -0.013 | 36.0% | -0.005 |
+| 3.0 | -0.007 | 35.2% | -0.002 |
+
+Best case k=3.0: **E[R] = -0.0068R, se 0.0075, t = -0.9**, n=35,874. Zero.
+Per trade: **-0.22 index points**. Sign flips by year (2023 -0.045, 2025 +0.037)
+and by instrument, so no stable subset exists either.
+
+**Statistical power:** se = 0.0075R detects any edge above ~0.023R at 3 sigma
+(~0.7 points on 31-pt median risk). The observed value is -0.007R. This
+**rules out** a tradable edge rather than failing to find one.
+
+## Why P(hold) can be significant while E[R] is zero
+
+P(hold) is a survival statistic measured to EOD. Expectancy depends on the PATH.
+Even when a fade ultimately holds, price frequently trades against the entry
+first and takes out a stop placed just beyond the extreme; when it does not hold,
+you lose a full 1R. The +8.1pp survival advantage is exactly cancelled by
+unfavourable path and timing. A classifier can be highly significant and still
+have no tradable content - this dataset is a clean example.
+
+## What this closes
+
+Every result in this repo is now consistent under one explanation:
+
+| strategy | outcome | consistent with E[R] ~ 0? |
+|---|---|---|
+| HA-EMA 34 channel (debit) | -10.2 pts/trade | yes: ~0 signal edge, then option cost |
+| Judas swing (debit) | net negative | yes |
+| SMC debit (RR gates) | 1-9 trades, OOS negative | yes |
+| SMC credit (sweep-fade) | PF 0.9, predicted 0.87 | yes, quantitatively |
+| Blind short straddle | -31% | yes: no selection at all |
+
+There is no directional edge in this signal family on the index. Positive results
+on 64-day windows were noise, and the 6-month data cap was never the real limit.
+
+## Recommendation
+
+Stop pursuing ICT/SMC directional variants. This is now a measured null with
+enough power to be trusted, not an inconclusive result. Reaching return >= 4% /
+Sharpe >= 1.0 / DD <= 6% requires a different SOURCE of edge, not another
+parameterisation of this one.
+
+The one mechanism that is genuinely different and now cheap to test: cross-
+sectional relative value between the four indices (e.g. NIFTY vs BANKNIFTY
+dislocation), since the cache holds 777 days of all four aligned on the same 5m
+grid. That is a different bet - convergence rather than continuation - and it has
+not been tested. Multi-day horizons are also untouched; everything here exits by
+15:15.

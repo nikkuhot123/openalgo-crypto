@@ -107,3 +107,4 @@ backtesting/data/*.duckdb.bak
 harvest_*.db
 harvest_*.db-shm
 harvest_*.db-wal
+backtesting/smc/*.csv

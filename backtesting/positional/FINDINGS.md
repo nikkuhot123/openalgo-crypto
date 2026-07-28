@@ -105,10 +105,60 @@ whether your realised close→open fills keep all-in cost under ~3.8 bps/side.
 Execute against the future near the auction and monitor realised slippage — this,
 not the signal, is the number to watch in production.
 
+## Grinding for more: what a disciplined squeeze found (and didn't)
+
+Rather than torture parameters, tried to add uncorrelated RETURN STREAMS. Two
+hypotheses were killed by measurement, one real improvement survived. All at the
+Flattrade-verified cost.
+
+**Killed — intraday-short complement.** Intraday Sharpe is negative (−1.1/−1.6),
+so shorting the open→close session, trend-gated, seemed a natural opposite
+stream. Measured standalone: Sharpe −0.34 (NIFTY) / −0.01 (SENSEX) / −0.36
+(BANKNIFTY). A negative long-Sharpe does not survive as a profitable short after
+cost. Dropped.
+
+**Killed — multi-index risk-parity basket.** All five index OVERNIGHT books
+correlate 0.65–0.94 (it is the same market overnight), so an equal-risk basket
+just dilutes strong books with weak ones: basket Calmar 0.5–0.83 vs MIDCAP50
+alone at 1.21. A 50/50 SENSEX+MIDCAP50 was worse than either alone (DD −19% from
+midcap tails). Cross-index diversification adds nothing here.
+
+**Real find — instrument selection.** The books are NOT equal. Overnight Sharpe
+at 3.34 bps/side: MIDCAP50 3.10, MIDCAP100 3.13, SENSEX 2.16, NIFTY 1.31,
+BANKNIFTY 0.55. Under honest cost stress the survivor is MIDCAP50:
+
+| instrument | Sharpe @3.3bps | @5bps | @7bps | both halves |
+|---|--:|--:|--:|---|
+| MIDCAP50 | 3.10 | **2.10** | 0.87 | 1.21 / 2.95 (stable) |
+| SENSEX | 2.16 | 0.94 | −0.53 | 1.49 / **0.10** (fragile) |
+| NIFTY | 1.64 | — | — | 1.48 / 1.40 (stable) |
+
+SENSEX's headline 2.16 is a mirage — its H2 Sharpe collapses to 0.10 at 5bps.
+MIDCAP50 is Sharpe-robust to cost AND stable across both halves, and its Sharpe
+is a flat 1.88–2.36 plateau across all lookback/halflife choices.
+
+**But it is not a free win.** Midcaps have fatter overnight tails, so at matched
+vol MIDCAP50 draws down deeper than NIFTY (−11.6% vs −6.5% at TARGET_VOL=0.03),
+giving LOWER Calmar (0.46 vs 0.80). It is a higher-Sharpe / higher-tail point on
+the frontier, not a domination. Two honest options:
+
+  * **Sharpe-maximiser**: trade the **Nifty Midcap Select future** (MIDCPNIFTY)
+    overnight, same rules, TARGET_VOL≈0.03 → Sharpe ~2.1, CAGR ~5.3%, DD ~−11.6%
+    at a conservative 5bps/side. Requires accepting deeper drawdowns and the
+    wider midcap-future spread (verify your fills — the 5bps assumption is the
+    live risk, edge gone by ~7bps).
+  * **Drawdown-minimiser**: keep NIFTY/SENSEX (large-cap futures, tighter
+    spreads, DD ≤7%). Best ret-per-unit-drawdown.
+
+Nothing beat the original NIFTY/SENSEX book on ret/DD; the squeeze buys raw
+Sharpe by moving down-cap, paid for in tail risk and spread. Files:
+`overnight_portfolio.py` (basket + intraday-short + per-instrument sweep).
+
 ## Files
 
 - `overnight_drift_strategy.py` — reference implementation + self-check (the deliverable)
 - `voltarget_harness.py` — single-signal sweep that isolated long/flat trend
 - `ensemble_trend.py` — full-day ensemble (Sharpe capped ~0.8; NIFTY/SENSEX corr 0.98)
 - `overnight_edge.py` — the overnight/intraday decomposition
+- `overnight_portfolio.py` — multi-index basket, intraday-short, per-instrument cost/half stress
 - `overnight_validate.py` — sub-period, yearly, and cost stress tests

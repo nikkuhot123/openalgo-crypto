@@ -89,3 +89,55 @@ Two secondary observations:
 Trade-by-trade parity with live is *not* expected from this proxy (fixed 0.10%/0.20%
 stops vs live candle-extreme stops; close-based stop checks vs live tick polling).
 Use it for aggregate signal edge, not for reconciling individual fills.
+
+## Local DuckDB cache (`HISTORIFY_DB_PATH`)
+
+**The VPS Historify DB is empty.** `/opt/openalgo/db/historify.duckdb` is 536 KB,
+untouched since 2025-06-20, and every table — including `market_data` — has **0 rows**.
+Pointing `HISTORIFY_DB_PATH` at it would gain nothing, so the cache is built locally
+in the identical Historify schema:
+
+```bash
+./venv/Scripts/python.exe backtesting/ingest_duckdb.py --days 400   # idempotent
+```
+
+Contents of `backtesting/data/market_cache.duckdb` (7.6 MB, gitignored):
+
+| symbol | exchange | interval | rows | span |
+|---|---|---|--:|---|
+| NIFTY | NSE_INDEX | 1m | 67,349 | 2025-06-23 .. 2026-07-28 |
+| NIFTY | NSE_INDEX | D | 270 | 2025-06-23 .. 2026-07-27 |
+| SENSEX | BSE_INDEX | 1m | 94,375 | 2025-06-23 .. 2026-07-28 |
+| SENSEX | BSE_INDEX | D | 154 | 2026-01-12 .. 2026-07-27 |
+
+Only `1m` and `D` are stored (Historify convention); other timeframes resample from
+1m. Scripts default to `BT_SOURCE=db`; use `BT_SOURCE=api` to bypass the cache.
+
+### Parity check (cache vs API)
+
+| source | bars | trades | win% | net P&L | return | Sharpe | runtime |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| DuckDB cache | 13,440 | 127 | 37.8% | -84,563 | -4.23% | -6.93 | 8 s |
+| OpenAlgo API | 13,439 | 127 | 37.8% | -84,687 | -4.23% | -6.94 | 28 s |
+
+Same trades, same win rate, P&L within Rs 124 (0.15%) - and 3.5x faster, no rate limit.
+
+### Resampling convention (important)
+
+The broker's intraday bars are **left-labelled / closed-left**: a 09:15 bar covers
+09:15-09:19. Resampling with the rule file's `label="right", closed="right"` would
+shift every bar by one interval and silently desynchronise signals. Verified by
+resampling 1m->5m and comparing against the broker's own 5m: **`open` matched on
+13,439/13,439 bars.**
+
+### Data-quality finding: ~1% of broker 5m bars are corrupt
+
+While validating, 150 of 13,439 5m bars disagreed with the 1m-derived values -
+**149 of them at 15:25**, the session's last bar. Worst case 2025-12-19: the 1m bars
+close at 25,961 while the API's 5m bar reports **23,970** - a 2026 price level on a
+2025 timestamp, i.e. a corrupt tail row in the 5m series.
+
+The 1m-derived series is therefore more trustworthy. These bars sit outside the
+09:45-14:30 entry window and after the 15:15 exit, so they do not affect the result
+above - but **any strategy trading or exiting near the close should use 1m data,
+not the broker's 5m.**

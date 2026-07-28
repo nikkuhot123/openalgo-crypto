@@ -53,7 +53,7 @@ SKIP_EXPIRY_WEEKDAY = 1  # Tuesday = NIFTY weekly expiry; deployed skip. None to
 OUT = Path(__file__).resolve().parent
 
 
-def fetch(symbol, exchange, interval, days):
+def _fetch_api(symbol, exchange, interval, days):
     client = api(api_key=os.getenv("OPENALGO_API_KEY"),
                  host=os.getenv("OPENALGO_HOST", "http://127.0.0.1:5000"))
     end = datetime.now().date()
@@ -64,6 +64,55 @@ def fetch(symbol, exchange, interval, days):
     if not isinstance(df, pd.DataFrame) or df.empty:
         raise SystemExit(f"no data for {symbol} {exchange} {interval}: {df}")
     return df.sort_index()
+
+
+def _fetch_duckdb(symbol, exchange, interval):
+    """Read from the local Historify-format cache (see ../ingest_duckdb.py).
+
+    Only 1m and D are stored; other timeframes resample from 1m using LEFT
+    labels/closed, which is what the broker's own intraday bars use (verified:
+    resampled `open` matched the API's 5m on 13,439/13,439 bars).
+    """
+    import duckdb
+    db = os.getenv("HISTORIFY_DB_PATH") or ""
+    if not db or not Path(db).exists():
+        return None
+    base = "1m" if interval not in ("1m", "D") else interval
+    con = duckdb.connect(db, read_only=True)
+    try:
+        df = con.execute(
+            "SELECT timestamp, open, high, low, close, volume FROM market_data "
+            "WHERE symbol=? AND exchange=? AND interval=? ORDER BY timestamp",
+            [symbol.upper(), exchange.upper(), base]).fetchdf()
+    finally:
+        con.close()          # DuckDB takes exclusive file locks on Windows
+    if df.empty:
+        return None
+    df["dt"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+    df = df.set_index("dt").drop(columns=["timestamp"]).sort_index()
+    if base == interval:
+        return df
+    rule = interval.replace("m", "min")
+    out = df.resample(rule, origin="start_day", offset="9h15min",
+                      label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min",
+         "close": "last", "volume": "sum"}).dropna()
+    # the feed includes a 09:14 pre-open bar, which would open a stray 09:10
+    # bucket; keep regular session bars only so the shape matches broker bars
+    return out[out.index.time >= pd.Timestamp("09:15").time()]
+
+
+def fetch(symbol, exchange, interval, days):
+    """DuckDB cache first (no rate limit, offline); fall back to the API."""
+    if os.getenv("BT_SOURCE", "db").lower() == "db":
+        df = _fetch_duckdb(symbol, exchange, interval)
+        if df is not None:
+            cutoff = pd.Timestamp(datetime.now().date() - timedelta(days=days),
+                                  tz="Asia/Kolkata")
+            print(f"  [db] {symbol} {interval}: {len(df)} bars from cache")
+            return df[df.index >= cutoff]
+        print(f"  [db] {symbol} {interval}: not cached -> API")
+    return _fetch_api(symbol, exchange, interval, days)
 
 
 def ha_bias_by_day(daily):

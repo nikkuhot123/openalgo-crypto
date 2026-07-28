@@ -93,3 +93,6 @@ yarn-error.log*
 
 # Windows NUL file
 nul
+.agents/
+venv/
+.env.bak.pre-backtest

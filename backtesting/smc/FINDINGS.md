@@ -127,3 +127,110 @@ does not survive out of sample.
 - NIFTY volume VAL   https://app.volrix.ai/report/86a9cb5c-fd89-474e-a584-7a4bb58eebd1
 - SENSEX bare VAL    https://app.volrix.ai/report/bba98ae5-6cef-4eab-a6fb-cceeafdddf94
 - SENSEX volume VAL  https://app.volrix.ai/report/6d61351d-f30f-4118-a52b-2ebefdfd99f4
+
+
+---
+
+# Part 2 — Inverting the mechanism: sell premium instead of buying it
+
+## The reasoning
+
+Every option-BUYING model tested (HA-EMA, Judas, the SMC debit model above) lost.
+The cause is mechanical, not tuning: a bought option must clear premium decay plus
+~1% slippage before direction pays, which is why the SMC debit model needed
+RR>=1.2 + Unicorn gates so strict they left 1-9 trades. Selling inverts every one
+of those terms - theta works for you, the level only has to HOLD rather than
+break, so the signal needs no large move and no starving gates.
+
+## The one genuinely strong finding of this whole session
+
+Same instrument, same side of the market, same theta tailwind. The only
+difference is WHERE the trade is placed:
+
+| TRAIN (NIFTY, 2026-01-26..04-30) | trades | return | Sharpe | maxDD | PF |
+|---|--:|--:|--:|--:|--:|
+| S1: sell ATM straddle blindly at 09:20 | 128 | **-31.49%** | -3.16 | 34.0% | 0.8 |
+| S3: sell only at swept-and-rejected liquidity | 111 | **+12.22%** | 1.30 | 13.2% | 1.2 |
+
+A ~44 percentage-point gap attributable purely to the ICT liquidity selection.
+The infographic concepts DO carry information. It is just not enough to be
+profitable - see below.
+
+## Structural findings that held up
+
+- **Skip expiry day (DTE 0).** DD 13.2% -> 9.4%, Sharpe 1.30 -> 1.42, return
+  intact. Sellers are short gamma; expiry day is where the tail lives. Same
+  conclusion the HA-EMA work reached independently.
+- **A protective wing makes it worse.** Sell OTM1 / buy OTM4 credit spread:
+  -14.13%, PF 0.9. The wing premium costs more than the tail it insures on
+  weekly options.
+- **Tighter premium stop makes it worse.** SL 40% -> 30%: DD 9.4% -> 14.3%.
+  More stop-outs on noise, and each stop is realised against slippage.
+- Late entry (from 11:00) and an early-only window (to 12:00) both degraded.
+  A "strong rejection close" filter also degraded (DD 9.4% -> 13.8%).
+
+## Why I am NOT handing over the good-looking config
+
+Tuning `VOL_MAX` produced this curve on TRAIN:
+
+| VOL_MAX | trades | return | Sharpe |
+|---|--:|--:|--:|
+| off | 85 | +3.91% | 0.52 |
+| 1.30 | 84 | -1.22% | -0.16 |
+| **1.60** | 83 | **+11.38%** | **1.42** |
+| 2.00 | 85 | +0.18% | 0.02 |
+
+A **spike, not a plateau**. Trade counts differ by 1-2 out of 85 while return
+swings 12 percentage points - so one or two outlier trades produce the entire
+result. `VOL_MAX=1.60` would have shown +11.38% / Sharpe 1.42 / DD 9.4% and
+cleared three of four targets. It is an artifact and it is not deployable.
+
+The honest unfitted base is the `off` row: +3.91%, Sharpe 0.52, DD 9.17%.
+
+## Out-of-sample, and then the full window
+
+Base config = sweep-fade credit, skip DTE-0, no volume gate, 09:30-14:30.
+
+| window | symbol | trades | return | Sharpe | maxDD | win | PF |
+|---|---|--:|--:|--:|--:|--:|--:|
+| TRAIN | NIFTY | 85 | +3.91% | 0.52 | 9.2% | 32.9% | 1.1 |
+| VAL | NIFTY | 83 | **-14.16%** | -2.78 | 21.6% | 28.9% | 0.7 |
+| VAL | SENSEX | 83 | **-19.88%** | -4.14 | 22.9% | 26.5% | 0.7 |
+| FULL 6m | NIFTY | 168 | -10.24% | -0.80 | 24.2% | 31.0% | 0.9 |
+| FULL 6m | SENSEX | 172 | -23.89% | -1.90 | 38.2% | 30.2% | 0.8 |
+| FULL 6m | portfolio (Rs 3.0L) | **340** | **-17.07%** | -1.54 | 30.3% | 30.6% | 0.9 |
+
+**This one is a real measurement, not a small-sample shrug.** 340 trades over the
+full available window is a meaningful sample, and it says profit factor 0.9 -
+losing. Unlike the debit model (1-9 trades, unmeasurable), the credit model
+generates enough trades to be judged, and the judgement is negative.
+
+## Final scoreboard vs targets
+
+| target | best honest result | met |
+|---|---|:--:|
+| return >= 4% | -17.07% (full, portfolio) | NO |
+| Sharpe >= 1.0 | -1.54 | NO |
+| max DD <= 6% | 30.3% | NO |
+| trades >= 15 | 340 | YES |
+
+Sizing cannot fix this: the return/DD ratio must be >= 4/6 = 0.667 for any lot
+size to satisfy both return and DD. The honest base ratio is 0.43 on train and
+negative everywhere else.
+
+## What I actually believe after all of this
+
+1. **The liquidity-selection concept has measurable content** (+44pp vs blind
+   selling). That is the real result and it is worth keeping.
+2. **It is not sufficient for profit in this 6-month window.** Both instruments,
+   both directions of expression (debit and credit), all fail out of sample.
+3. **VAL is entirely post-2026-04-30** - the same regime break every earlier
+   strategy family died in. Either that regime is hostile to all these
+   mechanisms, or nothing here ever had an edge and the earlier window
+   flattered it. Six months cannot separate those two explanations.
+4. Highest-value next step remains **more history** (Volrix Max: 1,841 trading
+   days vs 125). At ~1.4 trades/day the full range gives ~2,500 trades, enough
+   to test a regime/volatility filter - which is the only untested lever with
+   real headroom, since a seller's losses concentrate in trend/high-vol days.
+
+Do not deploy any of this.

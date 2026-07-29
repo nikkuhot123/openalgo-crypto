@@ -244,7 +244,10 @@ def resolve_future_symbol():
                     try:
                         d = datetime.strptime(str(e).upper(), "%d-%b-%Y").date()
                     except ValueError:
-                        continue
+                        try:
+                            d = datetime.strptime(str(e).upper(), "%d-%b-%y").date()
+                        except ValueError:
+                            continue
                 if d > today:            # strictly future: never hold into settlement
                     tag = f"{d.day:02d}{d.strftime('%b').upper()}{d.strftime('%y')}"
                     candidates.append((d, f"{UNDERLYING}{tag}FUT"))
@@ -260,7 +263,7 @@ def resolve_future_symbol():
                 if sym.startswith(UNDERLYING) and sym.endswith("FUT"):
                     exp = row.get("expiry")
                     d = None
-                    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d%b%y"):
+                    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d%b%y", "%d-%b-%y"):
                         try:
                             d = datetime.strptime(str(exp).upper(), fmt).date()
                             break

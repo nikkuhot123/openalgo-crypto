@@ -5,6 +5,7 @@ Monitors Heikin-Ashi daily bias and 34 EMA channel breakouts on NIFTY/SENSEX,
 automatically executes option entries, and monitors spot index price for exits.
 """
 import os
+import re
 import sys
 import signal
 import time
@@ -106,29 +107,149 @@ SKIP_EXPIRY_DAY_UNDERLYINGS = {
 LOCKS_DIR = Path("log") / "strategies" / "locks"
 LOCKS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Locks must never wedge. Measured 2026-07-29: 9 orphaned .lock files were sitting
+# in this dir, some on already-expired contracts, because release only runs on the
+# normal exit paths - a crash, restart, or unusual exit branch leaks the file. The
+# old acquire() had no staleness check, so a leaked lock on a LIVE contract would
+# silently block valid entries forever.
+LOCK_TTL_MIN = float(os.getenv('LOCK_TTL_MIN', '360'))   # max plausible hold: one session
+
+
+def _pid_alive(pid):
+    """True if the process still exists. Unknown -> assume alive (never steal a live lock)."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return True
+
+
+def _lock_is_stale(ts_str, pid):
+    """Stale if written on an earlier session, past its TTL, or its owner has died."""
+    try:
+        when = datetime.fromisoformat(str(ts_str))
+    except (ValueError, TypeError):
+        return True                                  # unparseable -> reclaim
+    if when.date() != date.today():
+        return True                                  # previous session
+    if (datetime.now() - when).total_seconds() / 60.0 > LOCK_TTL_MIN:
+        return True
+    if pid and not _pid_alive(pid):
+        return True                                  # owner process gone
+    return False
+
+
 def acquire_symbol_lock(symbol, strategy_name):
-    """Try to claim a lock on a symbol. Returns True if acquired (or already ours)."""
+    """Claim one CONTRACT. True if acquired, already ours, or the holder's lock is stale.
+
+    Prevents two strategies holding the same option at once (quantity/netting mess).
+    It cannot prevent OPPOSING bets - CE and PE are different symbols - see
+    acquire_direction_lock() for that.
+    """
     lock_file = LOCKS_DIR / f"{symbol}.lock"
     if lock_file.exists():
         try:
-            owner = lock_file.read_text().split("|", 1)[0]
-            return owner == strategy_name
+            parts = lock_file.read_text().split("|")
+            owner = parts[0]
+            if owner == strategy_name:
+                return True
+            ts = parts[1] if len(parts) > 1 else ""
+            pid = int(parts[2]) if len(parts) > 2 and parts[2].strip().isdigit() else 0
+            if not _lock_is_stale(ts, pid):
+                return False
+            log.warning(f"Stale contract lock on {symbol} (owner '{owner}') - reclaiming")
         except Exception:
             return False
     try:
-        lock_file.write_text(f"{strategy_name}|{datetime.now().isoformat()}")
+        lock_file.write_text(f"{strategy_name}|{datetime.now().isoformat()}|{os.getpid()}")
         return True
     except Exception:
         return False
 
 def release_symbol_lock(symbol, strategy_name):
-    """Release the lock if we own it."""
+    """Release the contract lock if we own it."""
     lock_file = LOCKS_DIR / f"{symbol}.lock"
     try:
         if lock_file.exists():
             owner = lock_file.read_text().split("|", 1)[0]
             if owner == strategy_name:
                 lock_file.unlink()
+    except Exception:
+        pass
+
+
+# ── Directional lock: one directional VIEW per underlying, across strategies ──
+# Measured 2026-07-29: 3 episodes where different strategies simultaneously held
+# CE and PE on the SAME underlying (e.g. 07-07 HA-EMA long NIFTY CE while Judas
+# bought NIFTY PE). Net delta ~0, double premium, double theta, double cost - a
+# straddle nobody designed. The per-contract lock cannot see this because CE and
+# PE are different symbols.
+#
+# Scope is deliberately CROSS-STRATEGY ONLY: a strategy is never blocked by its
+# own files, so POV keeps its intended multi-strike/both-side behaviour (11 of the
+# 14 opposing episodes were internal to one strategy and are by design).
+def _strategy_slug(name):
+    return re.sub(r'[^A-Za-z0-9]+', '_', str(name)).strip('_')
+
+
+def acquire_direction_lock(underlying, side, strategy_name):
+    """Claim a DIRECTION (CE/PE) on an underlying. False if another strategy is
+    already positioned the opposite way."""
+    und = str(underlying).upper()
+    me = _strategy_slug(strategy_name)
+    want = str(side).upper()
+    try:
+        for f in LOCKS_DIR.glob(f"{und}.*.dir"):
+            parts = f.name.split(".")
+            if len(parts) < 4:
+                continue
+            owner, held = parts[1], parts[2].upper()
+            if owner == me:
+                continue                                   # never block on ourselves
+            try:
+                body = f.read_text().split("|")
+                ts = body[0] if body else ""
+                pid = int(body[1]) if len(body) > 1 and body[1].strip().isdigit() else 0
+            except Exception:
+                ts, pid = "", 0
+            if _lock_is_stale(ts, pid):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+                continue
+            if held != want:
+                log.info(f"DIRECTION CONFLICT on {und}: '{owner}' already holds {held}, "
+                         f"we want {want} - standing aside (would be a delta-neutral "
+                         f"straddle paying double premium)")
+                return False
+    except Exception as e:
+        log.debug(f"direction lock scan failed: {e}")
+    try:
+        (LOCKS_DIR / f"{und}.{me}.{want}.dir").write_text(
+            f"{datetime.now().isoformat()}|{os.getpid()}")
+    except Exception:
+        pass
+    return True
+
+
+def release_direction_lock(underlying, strategy_name, side=None):
+    """Drop our directional claim on an underlying (a given side, or all sides)."""
+    und = str(underlying).upper()
+    me = _strategy_slug(strategy_name)
+    pat = f"{und}.{me}.{str(side).upper()}.dir" if side else f"{und}.{me}.*.dir"
+    try:
+        for f in LOCKS_DIR.glob(pat):
+            try:
+                f.unlink()
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -431,6 +552,7 @@ def _graceful_shutdown(signum, frame):
             except Exception as e:
                 log.error(f"Shutdown: positionbook check failed for {symbol}: {e} — aborting close to avoid naked short")
                 release_symbol_lock(symbol, STRATEGY_NAME)
+                release_direction_lock(UNDERLYING, STRATEGY_NAME)
                 log.info("Shutdown complete. Exiting.")
                 sys.exit(0)
 
@@ -447,6 +569,7 @@ def _graceful_shutdown(signum, frame):
             if broker_qty <= 0:
                 log.info(f"Shutdown: broker reports {symbol} qty={broker_qty} — already flat, no SELL")
                 release_symbol_lock(symbol, STRATEGY_NAME)
+                release_direction_lock(UNDERLYING, STRATEGY_NAME)
             else:
                 close_qty = min(broker_qty, _active_trade.get("qty", QUANTITY))
                 log.info(f"Closing active position: {symbol} (broker qty={broker_qty}, closing {close_qty})")
@@ -462,6 +585,7 @@ def _graceful_shutdown(signum, frame):
                     )
                     log.info(f"Shutdown exit response: {resp}")
                     release_symbol_lock(symbol, STRATEGY_NAME)
+                    release_direction_lock(UNDERLYING, STRATEGY_NAME)
                 except Exception as e:
                     log.error(f"Failed to close position on shutdown: {e}")
     else:
@@ -630,6 +754,7 @@ def run_strategy():
                                 log.info(f"Trade P&L: ₹{trade_pnl:+.2f} (gross ₹{gross:+.2f} "
                                          f"- cost ₹{cost:.2f}) | Loss streak reset")
                         release_symbol_lock(symbol, STRATEGY_NAME)
+                        release_direction_lock(UNDERLYING, STRATEGY_NAME)
                         state = "DONE"
                         active_trade = {}
                         _active_trade = {}
@@ -722,6 +847,7 @@ def run_strategy():
 
                     # Release symbol lock
                     release_symbol_lock(symbol, STRATEGY_NAME)
+                    release_direction_lock(UNDERLYING, STRATEGY_NAME)
 
                     # Single-entry per day: ANY exit (SL/Target/EOD) ends the day.
                     # Matches the faithful Volrix backtest (re-entry chop removed).
@@ -843,6 +969,12 @@ def run_strategy():
                         continue
 
                     # Symbol lock: skip if another strategy holds this symbol
+                    # One directional view per underlying across ALL strategies:
+                    # refuse to buy a CE while another strategy holds a PE here.
+                    if not acquire_direction_lock(UNDERLYING, signal, STRATEGY_NAME):
+                        last_entry_candle_fp = current_candle_fp
+                        time.sleep(15)
+                        continue
                     if not acquire_symbol_lock(opt_symbol, STRATEGY_NAME):
                         log.info(f"Symbol {opt_symbol} locked by another strategy. Skipping this signal.")
                         last_entry_candle_fp = current_candle_fp  # prevent re-checking same candle

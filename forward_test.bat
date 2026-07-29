@@ -12,14 +12,14 @@ echo =========================================================
 echo  LOCAL FORWARD TESTING ENGINE (PAPER TRADING)
 echo =========================================================
 echo  Target API       : %HOST_SERVER%
-echo  Simulated Capital: Rs 5,00,000
+echo  Simulated Capital: Rs 5,00,000 (Overnight Drift) / Rs 40,000 (Crypto)
 echo  Dry Run Mode     : %DRY_RUN%
 echo =========================================================
 
 echo.
 echo Running Pre-flight Checks...
 .\venv\Scripts\python.exe strategies\examples\nifty_overnight_drift_strategy.py --check
-.\venv\Scripts\python.exe strategies\examples\vrp_premium_harvester.py --check
+.\venv\Scripts\python.exe strategies\examples\crypto_perpetual_trend.py --check
 
 echo.
 echo Launching strategy daemons in separate windows...
@@ -31,6 +31,9 @@ start "NIFTY Overnight Drift - Forward Test" cmd /k "set OPENALGO_API_KEY=%OPENA
 
 :: Launch the VRP Premium Harvester in a new cmd window
 start "VRP Premium Harvester - Forward Test" cmd /k "set OPENALGO_API_KEY=%OPENALGO_API_KEY%&& set HOST_SERVER=%HOST_SERVER%&& set DRY_RUN=%DRY_RUN%&& set CAPITAL=%CAPITAL%&& .\venv\Scripts\python.exe strategies\examples\vrp_premium_harvester.py"
+
+:: Launch the Fractional Crypto Trend in a new cmd window
+start "Crypto Perpetual Trend - Forward Test" cmd /k "set OPENALGO_API_KEY=%OPENALGO_API_KEY%&& set HOST_SERVER=%HOST_SERVER%&& set DRY_RUN=%DRY_RUN%&& set CAPITAL=40000&& .\venv\Scripts\python.exe strategies\examples\crypto_perpetual_trend.py"
 
 echo Successfully launched! You can close this primary window.
 pause

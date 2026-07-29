@@ -73,6 +73,11 @@ DAILY_LOSS_LIMIT_RS = float(os.getenv('DAILY_LOSS_LIMIT_RS', '10000'))
 # the logs claimed one was armed. A stop-limit needs its limit below the trigger
 # to still fill while price falls; this is that buffer, in % of the trigger.
 SL_LIMIT_BUFFER_PCT = float(os.getenv('SL_LIMIT_BUFFER_PCT', '5'))
+# Round-trip statutory cost as % of option premium turnover (brokerage is zero on
+# Flattrade; STT/exchange/GST/SEBI/stamp are not). 0.12% matches Flattrade's own
+# calculator: Rs 103.01 on Rs 84,000 options turnover = 12.3 bps. Subtracted from
+# every booked trade so the circuit breaker trips on NET money lost.
+OPT_COST_PCT = float(os.getenv('OPT_COST_PCT', '0.12'))
 # High-conviction gating (cut over-trading / charge bleed — see cost analysis 2026-07-13)
 POV_MIN_SCORE = int(os.getenv('POV_MIN_SCORE', '5'))  # 5=STRONG only (all 5 conditions); 4 also allows WATCH
 POV_MAX_TRADES_PER_DAY = int(os.getenv('POV_MAX_TRADES_PER_DAY', '4'))  # hard daily entry cap per underlying (backstop)
@@ -377,17 +382,35 @@ def fetch_fill_price(order_id, context="", max_retries=4, retry_delay=0.7):
     log.warning(f"Could not read fill price for order {order_id} {context}".strip())
     return None
 
+def statutory_cost(entry_px, exit_px, qty):
+    """Round-trip statutory cost in rupees for an option BUY->SELL, premium-based.
+
+    Brokerage is zero on Flattrade, but STT/exchange/GST/SEBI/stamp are not.
+    OPT_COST_PCT is the round-trip charge as a % of premium turnover; the default
+    0.12% matches Flattrade's own calculator (Rs 103.01 of charges on Rs 84,000 of
+    options turnover = 12.3 bps).
+    """
+    if entry_px is None or exit_px is None or not qty:
+        return 0.0
+    return (float(entry_px) + float(exit_px)) * float(qty) * OPT_COST_PCT / 100.0
+
+
 def book_trade_pnl(symbol, exit_px, entry_px, qty, consecutive_losses, daily_loss_rs, source="fill"):
-    """Book realized P&L and update the circuit-breaker counters.
+    """Book realized P&L NET of statutory cost and update the circuit-breaker counters.
 
     `source` records whether the price is a broker fill or a degraded estimate so
-    the log states which. Returns the updated (consecutive_losses, daily_loss_rs).
+    the log states which. Cost is subtracted because the circuit breaker should
+    trip on money actually lost, not on a gross figure that flatters the strategy.
+    Returns the updated (consecutive_losses, daily_loss_rs).
     """
     if exit_px is None or entry_px is None:
         log.warning(f"P&L not booked for {symbol}: exit={exit_px} entry={entry_px} (unverifiable)")
         return consecutive_losses, daily_loss_rs
-    trade_pnl = (float(exit_px) - float(entry_px)) * qty
-    detail = f"[{source} {float(exit_px):.2f} vs entry {float(entry_px):.2f}]"
+    gross = (float(exit_px) - float(entry_px)) * qty
+    cost = statutory_cost(entry_px, exit_px, qty)
+    trade_pnl = gross - cost
+    detail = (f"[{source} {float(exit_px):.2f} vs entry {float(entry_px):.2f} | "
+              f"gross ₹{gross:+.2f} - cost ₹{cost:.2f}]")
     if trade_pnl < 0:
         consecutive_losses += 1
         daily_loss_rs += abs(trade_pnl)

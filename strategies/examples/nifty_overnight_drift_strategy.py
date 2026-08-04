@@ -120,9 +120,9 @@ LOOKBACKS = tuple(int(x) for x in os.getenv("LOOKBACKS", "50,75,100,150,200").sp
 VOL_HALFLIFE = int(os.getenv("VOL_HALFLIFE", "20"))
 COST_KILL_BPS = float(os.getenv("COST_KILL_BPS", "3.8"))   # per side; above this NIFTY Sharpe < 1
 
-ENTRY_TIME = os.getenv("ENTRY_TIME", "15:20")
+ENTRY_TIME = os.getenv("ENTRY_TIME", "15:26")
 EXIT_TIME = os.getenv("EXIT_TIME", "09:20")
-ENTRY_WINDOW_END = os.getenv("ENTRY_WINDOW_END", "15:27")   # do not chase past this
+ENTRY_WINDOW_END = os.getenv("ENTRY_WINDOW_END", "15:28")   # do not chase past this
 EXIT_WINDOW_END = os.getenv("EXIT_WINDOW_END", "09:40")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "20"))
 

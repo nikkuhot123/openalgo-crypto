@@ -64,7 +64,19 @@ EMA_PERIOD = 34
 STRIKE_OFFSET = os.getenv('STRIKE_OFFSET', 'ATM')  # 'ATM', 'ITM1', 'ITM2', 'OTM1', 'OTM2'
 ENTRY_START = dtime(int(os.getenv('ENTRY_START_HOUR', '9')), int(os.getenv('ENTRY_START_MIN', '45')))
 ENTRY_END = dtime(int(os.getenv('ENTRY_END_HOUR', '14')), int(os.getenv('ENTRY_END_MIN', '30')))
-EXIT_TIME = dtime(15, 15)  # Auto-squareoff time
+# CAS (SEBI circular HO/47/11/11(3)2025-MRD-POD2/I/2765/2026, live 2026-08-03):
+# cash continuous trading in F&O-underlying stocks ends 15:15, and the index
+# spot then teleports on the ~15:28 auction stamp (NIFTY +200.95 pts in one
+# tick, 2026-08-03). SL/target here are evaluated against spot, so squareoff
+# must complete while spot is still live. Options trade to 15:40, so a 15:10
+# market exit fills normally.
+EXIT_TIME = dtime(*(int(x) for x in os.getenv('EXIT_TIME', '15:10').split(':')))
+
+# VIX gate: skip the day entirely when INDIA VIX is below this.
+# Measured over 3y: NIFTY average intraday range is 0.94% (SENSEX 0.95%), and
+# a 34-EMA channel breakout cannot clear its own friction in a box that tight.
+# Range expands to 1.24% above VIX 15 and 1.60% above VIX 20.
+VIX_GATE_MIN = float(os.getenv('VIX_GATE_MIN', '15.0'))
 BREAKOUT_MULT = float(os.getenv('BREAKOUT_MULT', '1.0'))
 # Circuit breaker config (replaces COOLDOWN_MINUTES / MAX_TRADES_PER_DAY)
 LOSS_STREAK_LIMIT = int(os.getenv('LOSS_STREAK_LIMIT', '3'))
@@ -415,6 +427,23 @@ def statutory_cost(entry_px, exit_px, qty):
     return turnover * OPT_COST_PCT / 100.0
 
 
+def fetch_india_vix():
+    """Live INDIA VIX, or None when unavailable.
+
+    None must not be read as 'low volatility' - an API failure is not a
+    market signal. The caller keeps trading when this returns None and
+    relies on the circuit breakers instead.
+    """
+    try:
+        resp = client.quotes(symbol="INDIAVIX", exchange="NSE_INDEX")
+        if resp.get("status") == "success":
+            ltp = float((resp.get("data") or {}).get("ltp", 0) or 0)
+            if ltp > 0:
+                return ltp
+    except Exception as e:
+        log.warning(f"Could not fetch INDIA VIX: {e}")
+    return None
+
 def get_nearest_expiry(underlying, exchange):
     try:
         resp = client.expiry(symbol=underlying, exchange=exchange, instrumenttype="options")
@@ -626,6 +655,7 @@ def run_strategy():
     last_entry_candle_fp = None  # (open,high,low,close) tuple of the candle that triggered last entry
     consecutive_losses = 0
     daily_loss_rs = 0.0
+    vix_gate_checked = False
 
     # Adopt orphan position on boot (e.g. after restart while position was open)
     orphan = reconcile_orphan_position(UNDERLYING)
@@ -669,6 +699,7 @@ def run_strategy():
                 last_entry_candle_fp = None
                 consecutive_losses = 0
                 daily_loss_rs = 0.0
+                vix_gate_checked = False   # re-evaluate VIX once per session
                 log.info(f"--- New trading day initialized: {trade_date} ---")
 
             # 1. Fetch daily HA bias (only if in IDLE state)
@@ -773,7 +804,7 @@ def run_strategy():
 
                 if current_time >= EXIT_TIME:
                     exit_triggered = True
-                    exit_reason = "EOD Squareoff (15:15)"
+                    exit_reason = f"EOD Squareoff ({EXIT_TIME.strftime('%H:%M')}, pre-CAS freeze)"
                 elif is_adopted:
                     pass  # adopted orphan — defer to EOD; no SL/target known
                 elif direction == "CE":
@@ -872,6 +903,25 @@ def run_strategy():
                     log.info("Past entry window (14:30). Done for today.")
                     state = "DONE"
                     continue
+
+                # VIX gate — evaluated once per session, after ENTRY_START so
+                # the quote is live. A tight-range day cannot pay for a channel
+                # breakout's friction, so stand aside for the whole session
+                # rather than re-testing and drifting into a late entry.
+                if not vix_gate_checked:
+                    vix_gate_checked = True
+                    vix_val = fetch_india_vix()
+                    if vix_val is None:
+                        log.warning("INDIA VIX unavailable — gate bypassed, circuit breakers still active.")
+                    elif vix_val < VIX_GATE_MIN:
+                        log.info(
+                            f"VIX GATE: INDIA VIX {vix_val:.2f} < {VIX_GATE_MIN:.1f} — "
+                            f"intraday range too tight for a 34-EMA breakout. Standing aside today."
+                        )
+                        state = "DONE"
+                        continue
+                    else:
+                        log.info(f"VIX GATE PASSED: INDIA VIX {vix_val:.2f} >= {VIX_GATE_MIN:.1f}.")
 
                 # Circuit breaker: consecutive losses
                 if consecutive_losses >= LOSS_STREAK_LIMIT:

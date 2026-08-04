@@ -110,7 +110,7 @@ UNDERLYING = "NIFTY"
 IDX_EXCHANGE = "NSE_INDEX"
 FUT_EXCHANGE = "NFO"
 
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes")
 PRODUCT = os.getenv("PRODUCT", "NRML")          # NRML - must carry overnight
 CAPITAL = float(os.getenv("CAPITAL", "0"))      # 0 = query funds API
 TARGET_VOL = float(os.getenv("TARGET_VOL", "0.04"))

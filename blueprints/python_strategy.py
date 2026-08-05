@@ -506,6 +506,16 @@ def start_strategy_process(strategy_id):
             # Inject documented strategy environment variables
             # (per strategies/README.md: STRATEGY_ID, STRATEGY_NAME, OPENALGO_API_KEY, OPENALGO_HOST)
             strategy_env = os.environ.copy()
+
+            # Per-strategy overrides from the config's optional "env" dict.
+            # Applied FIRST so the managed variables below always win — a config
+            # must never be able to substitute the API key, strategy id, or
+            # exchange. This lets one script back several registrations that
+            # differ only by configuration: cas_window_logger.py runs both as
+            # the 2s auction recorder and as the 60s Greeks collector.
+            for _k, _v in (config.get("env") or {}).items():
+                strategy_env[str(_k)] = str(_v)
+
             strategy_env["STRATEGY_ID"] = strategy_id
             strategy_env["STRATEGY_NAME"] = config.get("name", strategy_id)
             strategy_env["OPENALGO_STRATEGY_EXCHANGE"] = normalize_exchange(

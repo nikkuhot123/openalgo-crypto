@@ -66,8 +66,25 @@ STRIKE_OFFSET = os.getenv('STRIKE_OFFSET', _DEF_STRIKE)  # 'ATM', 'ITM1', 'ITM2'
 OR_END = dtime(int(os.getenv('OR_END_HOUR', '9')), int(os.getenv('OR_END_MIN', '45')))
 SWEEP_END = dtime(int(os.getenv('SWEEP_END_HOUR', str(_DEF_SWEEP_H))), int(os.getenv('SWEEP_END_MIN', str(_DEF_SWEEP_M))))
 ENTRY_END = dtime(int(os.getenv('ENTRY_END_HOUR', str(_DEF_ENTRY_H))), int(os.getenv('ENTRY_END_MIN', str(_DEF_ENTRY_M))))
-EXIT_TIME = dtime(15, 15)  # Auto-squareoff time
+# CAS (SEBI circular 2026-01-16, live 2026-08-03): the cash index spot stops
+# updating at 15:15 and then teleports on the ~15:28 auction stamp (NIFTY moved
+# +200.95 pts in one tick on Aug 3). SL/target here are evaluated against spot,
+# so the squareoff must complete while spot is still live. Options trade to
+# 15:40, so a 15:10 market exit fills normally.
+EXIT_TIME = dtime(*(int(x) for x in os.getenv('EXIT_TIME', '15:10').split(':')))
 RR = float(os.getenv('RR', '2.0'))  # reward:risk target multiple (both indices: 2.0)
+# Break-even ratchet: once the trade shows this many R of open profit, the stop
+# moves to entry and stays there. 0 disables it.
+# Evidence (backtesting/haema_signal/judas_trail.py, 25 live round trips
+# 2026-07-14..08-06 replayed on 1-minute index bars):
+#     current        mean +0.189R   median -0.14R   worst -1.80R
+#     BE at 1.0R     mean +0.332R   median  0.00R   worst -1.00R
+#     trail 0.5R     mean +0.009R   <- trailing CAPS the 2.6-3.75R runners
+#     half at 1.0R   mean +0.241R   <- needs 2x premium capital
+# Paired improvement of BE-1.0R over current: +0.143R, 95% CI [+0.020, +0.294],
+# better on 16/25 trades. Only 4/25 trades ever reach the 2R target, which is
+# why protecting the median 0.60R excursion matters more than chasing it.
+BE_ARM_R = float(os.getenv('BE_ARM_R', '1.0'))
 # Circuit breaker config
 LOSS_STREAK_LIMIT = int(os.getenv('LOSS_STREAK_LIMIT', '3'))
 DAILY_LOSS_LIMIT_RS = float(os.getenv('DAILY_LOSS_LIMIT_RS', '10000'))
@@ -78,6 +95,31 @@ DAILY_LOSS_LIMIT_RS = float(os.getenv('DAILY_LOSS_LIMIT_RS', '10000'))
 # scaling the target with the floored risk is strictly worse (validated on the
 # HA-EMA analog: -6.16% scaled vs -2.03% unscaled, same window).
 MIN_SL_PCT = float(os.getenv('MIN_SL_PCT', '0.10'))
+# Round-trip statutory cost as % of option premium turnover. Brokerage is zero
+# on Flattrade, STT/exchange/GST/SEBI/stamp are not. 0.12% matches Flattrade's
+# own calculator (Rs 103.01 on Rs 84,000 turnover = 12.3 bps).
+OPT_COST_PCT = float(os.getenv('OPT_COST_PCT', '0.12'))
+
+# ── Entry geometry gate (added 2026-08-05 from the live record) ──
+# Six live trades: 7 stop-losses, 1 target, -Rs 1,990 GROSS. Two defects made
+# that arithmetically unavoidable rather than unlucky:
+#
+# 1. The target could sit BELOW the break-even distance, so a winning trade
+#    still lost money. 2026-07-29 SENSEX 10:17 targeted 15.3 pts when
+#    break-even needed 100.7.
+# 2. MIN_SL_PCT floors the STOP but the target keeps using raw_risk, so when
+#    raw_risk << floor the reward:risk silently inverts. Same trade: stop
+#    floored to 77.6 pts against a 15.3 pt target = 0.20:1, while RR reads 2.0.
+#
+# Both are geometry known BEFORE the order is sent, so refuse the trade rather
+# than pay the spread to discover it. These are structural guards, not fitted
+# parameters - 6 trades cannot calibrate anything.
+MIN_TARGET_VS_BE = float(os.getenv('MIN_TARGET_VS_BE', '1.5'))   # a win must clear friction
+MIN_EFFECTIVE_RR = float(os.getenv('MIN_EFFECTIVE_RR', '1.2'))   # after stop flooring
+ASSUMED_DELTA = float(os.getenv('ASSUMED_DELTA', '0.5'))         # ATM; conservative for ITM1
+# Option bid/ask as % of premium. Measured 2026-08-05 NIFTY11AUG2624600CE:
+# 0.55 spread on 132.95 premium = 0.41%. This DOMINATES statutory charges.
+SPREAD_PCT_OF_PREMIUM = float(os.getenv('SPREAD_PCT_OF_PREMIUM', '0.5'))
 # Skip entries on the traded weekly's own expiry day, for these underlyings.
 # NIFTY (Tue) DTE-0 ATM premium is ~1/3 of a normal day's, so gamma turns a
 # 0.025% adverse move into ~19% premium loss. Not applied to SENSEX (its Thu
@@ -281,6 +323,104 @@ def fetch_lot_size(underlying, idx_exchange, opt_exchange):
     except Exception as e:
         log.error(f"Error fetching lot size: {e}")
     return None
+
+def statutory_cost(entry_px, exit_px, qty):
+    """Round-trip statutory cost in rupees for an option BUY->SELL.
+
+    Judas reported GROSS P&L until 2026-08-05: trade_pnl was simply
+    (exit_ltp - entry_px) * qty with no costs at all. Across the first six
+    live trades that understated the loss by roughly Rs 1,050 per trade, and
+    it fed the circuit breakers a flattering number - DAILY_LOSS_LIMIT_RS was
+    metering against a loss ~4x smaller than the real one.
+    """
+    if entry_px is None or exit_px is None or not qty:
+        return 0.0
+    turnover = (float(entry_px) + float(exit_px)) * float(qty)
+    return turnover * OPT_COST_PCT / 100.0
+
+
+def fetch_fill_price(order_id, max_retries=4, retry_delay=1.0):
+    """Average TRADED price for an order, so P&L rests on real fills.
+
+    Quote-derived P&L excludes slippage: it prices the exit at whatever LTP we
+    happened to observe rather than what the broker actually filled.
+    Returns float, or None so the caller can fall back to the quote.
+    """
+    if not order_id:
+        return None
+    for attempt in range(max_retries):
+        try:
+            r = client.orderstatus(order_id=order_id, strategy=STRATEGY_NAME)
+            d = (r.get("data") or {}) if isinstance(r, dict) else {}
+            for k in ("average_price", "averageprice", "avgprice", "avg_price", "price"):
+                v = d.get(k)
+                if v not in (None, "", 0, "0") and float(v) > 0:
+                    return float(v)
+        except Exception as e:
+            log.debug(f"orderstatus {order_id} attempt {attempt + 1}: {e}")
+        try:
+            tb = client.tradebook()
+            if isinstance(tb, dict) and tb.get("status") == "success":
+                for t in tb.get("data", []) or []:
+                    if str(t.get("orderid", "")) == str(order_id):
+                        for k in ("average_price", "averageprice", "price", "tradeprice"):
+                            v = t.get(k)
+                            if v not in (None, "", 0, "0") and float(v) > 0:
+                                return float(v)
+        except Exception:
+            pass
+        time.sleep(retry_delay)
+    log.warning(f"Could not resolve fill price for order {order_id} — falling back to quote")
+    return None
+
+
+def breakeven_points(opt_premium, qty):
+    """Index points the spot must travel for the trade to reach exactly zero.
+
+    Two components, both premium-denominated:
+      statutory  OPT_COST_PCT of premium turnover (Flattrade-validated)
+      spread     crossing the option bid/ask, which DOMINATES - measured
+                 2026-08-05 on NIFTY11AUG2624600CE: 0.55 on a 132.95 premium
+                 = 0.41%, i.e. Rs 35.75 of spread vs Rs 20.74 of charges.
+
+    Cost is charged per round trip and does not scale with distance travelled,
+    so it converts into a fixed number of index points to cover before any
+    profit exists. For NIFTY that is ~1.7 pts, NOT the ~34 pts a notional-based
+    model wrongly produced: options are charged on premium turnover, not on
+    spot x lot, and those differ by ~37x.
+    """
+    if not opt_premium or not qty:
+        return None
+    statutory = statutory_cost(opt_premium, opt_premium, qty)
+    spread = float(opt_premium) * (SPREAD_PCT_OF_PREMIUM / 100.0) * float(qty)
+    denom = ASSUMED_DELTA * float(qty)
+    return (statutory + spread) / denom if denom else None
+
+
+def check_entry_geometry(entry_spot, sl_spot, target_spot, opt_premium, qty):
+    """Reject trades whose geometry is broken. Returns (ok, reason, detail).
+
+    The binding guard here is the effective reward:risk, not the cost floor.
+    Friction is ~1.7 index pts on NIFTY while stops run 25-98 pts, so cost is
+    NOT what breaks these trades. What does break them is MIN_SL_PCT flooring
+    the stop while the target keeps using raw_risk, which silently inverts the
+    reward:risk the strategy believes it has taken.
+    """
+    stop_d = abs(entry_spot - sl_spot)
+    tgt_d = abs(target_spot - entry_spot)
+    be = breakeven_points(opt_premium, qty)
+    eff_rr = (tgt_d / stop_d) if stop_d > 0 else 0.0
+    detail = (f"stop {stop_d:.1f}pt | target {tgt_d:.1f}pt | "
+              f"break-even {be:.1f}pt | effective RR {eff_rr:.2f}"
+              if be else f"stop {stop_d:.1f}pt | target {tgt_d:.1f}pt | effective RR {eff_rr:.2f}")
+
+    if be and tgt_d < MIN_TARGET_VS_BE * be:
+        return False, (f"target {tgt_d:.1f}pt < {MIN_TARGET_VS_BE}x break-even "
+                       f"({be:.1f}pt) — a WIN would still lose money"), detail
+    if eff_rr < MIN_EFFECTIVE_RR:
+        return False, (f"effective RR {eff_rr:.2f} < {MIN_EFFECTIVE_RR} — stop floor "
+                       f"(MIN_SL_PCT={MIN_SL_PCT}%) inverted the reward:risk"), detail
+    return True, None, detail
 
 def compute_judas_signal(df_5m, today):
     """Reconstruct the opening-range sweep-reversal signal from intraday 5m candles.
@@ -553,12 +693,45 @@ def run_strategy():
                 else:
                     log.info(f"Monitoring Trade: {symbol} | Spot: {underlying_ltp:.2f} | SL: {sl_spot:.2f} | Target: {target_spot:.2f}")
 
+                # ---- break-even ratchet -------------------------------------
+                # Measured 2026-08-06 over the 25 live round trips since
+                # 2026-07-14, replayed on 1-minute index bars (see
+                # backtesting/haema_signal/judas_trail.py): MFE is median
+                # 0.60R and only 4/25 trades ever touch the 2R target, so most
+                # winners round-trip all the way back into the stop. Moving the
+                # stop to entry once the trade has shown BE_ARM_R lifts the mean
+                # result from +0.189R to +0.332R (paired improvement +0.143R,
+                # 95% CI [+0.020, +0.294], better on 16/25 trades).
+                #
+                # A TRAILING stop was tested and is WORSE than doing nothing
+                # (trail 0.5R off peak: +0.009R) because it caps the handful of
+                # 2.6-3.75R runners that carry the book. Break-even protects the
+                # downside without touching the upside, so the ratchet only ever
+                # moves the stop to entry -- never further, never backwards.
+                if (BE_ARM_R > 0 and not is_adopted
+                        and not active_trade.get("be_moved")
+                        and active_trade.get("entry_spot")
+                        and active_trade.get("orig_sl_spot")):
+                    entry_spot = float(active_trade["entry_spot"])
+                    risk = abs(entry_spot - float(active_trade["orig_sl_spot"]))
+                    if risk > 0:
+                        sign = 1.0 if direction == "CE" else -1.0
+                        fav_r = sign * (underlying_ltp - entry_spot) / risk
+                        if fav_r >= BE_ARM_R:
+                            active_trade["sl_spot"] = entry_spot
+                            active_trade["be_moved"] = True
+                            sl_spot = entry_spot
+                            persist_trade(active_trade)
+                            log.info(f"BREAK-EVEN ARMED: {fav_r:.2f}R reached "
+                                     f"({underlying_ltp:.2f}) -- stop moved to entry "
+                                     f"{entry_spot:.2f} (was {active_trade['orig_sl_spot']:.2f})")
+
                 exit_triggered = False
                 exit_reason = ""
 
                 if current_time >= EXIT_TIME:
                     exit_triggered = True
-                    exit_reason = "EOD Squareoff (15:15)"
+                    exit_reason = f"EOD Squareoff ({EXIT_TIME.strftime('%H:%M')}, pre-CAS freeze)"
                 elif is_adopted:
                     pass  # adopted orphan — defer to EOD; no SL/target known
                 elif direction == "CE":
@@ -598,17 +771,31 @@ def run_strategy():
                             quantity=min(bq, qty)
                         )
                         log.info(f"Exit Order Response: {order_resp}")
-                        # Compute trade P&L (option BUY entry → SELL exit)
+                        # ── P&L on REAL fills, NET of statutory cost ──
+                        # Until 2026-08-05 this was (pre_exit_opt_ltp - entry) * qty:
+                        # a quote-derived GROSS number. It hid ~Rs 1,050/trade of
+                        # friction and fed the circuit breakers a loss ~4x too small.
                         entry_opt_price = active_trade.get("entry_opt_price")
-                        if entry_opt_price is not None and pre_exit_opt_ltp is not None:
-                            trade_pnl = (pre_exit_opt_ltp - entry_opt_price) * qty
+                        exit_oid = order_resp.get("orderid") if isinstance(order_resp, dict) else None
+                        exit_px = fetch_fill_price(exit_oid)
+                        src = "fill"
+                        if exit_px is None:
+                            exit_px = pre_exit_opt_ltp
+                            src = "est-ltp"
+                        entry_fill = active_trade.get("entry_fill_price") or entry_opt_price
+                        if entry_fill is not None and exit_px is not None:
+                            gross = (exit_px - entry_fill) * qty
+                            cost = statutory_cost(entry_fill, exit_px, qty)
+                            trade_pnl = gross - cost
                             if trade_pnl < 0:
                                 consecutive_losses += 1
                                 daily_loss_rs += abs(trade_pnl)
-                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak: {consecutive_losses} | Daily losses: ₹{daily_loss_rs:.0f}")
+                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} (gross ₹{gross:+.2f} − cost ₹{cost:.2f}, {src}) "
+                                         f"| Loss streak: {consecutive_losses} | Daily losses: ₹{daily_loss_rs:.0f}")
                             else:
                                 consecutive_losses = 0
-                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} | Loss streak reset")
+                                log.info(f"Trade P&L: ₹{trade_pnl:+.2f} (gross ₹{gross:+.2f} − cost ₹{cost:.2f}, {src}) "
+                                         f"| Loss streak reset")
                     else:
                         log.warning(f"{exit_reason}: broker flat on {symbol} — no long to close; skipping SELL to avoid naked short")
 
@@ -729,6 +916,20 @@ def run_strategy():
                 else:
                     entry_qty = LOT_SIZE * MAX_LOTS
 
+                # ── Entry geometry gate ──
+                # Refuse trades whose target cannot clear the cost floor, or whose
+                # reward:risk was inverted by the MIN_SL_PCT stop floor. Both are
+                # knowable here, before paying the spread to find out.
+                ok, why, detail = check_entry_geometry(
+                    entry_spot, sl_spot, target_spot, entry_opt_price, entry_qty)
+                log.info(f"Entry geometry: {detail}")
+                if not ok:
+                    log.warning(f"GEOMETRY REJECT — {why}. Skipping {opt_symbol}.")
+                    release_symbol_lock(opt_symbol, STRATEGY_NAME)
+                    last_entry_candle_fp = sig["candle_fp"]
+                    time.sleep(15)
+                    continue
+
                 log.info(f"Judas Reversal detected ({signal_type})! Placing BUY order for {opt_symbol} (qty={entry_qty})...")
                 order_resp = client.placeorder(
                     strategy=STRATEGY_NAME,
@@ -748,9 +949,19 @@ def run_strategy():
                         "direction": signal_type,
                         "entry_spot": entry_spot,
                         "sl_spot": sl_spot,
+                        # Frozen copy of the ENTRY stop. sl_spot is mutated by the
+                        # break-even ratchet, so R must be measured against this.
+                        "orig_sl_spot": sl_spot,
                         "target_spot": target_spot,
                         "qty": entry_qty,
                         "entry_opt_price": entry_opt_price,
+                        # Actual entry fill, so P&L rests on fills at BOTH legs.
+                        # entry_opt_price stays as the pre-trade quote for the
+                        # geometry/auto-lot maths; slippage is the gap between them.
+                        "entry_fill_price": (
+                            fetch_fill_price(order_resp.get("orderid"))
+                            if isinstance(order_resp, dict) else None
+                        ),
                     }
                     _active_trade = active_trade
                     persist_trade(active_trade)

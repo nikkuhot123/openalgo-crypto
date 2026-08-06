@@ -61,10 +61,23 @@ small sample, not an edge: the in-sample numbers are what tuning bought, and
 they did not survive two months forward. The constants below are the ones that
 topped the in-sample sweep, kept only so the result is reproducible.
 
+CONFIRMED 2026-08-06 by an independent harness (backtesting/haema_signal/,
+see red_bar_config_spec.md). Two regime gates -- skip Tuesday and skip
+strong-uptrend days (5-day momentum ending yesterday < 0.0137) -- were fitted
+on 2023-24 and do real work: over 2026-05-28..08-06, bars no gate or grid had
+seen, they lift the result from -Rs 10,919 (PF 0.61, 47 trades) to -Rs 896
+(PF 0.94, 28 trades). They subtract losers; they do not add winners. The
+ungated forward loss independently reproduces the Volrix figures above.
+
+What was ruled OUT as the cause: option pricing. Re-pricing 31 trades against
+real 1-minute premiums (harvest DBs) and live greeks gives
+real = 1.185 x delta_model (95% CI [0.936, 1.438], r 0.81) -- the spot-delta
+model is a fair, slightly CONSERVATIVE proxy. Theta over a 90-minute hold is
+~Rs 55/lot against ~Rs 116/lot of total friction. The strategy does not fail
+on costs; it fails on direction.
+
 Treat this file as a faithful, working ENCODING of the course -- not as a
-validated system. Before it trades real money it needs a multi-year backtest
-(paid data) that clears out-of-sample, or a long paper-trading run.
-Run it in analyzer mode.
+validated system. Run it in analyzer mode.
 """
 import json
 import logging

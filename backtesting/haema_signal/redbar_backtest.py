@@ -200,6 +200,7 @@ def backtest(m, df, symbol, lot, premium_pct):
             "R": pts / risk if risk else 0.0,
             "rs": option_pnl(pts, prem, lot),
             "bars": int(held // INTERVAL_MIN) + 1,
+            "entry_ts": entry_time, "exit_ts": ts,
         })
     return pd.DataFrame(trades)
 

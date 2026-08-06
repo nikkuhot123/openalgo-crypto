@@ -146,6 +146,35 @@ def rules(fav_hi, fav_lo, fav_end, R):
             out[f"half_{A}"] = -1.0
         else:
             out[f"half_{A}"] = 0.5 * booked + 0.5 * (rest if rest is not None else fav_end / R)
+
+    # Two-lot with a TIGHTENING runner (the desk's proposal): book lot 1 at
+    # A*R, then run lot 2 on a trail G*R below the peak instead of a flat
+    # break-even. Result is expressed as R PER LOT so it stays comparable to
+    # the single-lot rules -- but note it deploys 2x the premium capital for
+    # that same per-lot number.
+    for A, G in ((1.0, 0.25), (1.0, 0.5), (1.0, 1.0), (2.0, 0.5)):
+        booked, peak, rest = None, 0.0, None
+        for hi, lo in zip(fav_hi, fav_lo):
+            peak = max(peak, hi)
+            if booked is None:
+                if lo <= -R:                       # stopped before booking
+                    booked, rest = -1.0, -1.0
+                    break
+                if hi >= A * R:
+                    booked = A
+                continue
+            # lot 2 rides a trail that can never give back past entry
+            stop = max(0.0, peak - G * R)
+            if lo <= stop:
+                rest = stop / R
+                break
+        if booked is None:
+            out[f"two_{A}_{G}"] = fav_end / R
+        elif booked == -1.0:
+            out[f"two_{A}_{G}"] = -1.0
+        else:
+            out[f"two_{A}_{G}"] = 0.5 * booked + 0.5 * (rest if rest is not None
+                                                        else fav_end / R)
     return out
 
 
@@ -213,7 +242,7 @@ def main():
     print(f"outcome: mean {withR['end_R'].mean():+.2f}R | "
           f"wins {(withR['end_R'] > 0).sum()}/{len(withR)}")
 
-    rule_cols = [c for c in d.columns if c.startswith(("trail_", "be_", "tgt_", "half_"))]
+    rule_cols = [c for c in d.columns if c.startswith(("trail_", "be_", "tgt_", "half_", "two_"))]
     if rule_cols and len(withR):
         tab = pd.DataFrame({
             "mean_R": withR[rule_cols].mean().round(3),

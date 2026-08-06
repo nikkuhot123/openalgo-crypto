@@ -428,3 +428,15 @@ def test_live_mode_still_places_orders_and_takes_locks(tmp_path, monkeypatch):
     assert rb.acquire_symbol_lock("NIFTY26000PE", "Red Bar X-Candle") is True
     assert (tmp_path / "NIFTY26000PE.lock").exists()
     rb.release_symbol_lock("NIFTY26000PE", "Red Bar X-Candle")
+
+
+def test_shadow_state_file_is_separate_from_live(monkeypatch):
+    """A shadow snapshot must never be adopted as a real position on restart."""
+    import importlib
+    monkeypatch.setenv("DRY_RUN", "true")
+    shadow = importlib.reload(rb)
+    shadow_path = shadow.STATE_FILE
+    monkeypatch.setenv("DRY_RUN", "false")
+    live = importlib.reload(rb)
+    assert shadow_path != live.STATE_FILE
+    assert "shadow" in shadow_path.name and "shadow" not in live.STATE_FILE.name

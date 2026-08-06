@@ -241,7 +241,10 @@ LOCKS_DIR = Path("log") / "strategies" / "locks"
 LOCKS_DIR.mkdir(parents=True, exist_ok=True)
 STATE_DIR = Path("log") / "strategies" / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE = STATE_DIR / f"red_bar_x_candle_{UNDERLYING}.json"
+# A shadow instance MUST NOT share the live instance's snapshot: on restart the
+# live loop adopts whatever this file describes, so a simulated position here
+# would be adopted as a real one (and vice versa).
+STATE_FILE = STATE_DIR / f"red_bar_x_candle_{UNDERLYING}{'_shadow' if DRY_RUN else ''}.json"
 # A leaked lock must never wedge the host forever (siblings found 9 orphaned .lock
 # files, some on expired contracts, silently blocking valid entries).
 LOCK_TTL_MIN = float(os.getenv('LOCK_TTL_MIN', '360'))

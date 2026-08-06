@@ -333,3 +333,98 @@ def test_direction_lock_blocks_the_opposite_side_from_another_strategy(tmp_path,
     assert rb.acquire_direction_lock("NIFTY", "CE", "Red Bar X-Candle") is True
     rb.release_direction_lock("NIFTY", "Red Bar X-Candle")
     assert not list(tmp_path.glob("NIFTY.Red_Bar_X_Candle.*.dir"))
+
+
+# --------------------------------------------------------------- regime gates
+# The gates are what separate the profitable configuration from the losing one:
+# on 2026-05-28..08-06 the same signal is -Rs 10,919 ungated and -Rs 896 gated,
+# so a gate that silently passes everything ships the losing strategy.
+def _daily(closes, end=TODAY):
+    """Daily frame whose last row is the session BEFORE `end`."""
+    idx = [pd.Timestamp(end) - timedelta(days=len(closes) - i) for i in range(len(closes))]
+    return pd.DataFrame({"open": closes, "high": closes, "low": closes,
+                         "close": closes}, index=idx)
+
+
+def _client_with(df, monkeypatch):
+    monkeypatch.setattr(rb, "client", types.SimpleNamespace(
+        history=lambda **kw: df))
+
+
+def test_gate_stands_down_on_skipped_weekday(monkeypatch):
+    _client_with(_daily([100.0] * 8), monkeypatch)
+    tuesday = date(2026, 8, 4)
+    assert tuesday.weekday() == 1
+    ok, why = rb.regime_gate("NIFTY", "NSE_INDEX", tuesday)
+    assert ok is False and "weekday" in why
+
+
+def test_gate_blocks_after_a_strong_five_session_run_up(monkeypatch):
+    # +3% over the five sessions ending yesterday -> above the 0.0137 cutoff
+    _client_with(_daily([100.0, 100.0, 100.0, 101.0, 102.0, 103.0]), monkeypatch)
+    ok, why = rb.regime_gate("NIFTY", "NSE_INDEX", TODAY)
+    assert ok is False and "mom5" in why
+
+
+def test_gate_allows_a_flat_or_falling_five_sessions(monkeypatch):
+    _client_with(_daily([100.0, 100.0, 100.0, 100.0, 99.5, 99.0]), monkeypatch)
+    ok, why = rb.regime_gate("NIFTY", "NSE_INDEX", TODAY)
+    assert ok is True and "clear" in why
+
+
+def test_gate_uses_yesterdays_close_not_todays(monkeypatch):
+    """mom5_prev must ignore any bar dated today -- that would be lookahead."""
+    df = _daily([100.0, 100.0, 100.0, 100.0, 100.0, 100.2])
+    today_row = pd.DataFrame({"open": [130.0], "high": [130.0], "low": [130.0],
+                              "close": [130.0]}, index=[pd.Timestamp(TODAY)])
+    _client_with(pd.concat([df, today_row]), monkeypatch)
+    ok, why = rb.regime_gate("NIFTY", "NSE_INDEX", TODAY)
+    # +0.2% over the prior five sessions passes; today's +30% spike must not count
+    assert ok is True, why
+
+
+def test_gate_fails_closed_when_history_is_short_or_broken(monkeypatch):
+    _client_with(_daily([100.0, 101.0]), monkeypatch)
+    assert rb.regime_gate("NIFTY", "NSE_INDEX", TODAY)[0] is False
+
+    def boom(**kw):
+        raise RuntimeError("broker down")
+    monkeypatch.setattr(rb, "client", types.SimpleNamespace(history=boom))
+    ok, why = rb.regime_gate("NIFTY", "NSE_INDEX", TODAY)
+    assert ok is False and "failing closed" in why
+
+
+# ----------------------------------------------------------------- shadow mode
+def test_shadow_mode_takes_no_locks_and_sends_no_orders(tmp_path, monkeypatch):
+    monkeypatch.setattr(rb, "LOCKS_DIR", tmp_path)
+    monkeypatch.setattr(rb, "DRY_RUN", True)
+
+    # a foreign strategy holding the opposite direction must not block shadow
+    (tmp_path / "NIFTY.HA_EMA34_Channel.CE.dir").write_text(
+        f"{datetime.now().isoformat()}|{os.getpid()}")
+    assert rb.acquire_direction_lock("NIFTY", "PE", "Red Bar Shadow") is True
+    assert rb.acquire_symbol_lock("NIFTY26000PE", "Red Bar Shadow") is True
+    # and it must leave no lock behind for the live instance to trip over
+    assert not (tmp_path / "NIFTY26000PE.lock").exists()
+    assert not list(tmp_path.glob("NIFTY.Red_Bar_Shadow.*.dir"))
+
+    def explode(**kw):
+        raise AssertionError("shadow mode placed a real order")
+    monkeypatch.setattr(rb, "client", types.SimpleNamespace(
+        placeorder=explode, quotes=lambda **kw: {"status": "success", "data": {"ltp": 120.0}}))
+
+    oid, trig = rb.place_premium_sl("NIFTY26000PE", "NFO", 65, 100.0)
+    assert oid == "shadow-sl" and trig == 30.0          # 70% below entry
+
+    outcome, qty, px = rb.verified_exit_sell("NIFTY", "NIFTY26000PE", "NFO", 65,
+                                             oid, "Target Hit")
+    assert (outcome, qty, px) == ("sold", 65, 120.0)
+
+
+def test_live_mode_still_places_orders_and_takes_locks(tmp_path, monkeypatch):
+    """DRY_RUN must default off: the live path is unchanged."""
+    monkeypatch.setattr(rb, "LOCKS_DIR", tmp_path)
+    monkeypatch.setattr(rb, "DRY_RUN", False)
+    assert rb.acquire_symbol_lock("NIFTY26000PE", "Red Bar X-Candle") is True
+    assert (tmp_path / "NIFTY26000PE.lock").exists()
+    rb.release_symbol_lock("NIFTY26000PE", "Red Bar X-Candle")

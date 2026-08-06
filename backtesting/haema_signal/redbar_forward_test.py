@@ -53,26 +53,15 @@ def pf(x):
     return w / gl if gl else 99.0
 
 
-def fetch_5m(start, end):
-    """Fresh 5-minute NIFTY spot from the live broker API."""
-    from openalgo import api
-    env = (ROOT / ".env").read_text()
-    key = env.split("OPENALGO_API_KEY=")[1].split()[0]
-    host = env.split("OPENALGO_HOST=")[1].split()[0]
-    c = api(api_key=key, host=host)
-    df = c.history(symbol="NIFTY", exchange="NSE_INDEX", interval="5m",
-                   start_date=start, end_date=end)
-    if not isinstance(df, pd.DataFrame):
-        raise RuntimeError(f"history failed: {df}")
-    df = df.copy()
-    df.index = pd.to_datetime(df.index).tz_localize(None)
-    return df[["open", "high", "low", "close"]].sort_index()
-
-
 def main():
+    # NOTE: the broker's 5m history is range-dependent -- a multi-day request
+    # silently returns different bars than a single-day one (2026-06-12 came
+    # back at 23,984.85 over a long range vs 23,631.75 alone). load_full_5m
+    # fetches per-session and verifies, so it is the only safe source here.
+    from redbar_overnight import load_full_5m
     today = datetime.now().date().isoformat()
-    print(f"fetching fresh NIFTY 5m {WARMUP_FROM} .. {today} from the live API...")
-    df5 = fetch_5m(WARMUP_FROM, today)
+    print(f"loading cached history + per-day-verified fresh bars .. {today}")
+    df5 = load_full_5m()
     print(f"  {len(df5):,} bars | {df5.index.min()} .. {df5.index.max()}")
     unseen = sorted({d for d in df5.index.date if d > CUTOFF})
     print(f"  unseen sessions (> {CUTOFF}): {len(unseen)}")

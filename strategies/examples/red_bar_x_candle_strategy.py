@@ -212,6 +212,31 @@ SKIP_EXPIRY_DAY_UNDERLYINGS = {
     s.strip().upper() for s in os.getenv('SKIP_EXPIRY_DAY_UNDERLYINGS', 'NIFTY').split(',') if s.strip()
 }
 
+# ---------------------------------------------------------------- regime gates
+# Both were chosen on 2023-24 and re-validated under a full walk-forward that
+# re-fits parameters AND this cutoff every quarter (349 OOS trades, PF 1.19,
+# +Rs 32,142; see backtesting/haema_signal/red_bar_config_spec.md). WITHOUT
+# them the same signal loses: the untouched 2026-05-28..08-06 window is
+# -Rs 10,919 ungated (PF 0.61) versus -Rs 896 gated (PF 0.94). They subtract
+# losers rather than add winners, so they are not optional decoration.
+#
+# SKIP_WEEKDAYS: Monday=0 .. Friday=4. Tuesday is the only day gate that held
+# out of sample.
+SKIP_WEEKDAYS = {
+    int(x) for x in os.getenv('SKIP_WEEKDAYS', '1').split(',') if x.strip().lstrip('-').isdigit()
+}
+# MOM5_PREV_MAX: stand down after a strong 5-session run-up. mom5_prev is the
+# 5-session return ENDING YESTERDAY -- close[-1]/close[-6]-1 over prior daily
+# closes -- so it is fully known before the session opens. 0.0137 is the
+# 2023-24 75th percentile, picked before any out-of-sample look.
+MOM5_PREV_MAX = float(os.getenv('MOM5_PREV_MAX', '0.0137'))
+
+# DRY_RUN: shadow mode. Signals, sizing, exits and P&L are computed and logged
+# exactly as live, but no order is sent, no lock is taken and no broker
+# position is consulted. Used to forward-test alongside a live instance
+# without competing for capital or for the shared symbol/direction locks.
+DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
+
 LOCKS_DIR = Path("log") / "strategies" / "locks"
 LOCKS_DIR.mkdir(parents=True, exist_ok=True)
 STATE_DIR = Path("log") / "strategies" / "state"
@@ -259,6 +284,8 @@ def _strategy_slug(name):
 
 def acquire_symbol_lock(symbol, strategy_name):
     """Claim one CONTRACT. True if acquired, already ours, or the holder's lock is stale."""
+    if DRY_RUN:
+        return True          # shadow: never contend with the live instance
     lock_file = LOCKS_DIR / f"{symbol}.lock"
     if lock_file.exists():
         try:
@@ -281,6 +308,8 @@ def acquire_symbol_lock(symbol, strategy_name):
 
 
 def release_symbol_lock(symbol, strategy_name):
+    if DRY_RUN:
+        return
     lock_file = LOCKS_DIR / f"{symbol}.lock"
     try:
         if lock_file.exists() and lock_file.read_text().split("|", 1)[0] == strategy_name:
@@ -295,6 +324,8 @@ def release_symbol_lock(symbol, strategy_name):
 # The per-contract lock cannot see it because CE and PE are different symbols.
 def acquire_direction_lock(underlying, side, strategy_name):
     """Claim a direction on an underlying. False if another strategy holds the opposite."""
+    if DRY_RUN:
+        return True          # shadow: never blocked by, and never blocks, the live book
     und = str(underlying).upper()
     me = _strategy_slug(strategy_name)
     want = str(side).upper()
@@ -333,6 +364,8 @@ def acquire_direction_lock(underlying, side, strategy_name):
 
 
 def release_direction_lock(underlying, strategy_name, side=None):
+    if DRY_RUN:
+        return
     und = str(underlying).upper()
     me = _strategy_slug(strategy_name)
     pat = f"{und}.{me}.{str(side).upper()}.dir" if side else f"{und}.{me}.*.dir"
@@ -392,7 +425,14 @@ def reconcile_orphan_position(underlying):
 
 
 def live_position_qty(underlying, symbol):
-    """Broker's current qty on `symbol`: >0 held, 0 absent, None if unverifiable."""
+    """Broker's current qty on `symbol`: >0 held, 0 absent, None if unverifiable.
+
+    In shadow mode there is no broker position, so report the qty this process
+    believes it holds -- otherwise the empty book would be read as a filled
+    premium SL and tear down the simulated trade.
+    """
+    if DRY_RUN:
+        return int(_active_trade.get("qty_open", 0) or 0)
     try:
         pb = client.positionbook()
         if not isinstance(pb, dict) or pb.get("status") != "success":
@@ -518,6 +558,11 @@ def place_premium_sl(opt_symbol, opt_exchange, qty, entry_px):
     """
     if entry_px is None or qty <= 0:
         return None, None
+    if DRY_RUN:
+        trig = _tick(entry_px * (1.0 - PREMIUM_SL_PCT / 100.0))
+        log.info(f"[SHADOW] premium SL would sit @ {trig} ({PREMIUM_SL_PCT:.0f}% below "
+                 f"entry {entry_px}) qty {qty}")
+        return "shadow-sl", trig
     trigger = _tick(entry_px * (1.0 - PREMIUM_SL_PCT / 100.0))
     limit = max(0.05, _tick(trigger * (1.0 - SL_LIMIT_BUFFER_PCT / 100.0)))
     try:
@@ -551,6 +596,10 @@ def verified_exit_sell(underlying, symbol, opt_exchange, qty, sl_oid, reason):
       'rejected' -- SELL was refused; caller MUST keep tracking and retry
     Never collapse 'rejected' into 'flat': that abandons a live position.
     """
+    if DRY_RUN:
+        px = fetch_option_ltp(symbol, opt_exchange)
+        log.info(f"[SHADOW] {reason}: would SELL {qty} {symbol} @ {px}")
+        return "sold", qty, px
     bq = live_position_qty(underlying, symbol)
     if bq is None:
         log.warning(f"{reason}: cannot verify broker position for {symbol} -- deferring exit")
@@ -651,6 +700,40 @@ def fetch_daily_context(underlying, idx_exchange, today):
     except Exception as e:
         log.warning(f"Daily context fetch failed: {e}")
         return None, None
+
+
+def regime_gate(underlying, idx_exchange, today):
+    """(ok, detail) for the two IS-chosen regime gates, decided before entry.
+
+    Gate A -- weekday: Tuesday (1) stands down.
+    Gate B -- mom5_prev = close[-1]/close[-6] - 1 over PRIOR daily closes must
+              be < MOM5_PREV_MAX. Both closes predate today's open, so there
+              is no lookahead.
+
+    FAILS CLOSED, like the CPR and gap gates: if the daily series cannot be
+    fetched or is too short, the day is refused rather than traded unfiltered.
+    Ungated, this signal loses money -- see the note at SKIP_WEEKDAYS.
+    """
+    if today.weekday() in SKIP_WEEKDAYS:
+        return False, f"weekday gate: {today:%A} is in SKIP_WEEKDAYS"
+    try:
+        start = (today - timedelta(days=25)).strftime("%Y-%m-%d")
+        df = client.history(symbol=underlying, exchange=idx_exchange, interval="D",
+                            start_date=start, end_date=today.strftime("%Y-%m-%d"))
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return False, "mom5 gate: no daily history (failing closed)"
+        df = df.sort_index()
+        prior = df[[t.date() < today for t in pd.to_datetime(df.index)]]
+        if len(prior) < 6:
+            return False, f"mom5 gate: only {len(prior)} prior sessions (failing closed)"
+        closes = [float(x) for x in prior["close"].tail(6)]
+        mom5_prev = closes[-1] / closes[0] - 1.0
+        if mom5_prev >= MOM5_PREV_MAX:
+            return False, (f"mom5 gate: mom5_prev {mom5_prev:+.4f} >= {MOM5_PREV_MAX} "
+                           f"(5-session run-up, standing down)")
+        return True, f"gates clear (mom5_prev {mom5_prev:+.4f} < {MOM5_PREV_MAX})"
+    except Exception as e:
+        return False, f"mom5 gate: fetch failed ({e}) -- failing closed"
 
 
 # ---------------------------------------------------------------- the signal
@@ -866,6 +949,13 @@ def run_strategy():
              f"EMA10 {REQUIRE_EMA10} EMA30 {REQUIRE_EMA30} CPR {REQUIRE_CPR} GAP {REQUIRE_GAP_GATE}")
     log.info(f"Premium SL {PREMIUM_SL_PCT}% | max hold {MAX_HOLD_MINUTES}min | "
              f"decay floor {DECAY_EXIT_PCT:.0%} | trades/day {MAX_TRADES_PER_DAY}")
+    log.info(f"Gates: skip weekdays {sorted(SKIP_WEEKDAYS)} | mom5_prev < {MOM5_PREV_MAX} "
+             f"| maxSL {MAX_SL_PCT}% (both gates FAIL CLOSED)")
+    if DRY_RUN:
+        log.warning("=== SHADOW MODE (DRY_RUN=true) -- no orders, no locks, no capital. "
+                    "Signals and P&L are logged as if live. ===")
+    else:
+        log.warning("=== LIVE MODE -- orders are REAL. ===")
 
     if QUANTITY == 0:
         detected = fetch_lot_size(UNDERLYING, idx_exchange, opt_exchange)
@@ -888,6 +978,7 @@ def run_strategy():
     daily_loss_rs = 0.0
     cpr, prev_close, ctx_date = None, None, None
     expiry_cache = (None, None)
+    gate_cache = (None, False, "")
     force_flatten = False
 
     def save():
@@ -1185,6 +1276,15 @@ def run_strategy():
                     state = "DONE"
                     continue
 
+                # Regime gates, resolved once per session (both are decided
+                # from data that predates today's open, so one check is enough)
+                if gate_cache[0] != today:
+                    gate_cache = (today, *regime_gate(UNDERLYING, idx_exchange, today))
+                if not gate_cache[1]:
+                    log.info(f"Regime gate: standing down -- {gate_cache[2]}")
+                    state = "DONE"
+                    continue
+
                 intra_start = (today - timedelta(days=5)).strftime("%Y-%m-%d")
                 df_5m = client.history(symbol=UNDERLYING, exchange=idx_exchange,
                                        interval=INTERVAL, start_date=intra_start,
@@ -1251,21 +1351,25 @@ def run_strategy():
                 entry_qty = LOT_SIZE * lots
 
                 log.info(f"Red bar trigger ({sig['signal']}, {sig['reason']}). "
-                         f"Placing BUY order for {opt_symbol} (qty={entry_qty})...")
-                order_resp = client.placeorder(strategy=STRATEGY_NAME, symbol=opt_symbol,
-                                               action="BUY", exchange=opt_exchange,
-                                               price_type="MARKET", product=PRODUCT,
-                                               quantity=entry_qty)
-                log.info(f"Entry order response: {order_resp}")
+                         f"{'[SHADOW] would place' if DRY_RUN else 'Placing'} BUY order "
+                         f"for {opt_symbol} (qty={entry_qty})...")
+                if DRY_RUN:
+                    entry_fill_price = entry_opt_price
+                else:
+                    order_resp = client.placeorder(strategy=STRATEGY_NAME, symbol=opt_symbol,
+                                                   action="BUY", exchange=opt_exchange,
+                                                   price_type="MARKET", product=PRODUCT,
+                                                   quantity=entry_qty)
+                    log.info(f"Entry order response: {order_resp}")
 
-                if not (isinstance(order_resp, dict) and order_resp.get("status") == "success"):
-                    release_symbol_lock(opt_symbol, STRATEGY_NAME)
-                    release_direction_lock(UNDERLYING, STRATEGY_NAME, sig["signal"])
-                    last_entry_candle_fp = sig["candle_fp"]
-                    time.sleep(15)
-                    continue
+                    if not (isinstance(order_resp, dict) and order_resp.get("status") == "success"):
+                        release_symbol_lock(opt_symbol, STRATEGY_NAME)
+                        release_direction_lock(UNDERLYING, STRATEGY_NAME, sig["signal"])
+                        last_entry_candle_fp = sig["candle_fp"]
+                        time.sleep(15)
+                        continue
 
-                entry_fill_price = fetch_fill_price(order_resp.get("orderid"), opt_symbol)
+                    entry_fill_price = fetch_fill_price(order_resp.get("orderid"), opt_symbol)
                 if entry_fill_price and entry_opt_price:
                     log.info(f"Entry fill {entry_fill_price} vs quote {entry_opt_price} -> "
                              f"slippage {(entry_fill_price - entry_opt_price) / entry_opt_price * 1e4:+.0f} bps")

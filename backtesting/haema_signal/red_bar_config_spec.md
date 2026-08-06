@@ -3,13 +3,25 @@
 Date: 2026-08-06 · Author: research harness (backtesting/haema_signal)
 Verdict: **thin but real edge — forward-test at 1 lot, do not scale yet.**
 Under a full walk-forward that re-fits both parameters and the gate every
-quarter, the intraday long-option config returns +Rs 32,142 over 349
-out-of-sample trades (PF 1.19, ~Rs 92/trade, all three years positive, max
-drawdown Rs 13,495). Against that: the one window where nothing at all was
-fitted (2026-05-28..08-06, 28 trades) is flat at -Rs 896. Overnight holds,
-stop removal, futures, inversion, short premium and the other indices were
-all tested and all fail — see section 5b. Two earlier verdicts in this
+quarter, the intraday long-option config returns +Rs 33,453 over 350
+out-of-sample trades (PF 1.20, ~Rs 96/trade, all three years positive, max
+drawdown Rs 13,495). The one window where nothing at all was fitted
+(2026-05-28..08-06, 29 trades) reads +Rs 619, PF 1.05 — consistent with a
+thin edge that a sample that small cannot resolve either way. Overnight
+holds, stop removal, futures, inversion, short premium and the other indices
+were all tested and all fail — see section 5b. Two earlier verdicts in this
 session are retracted below, with the reason each was wrong.
+
+DATA WARNING (found 2026-08-06): the broker's 5-minute history endpoint is
+RANGE-DEPENDENT. Requesting 2026-05-20..08-06 in one call returns 2026-06-12
+with last close 23,984.85 / high 23,984.85; requesting 06-12 alone returns
+23,631.75 / 23,645.35, which agrees with the official daily bar. Multi-day
+responses are silently wrong, and an earlier revision of this spec quoted
+forward numbers (-Rs 896 gated, -Rs 10,919 ungated) computed from them. Fresh
+bars are now fetched one session at a time and cross-checked against a
+single-day request (`fetch_5m_live` raises rather than return inconsistent
+data). The duckdb cache (<= 2026-05-27) was never affected, so the grid and
+IS/OOS work stand unchanged.
 
 The strategy was given the full pass: regime gates, walk-forward parameter
 grid, SENSEX test, CAS exit timing, real-premium re-pricing, a live-faithful

@@ -26,7 +26,7 @@ Usage:
 """
 import os
 import sys
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -46,24 +46,77 @@ CUTOFF = datetime(2026, 5, 27).date()
 CALIB = 1.185             # real = 1.185 x delta (n=31, CI [0.936, 1.438])
 
 
-def fetch_5m_live(start, end):
+def fetch_5m_live(start, end, chunk_days=1, verify=True):
+    """Fresh 5-minute NIFTY spot from the live broker API, fetched in chunks.
+
+    IMPORTANT (measured 2026-08-06): the history endpoint returns DIFFERENT
+    values for the same session depending on the width of the requested
+    range. Asking for 2026-05-20..08-06 in one call returned 2026-06-12 with
+    last close 23,984.85 / high 23,984.85, while asking for 2026-06-12 alone
+    returned 23,631.75 / 23,645.35 -- the correct session. Long-range
+    responses are silently corrupted, so everything is fetched in short
+    chunks and spot-checked against single-day requests.
+    """
     from openalgo import api
     env = (ROOT / ".env").read_text()
     key = env.split("OPENALGO_API_KEY=")[1].split()[0]
     host = env.split("OPENALGO_HOST=")[1].split()[0]
     c = api(api_key=key, host=host)
-    df = c.history(symbol="NIFTY", exchange="NSE_INDEX", interval="5m",
-                   start_date=start, end_date=end)
-    df = df.copy()
-    df.index = pd.to_datetime(df.index).tz_localize(None)
-    return df[["open", "high", "low", "close"]].sort_index()
+
+    def _one(lo, hi):
+        df = c.history(symbol="NIFTY", exchange="NSE_INDEX", interval="5m",
+                       start_date=lo, end_date=hi)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame()
+        df = df.copy()
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        return df[["open", "high", "low", "close"]]
+
+    lo = pd.Timestamp(start)
+    hi_end = pd.Timestamp(end)
+    parts = []
+    while lo <= hi_end:
+        hi = min(lo + pd.Timedelta(days=chunk_days - 1), hi_end)
+        parts.append(_one(lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")))
+        lo = hi + pd.Timedelta(days=1)
+    out = pd.concat([p for p in parts if len(p)]).sort_index()
+    out = out[~out.index.duplicated(keep="first")]
+
+    if verify and len(out):
+        days = sorted({d for d in out.index.date})
+        for probe in (days[len(days) // 3], days[-2] if len(days) > 1 else days[-1]):
+            ref = _one(probe.strftime("%Y-%m-%d"), probe.strftime("%Y-%m-%d"))
+            got = out[out.index.date == probe]
+            if len(ref) and len(got):
+                delta = abs(float(ref["close"].iloc[-1]) - float(got["close"].iloc[-1]))
+                if delta > 0.05:
+                    raise RuntimeError(
+                        f"5m history inconsistent for {probe}: chunked close "
+                        f"{got['close'].iloc[-1]} vs single-day {ref['close'].iloc[-1]}. "
+                        f"Reduce chunk_days.")
+    return out
 
 
-def load_full_5m():
-    """Cached history (to 2026-05-27) + fresh API bars after it."""
+def load_full_5m(refresh=False):
+    """Cached duckdb history + fresh, per-day-verified API bars after it.
+
+    The fresh tail is memoised on disk because it costs one API call per
+    session (multi-day requests come back corrupted -- see fetch_5m_live).
+    """
     hist = rb.load_bars("NIFTY")
-    fresh = fetch_5m_live("2026-05-20", datetime.now().date().isoformat())
-    fresh = fresh[fresh.index.date > hist.index.date.max()]
+    cache_end = hist.index.date.max()
+    pkl = Path(__file__).parent / "_fresh5m.pkl"
+    fresh = None
+    if pkl.exists() and not refresh:
+        fresh = pd.read_pickle(pkl)
+        if fresh.index.date.max() < (datetime.now().date() - timedelta(days=1)):
+            fresh = None                      # stale, refetch
+    if fresh is None:
+        fresh = fetch_5m_live(
+            (pd.Timestamp(cache_end) - pd.Timedelta(days=5)).strftime("%Y-%m-%d"),
+            datetime.now().date().isoformat())
+        fresh.to_pickle(pkl)
+    fresh = fresh[fresh.index.date > cache_end]
     return pd.concat([hist, fresh]).sort_index()
 
 

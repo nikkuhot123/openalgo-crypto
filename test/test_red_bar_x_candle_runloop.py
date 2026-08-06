@@ -56,9 +56,12 @@ def _intraday_frame():
 
 
 def _daily_frame():
-    """Prior session H/L/C -> CPR band at 25000, below the trade's entry."""
-    idx = [datetime.combine(TODAY - timedelta(days=d), datetime.min.time()) for d in (2, 1)]
-    return pd.DataFrame([(25000, 25050, 24950, 25000)] * 2,
+    """Prior sessions: CPR band at 25000 (below the trade's entry) and a flat
+    five-session run so the mom5_prev regime gate passes. The gate needs six
+    prior closes and fails closed without them."""
+    idx = [datetime.combine(TODAY - timedelta(days=d), datetime.min.time())
+           for d in (8, 7, 6, 5, 4, 3, 2, 1)]
+    return pd.DataFrame([(25000, 25050, 24950, 25000)] * len(idx),
                         columns=["open", "high", "low", "close"], index=idx)
 
 

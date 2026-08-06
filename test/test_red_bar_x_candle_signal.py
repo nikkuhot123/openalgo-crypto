@@ -440,3 +440,16 @@ def test_shadow_state_file_is_separate_from_live(monkeypatch):
     live = importlib.reload(rb)
     assert shadow_path != live.STATE_FILE
     assert "shadow" in shadow_path.name and "shadow" not in live.STATE_FILE.name
+
+
+def test_shadow_mode_switches_on_from_the_registration_name(monkeypatch):
+    """The UI upload writes no env dict, so the name is the only channel."""
+    import importlib
+    monkeypatch.delenv("DRY_RUN", raising=False)
+    monkeypatch.setenv("STRATEGY_NAME", "Red Bar X-Candle (SHADOW)")
+    assert importlib.reload(rb).DRY_RUN is True
+
+    monkeypatch.setenv("STRATEGY_NAME", "Red Bar X-Candle (NIFTY)")
+    live = importlib.reload(rb)
+    assert live.DRY_RUN is False
+    assert live.MAX_SL_PCT == 0.80          # walk-forward value, no env needed

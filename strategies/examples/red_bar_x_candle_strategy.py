@@ -164,7 +164,11 @@ T1_RR = float(os.getenv('T1_RR', '1.0'))      # digest 2.11: half off at the fir
 # SAME floored risk -- scaling the stop but not the target silently collapses the
 # realised reward:risk (a 2-pt bar would otherwise target 6 pts behind a 25-pt stop).
 MIN_SL_PCT = float(os.getenv('MIN_SL_PCT', '0.10'))
-MAX_SL_PCT = float(os.getenv('MAX_SL_PCT', '0.60'))   # skip signals whose bar is too tall
+# 0.80 is the walk-forward choice, not the sweep's: with the two regime gates
+# it beats 0.60 on both the fitted range (IS PF 1.38 vs 1.35) and out of
+# sample (1.32 vs 1.28). It is the DEFAULT rather than an env override because
+# the UI upload form writes no `env` dict and nothing in the UI edits one.
+MAX_SL_PCT = float(os.getenv('MAX_SL_PCT', '0.80'))   # skip signals whose bar is too tall
 GAP_PCT = float(os.getenv('GAP_PCT', '0.30'))         # gap size that arms the gap gate
 # One 30m bar covers the whole 09:15-09:45 anchor; raise this only if INTERVAL is 5m.
 MIN_ANCHOR_BARS = int(os.getenv('MIN_ANCHOR_BARS', '1'))
@@ -235,7 +239,17 @@ MOM5_PREV_MAX = float(os.getenv('MOM5_PREV_MAX', '0.0137'))
 # exactly as live, but no order is sent, no lock is taken and no broker
 # position is consulted. Used to forward-test alongside a live instance
 # without competing for capital or for the shared symbol/direction locks.
-DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
+#
+# It is ALSO switched on by naming the registration "... SHADOW" in the UI.
+# The upload form only captures name/exchange/schedule -- it never writes the
+# config's optional `env` dict, and nothing in the UI edits it, so a
+# DRY_RUN=true env var can only be hand-added to strategy_configs.json, which
+# needs an app restart to be read and is erased by the next save_configs().
+# The platform always injects STRATEGY_NAME, so the name is the one channel
+# that survives the UI-only path.
+STRATEGY_LABEL = os.getenv('STRATEGY_NAME', '')
+DRY_RUN = (os.getenv('DRY_RUN', 'false').lower() == 'true'
+           or 'shadow' in STRATEGY_LABEL.lower())
 
 LOCKS_DIR = Path("log") / "strategies" / "locks"
 LOCKS_DIR.mkdir(parents=True, exist_ok=True)

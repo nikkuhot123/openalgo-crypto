@@ -119,8 +119,13 @@ def to_30m(df):
     return pd.concat(out).sort_index() if out else df
 
 
-def backtest(m, df, symbol, lot, premium_pct):
-    """One trade per day, exits in the strategy's own priority order."""
+def backtest(m, df, symbol, lot, premium_pct, use_stop=True):
+    """One trade per day, exits in the strategy's own priority order.
+
+    use_stop=False removes the spot stop entirely, leaving target / max-hold /
+    EOD. For a LONG option that is not unbounded risk: loss is capped at the
+    premium, and the live loop's 60% decay floor cuts well before that.
+    """
     days = sorted({d.date() for d in df.index})
     trades = []
 
@@ -170,14 +175,14 @@ def backtest(m, df, symbol, lot, premium_pct):
                 exit_px, reason = row["close"], "EOD"
                 break
             if side == 1:
-                if row["low"] <= slp:                       # stop-limit on spot
+                if use_stop and row["low"] <= slp:          # stop-limit on spot
                     exit_px, reason = slp, "SL"
                     break
                 if row["high"] >= tgt:                     # target fill
                     exit_px, reason = tgt, "target"
                     break
             else:
-                if row["high"] >= slp:
+                if use_stop and row["high"] >= slp:
                     exit_px, reason = slp, "SL"
                     break
                 if row["low"] <= tgt:

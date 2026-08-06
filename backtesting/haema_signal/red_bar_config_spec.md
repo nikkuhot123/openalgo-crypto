@@ -1,11 +1,15 @@
 # Red Bar / X-Candle — Configuration Spec & Evidence
 
 Date: 2026-08-06 · Author: research harness (backtesting/haema_signal)
-Verdict: **DO NOT DEPLOY.** The gates work, the CAS handling is correct, and
-real option premiums are NOT the problem — but on the only window never used
-to fit anything (2026-05-28 .. 08-06) the gated config is flat-to-negative:
-28 trades, -Rs 896, PF 0.94. Two earlier verdicts in this session are
-retracted below, with the reason each was wrong.
+Verdict: **thin but real edge — forward-test at 1 lot, do not scale yet.**
+Under a full walk-forward that re-fits both parameters and the gate every
+quarter, the intraday long-option config returns +Rs 32,142 over 349
+out-of-sample trades (PF 1.19, ~Rs 92/trade, all three years positive, max
+drawdown Rs 13,495). Against that: the one window where nothing at all was
+fitted (2026-05-28..08-06, 28 trades) is flat at -Rs 896. Overnight holds,
+stop removal, futures, inversion, short premium and the other indices were
+all tested and all fail — see section 5b. Two earlier verdicts in this
+session are retracted below, with the reason each was wrong.
 
 The strategy was given the full pass: regime gates, walk-forward parameter
 grid, SENSEX test, CAS exit timing, real-premium re-pricing, a live-faithful
@@ -85,24 +89,27 @@ again — it is not a deployment recommendation.
 
 ## 3. Sizing for a 5-6 lakh account
 
-**Recommended allocation today: zero.** The forward test does not support
-risking capital. The numbers below exist only so the sizing question has an
-answer if ~50 forward trades later turn positive.
-
+**Recommended allocation: 1 lot, forward-test only.** The honest
+walk-forward pays ~Rs 92/trade (Rs 109 real-equivalent), ~110 trades/year.
+Sizing beyond 1 lot should wait for ~30 forward trades that land in that
+band. The fitted-history column below is what the sweep bought and is
+deliberately shown next to the walk-forward number, which is what to expect.
 Per-trade capital is the premium: ~Rs 13,000 per lot at a 200-point ATM.
-On the FITTED history (419 trades, real-equivalent, 1 lot) the strategy made
-~Rs 20k/year with a Rs 11,823 max drawdown; the same series over the forward
-window makes -Rs 1,061. Sizing off the fitted number would be sizing off the
-curve fit.
+The walk-forward column is the one to plan against (Rs 92/trade x ~110
+trades/year, drawdown from the same 349-trade OOS series); the fitted column
+is what the sweep bought, shown only for contrast.
 
-| Lots | Capital/trade | Fitted-history/year | Fitted max DD | Forward window |
+| Lots | Capital/trade | Walk-forward/year | Walk-forward maxDD | Fitted/year |
 |---|---|---|---|---|
-| 1 | ~13,000 | ~+20,000 | -11,823 | -1,061 |
-| 3 | ~39,000 | ~+60,200 | -35,469 | -3,183 |
-| 5 | ~65,000 | ~+100,333 | -59,115 | -5,305 |
+| 1 | ~13,000 | ~+10,100 | -13,495 | ~+20,000 |
+| 3 | ~39,000 | ~+30,300 | -40,485 | ~+60,200 |
+| 5 | ~65,000 | ~+65,000* | -67,475 | ~+100,333 |
 
-If it is ever deployed: 3 lots is ~7% of a 5.5L account per trade with a ~6%
-account drawdown on fitted history — and fitted drawdowns are always optimistic.
+*5 lots assumes fills stay at the quote; at Rs 92/trade of edge the strategy
+is execution-sensitive, and size makes that worse.
+
+At 3 lots that is ~Rs 30k/year on a 5.5L account (~5.5%) against a ~Rs 40k
+drawdown (~7%). That ratio is not compelling enough to skip the forward test.
 
 ## 4. Evidence
 
@@ -173,33 +180,103 @@ stationary mix 17/48/35%). But regime-conditioned PF inverts out of sample:
 
 Bull drives IS and is flat OOS; Bear inverts. No transferable signal.
 
-## 5. Why it fails, and what is still unknown
+## 5. Where the edge is and is not
 
-What the evidence supports:
-1. The signal has no forward edge. Ungated PF 0.61 over 47 forward trades,
-   corroborated by an independent Volrix run on real premiums (PF 0.5).
-2. The gates are genuinely useful — they lift the forward window from
-   -Rs 10,919 to -Rs 896 — but they subtract losers rather than add winners.
-3. Option pricing is NOT the problem (calibration 1.185, r 0.81), CAS
-   handling is correct, and the live-only exits (60% decay floor, -70%
-   broker stop) never fired in 31 trades.
+Two facts sit in tension and both are real:
 
-What remains unknown:
-1. 28 forward trades is a small sample; the true forward expectancy could be
-   mildly positive or clearly negative. It is not, on this evidence, good.
-2. Real premiums exist for only 31 trades, all inside the fitted range. The
-   harvest stopped 2026-05-27; nothing after it has real option data.
-3. The 5-second exit polling was validated on those 31 trades only. On the
-   forward window only the 30-minute delta model was available.
+- **Walk-forward (large sample, honest re-fitting): positive.** 349 OOS
+  trades, +Rs 32,142, PF 1.19, every year positive, not concentration-driven
+  (+Rs 16,572 after deleting the best three trades).
+- **The single fully-unfitted window: flat.** 28 trades, -Rs 896, PF 0.94.
+  Its ungated form (-Rs 10,919, PF 0.61) is independently reproduced by a
+  Volrix run on real premiums (-Rs 15,301, PF 0.5).
 
-**Recommended next step:** do not allocate. If the strategy is kept alive as
-research, resume option harvesting (it stopped 2026-05-27) and run the gated
-config in analyzer/paper mode. Revisit only if ~50 further forward trades
-turn clearly positive — the bar is a forward PF above ~1.2, not above 1.0,
-because 1.0 does not pay for the attention.
+The reconciliation is sample size, not contradiction: 28 trades cannot
+resolve a Rs 92/trade edge. One quarter of this strategy is noise by
+construction — 2026Q2 (-474) and 2026Q3 (-1,367) are both inside the
+walk-forward's positive 2026.
+
+What is settled:
+1. Option pricing is not the problem — calibration 1.185, r 0.81, and the
+   real delta (0.52) beats the model's 0.358 by more than theta costs.
+2. The gates do real work but subtract losers rather than add winners.
+3. CAS handling is correct; the live-only exits (60% decay floor, -70%
+   broker stop) never fired in 31 real-premium trades.
+4. The stop is load-bearing — removing it costs Rs 44k across the
+   walk-forward and triples the drawdown.
+
+What is not settled:
+1. The signal DESIGN (red-bar rule, fib bands, 30m interval) was chosen with
+   hindsight in earlier sessions. Only parameters and the gate were re-fitted
+   here, so even the honest arm carries design-level selection.
+2. Real premiums exist for 31 trades, all inside the fitted range. Harvesting
+   stopped 2026-05-27.
+3. Edge per trade (~1.4 index points after costs) is smaller than the
+   1-minute option bar range, so execution quality is a live risk that no
+   backtest here can settle.
+
+**Recommended next step:** run it at 1 lot (or in analyzer mode) for a
+quarter — ~30 trades — and compare realised Rs/trade against the Rs 92-109
+the walk-forward predicts. Scale only if the forward run lands in that band.
+Resume option harvesting at the same time; it is the only way the next
+premium audit gets a bigger sample than 31 trades.
+
+## 5b. Can it be made profitable? (exploration, 2026-08-06)
+
+Seven structures were tested. One works, marginally; the rest are dead. Every
+row is scored on data the variant was not chosen on.
+
+| Structure | Result | Verdict |
+|---|---|---|
+| intraday long option, **full walk-forward** (params + gate re-fitted quarterly) | 349 OOS trades, +Rs 32,142, PF 1.19, all 3 years positive | **the only survivor** |
+| overnight to next 09:20 (real premiums) | -Rs 384, PF 1.00 (29 trades) | dead |
+| overnight to next 15:10 (real premiums) | -Rs 6,715, PF 0.95 | dead |
+| inverse the signal | fitted PF 0.74, forward PF 1.07 | sign flips — noise |
+| futures instead of options | fitted +93,716, forward -7,528 PF 0.83 | dead |
+| no spot stop, hold to 15:10 | walk-forward -Rs 11,775, PF 0.96, maxDD -55,985 | dead |
+| short overnight ATM straddle | 47 nights -Rs 3,136, PF 0.94 | dead (and not this signal) |
+| BANKNIFTY / FINNIFTY / MIDCPNIFTY | fitted PF 1.07 / 1.12 / 1.17 | weaker than NIFTY before any OOS |
+
+### Why overnight fails — measured, not modelled
+The signal DOES carry overnight: +15.6 spot points in its direction on the
+fitted window (56.1% hit rate). But 99 contract-nights of real ATM premiums
+give the price of a night:
+
+    d_premium = 0.474 * d_spot - 1.28      (n=99, all DTE)
+    DTE  5-9 : delta 0.492, night costs -8.06 pts = -Rs 524/lot
+    DTE 10-39: delta 0.453, night costs +6.33 pts (n=33, unstable)
+
+The gap edge is worth +15.6 x 0.474 = 7.4 premium points = +Rs 480/lot. One
+night on the weekly the strategy trades costs -Rs 524/lot. The edge is
+cancelled almost exactly, before transaction costs — which is why the real
+premium test lands on PF 1.00. Overnight is not a rescue; it is a wash that
+turns into a loss once you pay to enter.
+
+### Why "remove the stop" fails
+The live sim showed the SL bucket at PF 0.02 while max-hold carried the book,
+which suggests cutting the stop. On the 28-trade forward window that looked
+right (+Rs 4,412, PF 1.25) — but the entire result is two trades: remove the
+best one and it is -Rs 2,027. On 349 walk-forward trades the same variant
+loses Rs 11,775 with a Rs 56k drawdown. The stop is doing real work.
+
+### What the survivor is actually worth
+Honest walk-forward: Rs 92/trade at 1 lot, ~110 trades/year, PF 1.19,
+max drawdown Rs 13,495. Applying the real-premium calibration (x1.185) gives
+~Rs 109/trade, so roughly **Rs 12k/year per lot**. At 3 lots that is ~Rs 36k
+a year on a 5.5L account (~6.5%) against a ~Rs 40k drawdown (~7%).
+
+That is a real but thin edge, and it rests on a signal design that was itself
+chosen with hindsight — only the parameters and the gate were re-fitted here.
+The one window where nothing at all was fitted (28 trades, 2026-05-28..08-06)
+is flat. Both facts have to be held at once.
 
 ## 6. Artifacts
-
+- `redbar_walkforward_full.py` — parameters AND gate re-fitted quarterly (the
+  honest large-sample test, 349 OOS trades)
+- `redbar_walkforward.py` — gate-only re-fitting variant
+- `redbar_overnight.py` — overnight spot-edge horizons (gap / d1 / d2 / MFE)
+- `redbar_overnight_premium.py` — overnight cost measured on real premiums
+- `redbar_structures.py` — inverse, futures, short straddle
 - `redbar_forward_test.py` / `redbar_forward_trades.csv` — TRUE forward test
   on live-fetched bars after the cache boundary (the decisive evidence)
 - `redbar_live_sim.py` / `redbar_live_sim_trades.csv` — live-faithful 1-minute

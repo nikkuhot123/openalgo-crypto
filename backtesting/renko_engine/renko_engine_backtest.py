@@ -386,27 +386,35 @@ def report(t, symbol, tf, label=""):
     gw, gl = pts[pts > 0].sum(), -pts[pts < 0].sum()
     pf = gw / gl if gl > 0 else np.inf
     lot = LOT.get(symbol.upper(), 65)
-    # Option translation. ATM weekly premium is ~0.45% of the index, measured
-    # 2026-08-07: NIFTY11AUG2624550PE quoted 82.25 against a 24,551 spot, and
-    # the 24600PE filled at 127.50 on a 24,578 spot. An earlier 1.2% guess
-    # tripled the friction and buried every timeframe on its own.
+
+    # Option translation: point value to Rupees via delta and real friction
     prem = t["entry"].mean() * PREMIUM_PCT / 100.0
     cost_rt = (2 * prem * lot) * OPT_COST_PCT / 100.0 + prem * SPREAD_PCT / 100.0 * lot
     rs_per_point = DELTA * lot
+    
+    # 1 lot trade P&L series in Rupees
     rs = pts * rs_per_point - cost_rt
-    eq = pts.cumsum()
-    dd = (eq.cummax() - eq).max()
-    breakeven_pts = cost_rt / rs_per_point
-    # Sized on the standard Rs 2,00,000 research notional, never the live
-    # balance -- see backtesting/config.py for why.
+    
+    # Max Drawdown on 1 lot
+    eq = rs.cumsum()
+    dd_Rs = (eq.cummax() - eq).max()
+    
+    # Sized on standard Rs 2,00,000 research notional
     lots = max(int((BACKTEST_CAPITAL * 0.5) // (prem * lot)), 1)
+    scaled_net = rs.sum() * lots
+    scaled_dd = dd_Rs * lots
+    dd_pct = (scaled_dd / BACKTEST_CAPITAL) * 100.0
+    
+    # Sharpe ratio (Trade)
+    sharpe = (rs.mean() / rs.std() * np.sqrt(len(rs))) if len(rs) > 1 and rs.std() > 0 else 0.0
+    
     print(f"  {label or 'ALL':12s} n={len(t):4d}  win={100*(pts>0).mean():4.1f}%  "
-          f"PF={pf:4.2f}  pts={pts.sum():+8.0f}  avg={pts.mean():+6.1f}  "
-          f"maxDD={dd:6.0f}  | need {breakeven_pts:.1f}pts/trade  "
-          f"1lot Rs={rs.sum():+9,.0f}  "
-          f"{lots}lot={rs.sum() * lots / BACKTEST_CAPITAL * 100:+6.1f}% of 2L")
+          f"PF={pf:4.2f}  net={scaled_net:+8,.0f}  "
+          f"maxDD={scaled_dd:5,.0f} ({dd_pct:4.1f}%)  "
+          f"Sharpe={sharpe:5.2f}  | {lots}lot ({scaled_net / BACKTEST_CAPITAL * 100:+.1f}% of 2L)")
+          
     return {"n": len(t), "pf": pf, "pts": pts.sum(), "rs": rs.sum(),
-            "avg": pts.mean(), "be": breakeven_pts, "lots": lots}
+            "avg": pts.mean(), "lots": lots}
 
 
 def main():

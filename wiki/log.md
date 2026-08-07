@@ -16,9 +16,9 @@ An append-only record of wiki updates, backtests, and VPS operations.
 - Action: archived tail, truncated file (freeing 16G, disk -> 51%), and installed `openalgo-logcap` hourly systemd timer for size-gated copytruncate.
 - Tested: confirmed truncate works on test file.
 
-## [2026-08-07] research | Renko PRO backtest
-- Ported `Doctor_Diven_Smart_Renko_Engine_Pro_Combined.pine` to Python.
-- Backtested NIFTY 5m/15m/30m 2023-2026. Positive in index points (+4.1 at 30m) but loses on option friction.
+## [2026-08-07] research | Renko PRO Index Backtest (RAW)
+- Backtested NIFTY/SENSEX/BANKNIFTY/FINNIFTY under RAW flat-sizing (fixed lot sizes, no stop-based risk sizing) and option friction.
+- Finding: NIFTY 30m is positive (+Rs 315,534 / +157.8%, Sharpe 0.94) but has a maximum drawdown of Rs 314,250 (157.1% of capital) which wipes out the account during the run. All other pairs lose (SENSEX 30m: -Rs 51,702, BANKNIFTY 30m: -Rs 123,230, FINNIFTY 30m: -Rs 315,187). Edge is an artifact of concentration (top 5 of 435 trades are 51% of points) and does not survive cross-symbol validation.
 
 ## [2026-08-07] research | Renko Stock Intraday Backtest (RAW)
 - Backtested the Renko PRO strategy on 5 liquid stocks (RELIANCE, SBIN, HDFCBANK, ICICIBANK, TCS) using 60 days of 15m/30m data.

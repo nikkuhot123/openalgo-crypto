@@ -4,10 +4,11 @@ An append-only record of wiki updates, backtests, and VPS operations.
 
 ---
 
-## [2026-08-07] operations | retired two strategies
-- Stopped `openalgo` service and removed two registrations from `strategy_configs.json` (11 -> 9 remaining).
+## [2026-08-07] operations | retired four strategies
+- Stopped `openalgo` service and removed four registrations from `strategy_configs.json` (11 -> 7 remaining).
 - **Red Bar X-Candle**: Retired. Walk-forward thin edge (1.20) collapsed on unfitted window (1.05); live trade today lost Rs 1,777 at EOD.
 - **Overnight Drift**: Retired. Sizing model requires Rs 52 Lakhs for 1 lot at 0.36 exposure; live balance cannot support it.
+- **HA-EMA 34 Channel** (NIFTY/SENSEX): Retired. Backtest over 264 sessions showed negative expectancy (-5.6 index pts avg per trade, Sharpe -3.82, net Rs -68,928), making option profit structurally impossible.
 
 ## [2026-08-07] operations | contained 16G runaway service log
 - Found `/opt/openalgo/log/openalgo.log` at 16 GB, filling `/` to 86%.

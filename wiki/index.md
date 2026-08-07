@@ -28,3 +28,4 @@ A catalog of everything in the wiki. Updated on every ingestion.
 ## Retired Code
 
 - [[strategies/red_bar_x_candle\|Red Bar X-Candle]]: De-registered on 2026-08-07. Shipped PF 1.05 on unfitted window, EOD trade lost Rs 1,777.
+- [[strategies/ha_ema34_channel\|HA-EMA 34 Channel]]: De-registered on 2026-08-07. NIFTY backtest showed -5.6 index pts avg, Sharpe -3.82, zero directional edge.

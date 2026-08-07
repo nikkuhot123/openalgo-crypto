@@ -109,3 +109,4 @@ harvest_*.db-shm
 harvest_*.db-wal
 backtesting/smc/*.csv
 backtesting/data/*_daily.csv
+backtesting/path_logs/

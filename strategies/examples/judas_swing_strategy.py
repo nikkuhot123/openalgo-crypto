@@ -597,6 +597,44 @@ def _graceful_shutdown(signum, frame):
 signal.signal(signal.SIGINT, _graceful_shutdown)
 signal.signal(signal.SIGTERM, _graceful_shutdown)
 
+
+def log_premium_path(symbol, opt_exchange, active_trade, underlying_ltp, qty, now=None):
+    """Emit one throttled PATH line recording what the position is worth.
+
+    2026-08-07 is the case for it: the 24600PE bought at 127.50 peaked at
+    148.50 (+16.5%) at 14:15 and was flattened at 109.70 (-14.0%) at the 15:10
+    EOD -- a Rs 2,522 give-back -- while SPOT finished 21 points IN FAVOUR.
+    The break-even ratchet armed at 14:12, two minutes before the premium peak,
+    and never fired, because it guards spot and the spot stop was never
+    touched. Nothing watched what the position was actually worth, and once the
+    weekly contract expired the path was unrecoverable: only 4 of 27 round
+    trips could still be replayed.
+
+    INSTRUMENTATION ONLY. It must never be able to disturb an exit, so every
+    failure is swallowed. Returns True only when a line was actually written,
+    which is what makes it testable -- a silent no-op collector would waste the
+    whole collection window before anyone noticed.
+    """
+    global _last_premium_log
+    t = time.time() if now is None else now
+    if t - _last_premium_log < PREMIUM_LOG_SECS:
+        return False
+    _last_premium_log = t
+    try:
+        prem = fetch_option_ltp(symbol, opt_exchange, underlying_ltp=underlying_ltp)
+        entry = (active_trade or {}).get("entry_opt_price")
+        if prem is None or not entry:
+            return False
+        e = float(entry)
+        log.info(
+            f"PATH {symbol} prem={prem:.2f} entry={e:.2f} "
+            f"pct={(prem - e) / e * 100:+.1f}% rs={(prem - e) * qty:+.0f}"
+        )
+        return True
+    except Exception as err:
+        log.debug(f"premium path log failed: {err}")
+        return False
+
 def run_strategy():
     global _active_trade, _opt_exchange, QUANTITY, LOT_SIZE, _last_premium_log
     log.info(f"Starting Autonomous Judas Swing Strategy for {UNDERLYING}...")
@@ -698,29 +736,7 @@ def run_strategy():
                 else:
                     log.info(f"Monitoring Trade: {symbol} | Spot: {underlying_ltp:.2f} | SL: {sl_spot:.2f} | Target: {target_spot:.2f}")
 
-                # Premium path, throttled. 2026-08-07 is the case for it: the
-                # 24600PE bought at 127.50 peaked at 148.50 (+16.5%) at 14:15
-                # and was flattened at 109.70 (-14.0%) at the 15:10 EOD, a
-                # Rs 2,522 give-back -- while SPOT finished 21 points IN FAVOUR.
-                # The break-even ratchet armed at 14:12, two minutes before the
-                # premium peak, and never fired, because it guards spot and the
-                # spot stop was never touched. Nothing here watched what the
-                # position was worth. Instrumentation only: it must never be
-                # able to disturb an exit.
-                if time.time() - _last_premium_log >= PREMIUM_LOG_SECS:
-                    _last_premium_log = time.time()
-                    try:
-                        _prem = fetch_option_ltp(symbol, opt_exchange, underlying_ltp=underlying_ltp)
-                        _entry_prem = active_trade.get("entry_opt_price")
-                        if _prem is not None and _entry_prem:
-                            _ep = float(_entry_prem)
-                            log.info(
-                                f"PATH {symbol} prem={_prem:.2f} entry={_ep:.2f} "
-                                f"pct={(_prem - _ep) / _ep * 100:+.1f}% "
-                                f"rs={(_prem - _ep) * qty:+.0f}"
-                            )
-                    except Exception as _perr:
-                        log.debug(f"premium path log failed: {_perr}")
+                log_premium_path(symbol, opt_exchange, active_trade, underlying_ltp, qty)
 
                 # ---- break-even ratchet -------------------------------------
                 # Measured 2026-08-06 over the 25 live round trips since

@@ -525,6 +525,11 @@ def compute_judas_signal(df_5m, today):
 _shutdown_requested = False
 _active_trade = {}
 _opt_exchange = None
+# Premium-path instrumentation. Judas exits on SPOT only and never looked at
+# what the position was worth, so once the weekly contract expired the path
+# was gone: on 2026-08-07 only 4 of 27 round trips could still be replayed.
+PREMIUM_LOG_SECS = int(os.getenv("PREMIUM_LOG_SECS", "30"))
+_last_premium_log = 0.0
 
 def _graceful_shutdown(signum, frame):
     """Handle Ctrl+C / SIGTERM: close active position, then exit."""
@@ -593,7 +598,7 @@ signal.signal(signal.SIGINT, _graceful_shutdown)
 signal.signal(signal.SIGTERM, _graceful_shutdown)
 
 def run_strategy():
-    global _active_trade, _opt_exchange, QUANTITY, LOT_SIZE
+    global _active_trade, _opt_exchange, QUANTITY, LOT_SIZE, _last_premium_log
     log.info(f"Starting Autonomous Judas Swing Strategy for {UNDERLYING}...")
     log.info(f"OR window ≤ {OR_END} | Sweep ≤ {SWEEP_END} | Entry ≤ {ENTRY_END} | Strike {STRIKE_OFFSET} | RR {RR}")
     idx_exchange = _index_exchange(UNDERLYING)
@@ -692,6 +697,30 @@ def run_strategy():
                     log.info(f"Monitoring (adopted) Trade: {symbol} | Spot: {underlying_ltp:.2f} | EOD-exit-only")
                 else:
                     log.info(f"Monitoring Trade: {symbol} | Spot: {underlying_ltp:.2f} | SL: {sl_spot:.2f} | Target: {target_spot:.2f}")
+
+                # Premium path, throttled. 2026-08-07 is the case for it: the
+                # 24600PE bought at 127.50 peaked at 148.50 (+16.5%) at 14:15
+                # and was flattened at 109.70 (-14.0%) at the 15:10 EOD, a
+                # Rs 2,522 give-back -- while SPOT finished 21 points IN FAVOUR.
+                # The break-even ratchet armed at 14:12, two minutes before the
+                # premium peak, and never fired, because it guards spot and the
+                # spot stop was never touched. Nothing here watched what the
+                # position was worth. Instrumentation only: it must never be
+                # able to disturb an exit.
+                if time.time() - _last_premium_log >= PREMIUM_LOG_SECS:
+                    _last_premium_log = time.time()
+                    try:
+                        _prem = fetch_option_ltp(symbol, opt_exchange, underlying_ltp=underlying_ltp)
+                        _entry_prem = active_trade.get("entry_opt_price")
+                        if _prem is not None and _entry_prem:
+                            _ep = float(_entry_prem)
+                            log.info(
+                                f"PATH {symbol} prem={_prem:.2f} entry={_ep:.2f} "
+                                f"pct={(_prem - _ep) / _ep * 100:+.1f}% "
+                                f"rs={(_prem - _ep) * qty:+.0f}"
+                            )
+                    except Exception as _perr:
+                        log.debug(f"premium path log failed: {_perr}")
 
                 # ---- break-even ratchet -------------------------------------
                 # Measured 2026-08-06 over the 25 live round trips since

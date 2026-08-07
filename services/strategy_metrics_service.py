@@ -383,6 +383,44 @@ def _live_open_positions(api_key, underlying):
 
 # ── public entry point ───────────────────────────────────────────────────────
 
+def _merge_with_archive(live_rows):
+    """Archive today's broker fills, then return archive + live, de-duplicated.
+
+    The broker tradebook is a same-session view; the archive is the only thing
+    that remembers last week. Writing on every read is deliberate -- the UI
+    polling metrics is what keeps the archive current, so history accumulates
+    without a separate daemon. It is idempotent (unique on
+    orderid+action+qty+price), so repeated reads add nothing.
+    """
+    try:
+        from database.strategy_trades_db import archive_trades, fetch_trades
+    except Exception as e:
+        logger.warning(f"trade archive unavailable, history limited to today: {e}")
+        return live_rows
+
+    try:
+        archive_trades([dict(r, source="live") for r in live_rows])
+    except Exception as e:
+        logger.warning(f"trade archive write failed: {e}")
+
+    try:
+        archived = fetch_trades()
+    except Exception as e:
+        logger.warning(f"trade archive read failed: {e}")
+        return live_rows
+
+    seen, merged = set(), []
+    for r in list(archived) + list(live_rows):
+        key = (str(r.get("orderid") or ""), (r.get("action") or "").upper(),
+               int(r.get("qty") or 0), round(float(r.get("price") or 0), 4))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(r)
+    merged.sort(key=lambda r: r["ts"])
+    return merged
+
+
 def get_strategy_metrics(strategy_id, strategy_configs, user_id="nikhil",
                          period="week", api_key=None, trade_limit=50, logs_dir=None):
     """Return {performance, trades, positions, meta} for one strategy_id.
@@ -407,7 +445,11 @@ def get_strategy_metrics(strategy_id, strategy_configs, user_id="nikhil",
         rows = _sandbox_trade_rows(user_id, None)  # pull all for continuous FIFO
         positions = _sandbox_open_positions(user_id, underlying)
     else:
-        rows = _live_trade_rows(api_key, None)
+        # The broker tradebook only serves the CURRENT session, so on its own
+        # every period collapses to today and History renders empty. Archive
+        # whatever it returns, then read the union back: today from the
+        # broker, everything older from the local archive.
+        rows = _merge_with_archive(_live_trade_rows(api_key, None))
         positions = _live_open_positions(api_key, underlying)
 
     round_trips, open_legs = _fifo_round_trips(rows)

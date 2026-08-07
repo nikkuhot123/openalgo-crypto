@@ -19,6 +19,11 @@ An append-only record of wiki updates, backtests, and VPS operations.
 ## [2026-08-07] research | Renko PRO backtest
 - Ported `Doctor_Diven_Smart_Renko_Engine_Pro_Combined.pine` to Python.
 - Backtested NIFTY 5m/15m/30m 2023-2026. Positive in index points (+4.1 at 30m) but loses on option friction.
+
+## [2026-08-07] research | Renko Stock Intraday Backtest
+- Backtested the Renko PRO strategy on 5 liquid stocks (RELIANCE, SBIN, HDFCBANK, ICICIBANK, TCS) using 60 days of 15m/30m data.
+- Modelled 1% risk-sizing with 5x leverage MIS and cash friction (0.035% turnover).
+- Finding: Disastrous results (15m: −78.0% return, 327 trades, PF 0.64; 30m: −20.3% return, 192 trades, PF 0.79). The leverage maxed out due to tight stops, and the lack of a directional edge accelerated losses.
 - Finding: 51% of profits came from 5 trades. Cross-symbol tests (BANKNIFTY, FINNIFTY) failed. Edge is noise.
 
 ## [2026-08-07] research | Judas strike selection

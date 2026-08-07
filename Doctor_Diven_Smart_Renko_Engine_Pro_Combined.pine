@@ -1,0 +1,701 @@
+//@version=5
+// Dr. Devendra Smart Renko Engine - PRO Edition  |  Advanced Red Bar Theory (v7)
+//
+// Brick sizing solved and verified against four PRO Edition screenshots:
+//
+//   symbol      panel ASSET    close        BRICK SIZE    implied
+//   NIFTY 50    NIFTY 50       24,534.45    161.93        0.66%
+//   BANKNIFTY   BANKNIFTY      57,746.45    381.13        0.66%
+//   SENSEX      SENSEX         78,499.17    518.09        0.66%
+//   RELIANCE    STOCKS          1,330.00     26.60        2.00%
+//
+// Rule: every INDEX 0.66%, STOCKS 2.00%. All four exact to the paisa.
+//
+// Auto-Detect buckets by ASSET CLASS, not by ticker - the RELIANCE panel reads
+// "STOCKS". Named index buckets exist so the panel can print "SENSEX" etc.
+// The asset dropdown in the settings string is cosmetic: every frame carried
+// "NIFTY 50" there while the panel correctly reported the real class.
+//
+// The 156 points quoted in the lectures is a rounded example for Nifty at the
+// time of recording, not the mechanism. It is 2.4x too small on BANKNIFTY and
+// 5.9x too large on RELIANCE.
+//
+// HONEST SCOPE NOTE
+// The original product is an INDICATOR: it plots levels, zones and a trend state.
+// It does not fire entry arrows and it has no backtest. The strategy layer here is
+// my mechanical reading of the lectures, not part of the product. Turn
+// "Execute Backtest Trades" off to use this the way the original is used.
+strategy("Dr Devendra Smart Renko Engine PRO", overlay=true, initial_capital=100000, default_qty_type=strategy.fixed, default_qty_value=2, process_orders_on_close=true, commission_type=strategy.commission.cash_per_order, commission_value=20, slippage=2, max_boxes_count=500, max_labels_count=100)
+
+// ==========================================
+// 1. INPUTS
+// ==========================================
+gp_setup = "Mode"
+trade_backtest = input.bool(false, "Execute Backtest Trades", group=gp_setup, tooltip="Default OFF. The original is a levels indicator; the strategy layer is a mechanical interpretation and has not demonstrated an edge.")
+square_off_eod = input.bool(true, "Square Off At Session End", group=gp_setup)
+show_panel = input.bool(true, "Show Engine Panel", group=gp_setup)
+highlight_qualified = input.bool(false, "Highlight Qualified Red Bars", group=gp_setup, tooltip="Diagnostic aid. Off by default: on a busy chart it stripes the background and buries the price action.")
+
+gp_renko = "Renko Engine"
+show_renko = input.bool(true, "Show Renko Lattice", group=gp_renko)
+brick_mode = input.string("Percentage (Auto)", "Brick Size Mode", options=["Percentage (Auto)", "Percentage (Manual)", "ATR", "Fixed Points"], group=gp_renko, tooltip="Auto reproduces the PRO Edition Auto-Detect: it buckets the symbol by ASSET CLASS and applies that class percentage.")
+pct_nifty = input.float(0.66, "  NIFTY 50 Brick %", minval=0.01, step=0.01, group=gp_renko, tooltip="Verified: 24534.45 x 0.66% = 161.93")
+pct_banknifty = input.float(0.66, "  BANKNIFTY Brick %", minval=0.01, step=0.01, group=gp_renko, tooltip="Verified: 57746.45 x 0.66% = 381.13")
+pct_sensex = input.float(0.66, "  SENSEX Brick %", minval=0.01, step=0.01, group=gp_renko, tooltip="Verified: 78499.17 x 0.66% = 518.09")
+pct_index_other = input.float(0.66, "  Other Index Brick %", minval=0.01, step=0.01, group=gp_renko, tooltip="Finnifty / Midcap / commodities unsampled, but all three sampled indices agree at 0.66%.")
+pct_stocks = input.float(2.00, "  Stocks Brick %", minval=0.01, step=0.01, group=gp_renko, tooltip="Verified: RELIANCE 1330.00 x 2.00% = 26.60")
+brick_pct = input.float(0.66, "Manual Brick Percentage (%)", minval=0.01, step=0.01, group=gp_renko)
+brick_atr_len = input.int(50, "ATR Length", minval=1, group=gp_renko)
+brick_atr_mult = input.float(1.0, "ATR Multiplier", minval=0.1, step=0.1, group=gp_renko)
+brick_fixed_pts = input.float(156.0, "Fixed Brick (Points)", minval=0.05, group=gp_renko)
+
+gp_quality = "Signal Quality (strategy layer only)"
+require_level_confluence = input.bool(true, "Red Bar Must Sit On A Structural Level", group=gp_quality)
+level_tol_pts = input.float(8.0, "Level Confluence Tolerance (Points)", minval=0.05, group=gp_quality)
+confluence_use_body = input.bool(true, "Measure Confluence From Candle Body", group=gp_quality)
+conf_use_cpr = input.bool(true, "Count CPR Levels", group=gp_quality)
+conf_use_gap = input.bool(true, "Count Gap Levels", group=gp_quality)
+conf_use_inst = input.bool(true, "Count Institutional Zone", group=gp_quality)
+conf_use_x = input.bool(true, "Count X Candle Levels", group=gp_quality)
+conf_use_aft = input.bool(true, "Count Afternoon Levels", group=gp_quality)
+conf_use_renko = input.bool(false, "Count Renko Lattice", group=gp_quality)
+conf_use_ema = input.bool(false, "Count Slow EMA", group=gp_quality)
+require_room = input.bool(true, "Require Room To The Structural Target", group=gp_quality)
+min_target_r = input.float(2.0, "Minimum Room (R multiples)", minval=0.1, group=gp_quality)
+one_shot_levels = input.bool(true, "Trade Each Red Bar Level Only Once", group=gp_quality)
+max_trades_per_day = input.int(3, "Max Trades Per Day", minval=1, maxval=20, group=gp_quality)
+cooldown_bars = input.int(6, "Cooldown Bars After A Loss", minval=0, group=gp_quality)
+skip_inside_x_band = input.bool(true, "No Entries Inside X 44-56 Band", group=gp_quality)
+skip_inside_cpr = input.bool(true, "No Entries Inside CPR", group=gp_quality)
+
+gp_diag = "Edge Diagnostic"
+show_diagnostic = input.bool(true, "Show Edge Diagnostic Table", group=gp_diag)
+fwd_bars = input.int(12, "Forward Window (bars)", minval=1, maxval=200, group=gp_diag)
+
+gp_strategy = "Trade Management"
+use_call_signals = input.bool(true, "Enable CALL Signals (Long)", group=gp_strategy)
+use_put_signals = input.bool(true, "Enable PUT Signals (Short)", group=gp_strategy)
+stop_loss_type = input.string("Previous Candle Low/High", "Stop Loss Type", options=["Previous Candle Low/High", "Red Bar Opposite Side", "Fixed Points"], group=gp_strategy)
+sl_points = input.float(30.0, "Fixed / Fallback SL Points", minval=0.05, group=gp_strategy)
+target_mode = input.string("Structure", "Target Mode", options=["Structure", "Fixed R:R", "Trail Slow EMA"], group=gp_strategy)
+target_1_rr = input.float(1.5, "Target 1 R:R (books 50%)", minval=0.1, group=gp_strategy)
+target_2_rr = input.float(4.0, "Target 2 R:R (Fixed R:R mode)", minval=0.1, group=gp_strategy)
+trail_to_breakeven = input.bool(false, "Move SL To Breakeven After Target 1", group=gp_strategy)
+
+gp_x = "First Candle (X Candle)"
+show_x_levels = input.bool(true, "Show X Levels", group=gp_x)
+filter_signals_with_x = input.bool(true, "Filter Signals With X Levels", group=gp_x)
+x_color_high_low = input.color(color.blue, "X High/Low Color", group=gp_x)
+x_color_mid = input.color(color.orange, "X Median (50%) Color", group=gp_x)
+x_color_buffer = input.color(color.gray, "X Buffer (44%/56%) Color", group=gp_x)
+
+gp_gap = "Gap Fibonacci Levels"
+show_gap_levels = input.bool(true, "Show Gap Levels", group=gp_gap)
+filter_signals_with_gap = input.bool(true, "Filter Signals With Gap Levels", group=gp_gap)
+gap_color_near = input.color(color.red, "Gap Near (44%) Color", group=gp_gap)
+gap_color_mid = input.color(color.yellow, "Gap Mid (50%) Color", group=gp_gap)
+gap_color_far = input.color(color.green, "Gap Far (56%) Color", group=gp_gap)
+
+gp_inst = "Institutional Zones"
+show_inst_zone = input.bool(true, "Show Institutional Zone", group=gp_inst)
+inst_bars_count = input.int(3, "End-Of-Day Bars", minval=1, maxval=50, group=gp_inst)
+inst_color = input.color(color.purple, "Institutional Zone Color", group=gp_inst)
+show_next_day_zone = input.bool(true, "Project Next Day Institutional Zone", group=gp_inst, tooltip="The PRO Edition labels these 'Next Day Inst. Zone' on the right edge.")
+eod_start_hhmm = input.int(1515, "EOD Window Start (HHMM)", minval=0, maxval=2359, group=gp_inst, tooltip="1515 = last 15 minutes of the NSE session.")
+
+gp_ema = "Trend Cloud"
+show_ema = input.bool(true, "Show EMA Cloud", group=gp_ema)
+ema_fast_len = input.int(10, "Fast EMA Length", minval=1, group=gp_ema)
+ema_slow_len = input.int(30, "Slow EMA Length (Mean)", minval=1, group=gp_ema)
+filter_signals_with_ema = input.bool(true, "Filter Signals With Slow EMA", group=gp_ema)
+
+gp_aft = "Afternoon Session (12:45-13:15)"
+show_aft_levels = input.bool(true, "Show Afternoon Levels", group=gp_aft)
+trade_afternoon_range = input.bool(true, "Enable Afternoon Breakout Triggers", group=gp_aft)
+aft_tz = input.string("GMT+5:30", "Exchange Timezone", group=gp_aft)
+
+gp_signals = "Red Bar Signals"
+put_trigger_mode = input.string("Red Bar 50%", "PUT Trigger", options=["Red Bar 50%", "Red Bar Low", "Either"], group=gp_signals)
+color_call_sig = input.color(color.green, "Call Signal Color", group=gp_signals)
+color_put_sig = input.color(color.red, "Put Signal Color", group=gp_signals)
+label_signals = input.bool(true, "Label Signals BUY / SELL", group=gp_signals, tooltip="Off reverts to plain triangles.")
+
+// ==========================================
+// 2. DAY STATE & DAILY REFERENCE DATA
+// ==========================================
+is_new_day = timeframe.isintraday and ta.change(time("D")) != 0
+is_session_end = timeframe.isintraday and session.islastbar
+
+[pdh, pdl, pdc] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+day_open = request.security(syminfo.tickerid, "D", open, lookahead=barmerge.lookahead_on)
+
+mins_of_day = hour(time, aft_tz) * 60 + minute(time, aft_tz)
+
+// ==========================================
+// 3. RENKO BRICK SIZE
+// ==========================================
+// Held constant for the session. A brick that changes every bar would make the
+// lattice jitter and would contradict the single BRICK SIZE the panel reports.
+// Auto-Detect buckets the symbol into an ASSET CLASS and applies that class's
+// percentage. Verified on four symbols:
+//
+//   NIFTY 50   161.93 / 24,534.45 = 0.66%     BANKNIFTY  381.13 / 57,746.45 = 0.66%
+//   SENSEX     518.09 / 78,499.17 = 0.66%     RELIANCE    26.60 /  1,330.00 = 2.00%
+//
+// The rule is simply: every INDEX 0.66%, STOCKS 2.00%. The named buckets exist
+// so the panel can print "SENSEX" rather than a generic class. Evidence that it
+// IS a class and not a ticker: the RELIANCE panel reads "STOCKS".
+// BANKNIFTY is tested before NIFTY because its ticker contains "NIFTY".
+asset_class = str.contains(syminfo.ticker, "BANKNIFTY") ? "BANKNIFTY" : str.contains(syminfo.ticker, "NIFTY") ? "NIFTY 50" : str.contains(syminfo.ticker, "SENSEX") ? "SENSEX" : syminfo.type == "index" ? "INDEX" : "STOCKS"
+auto_pct = asset_class == "BANKNIFTY" ? pct_banknifty : asset_class == "NIFTY 50" ? pct_nifty : asset_class == "SENSEX" ? pct_sensex : asset_class == "INDEX" ? pct_index_other : pct_stocks
+
+atr_for_brick = ta.atr(brick_atr_len)
+// Brick tracks the live close, matching the PRO panel: its NIFTY frame read
+// 161.93 against a 24,534.45 close, i.e. recomputed continuously, not frozen
+// at the session open.
+brick_size = math.max(brick_mode == "Percentage (Auto)" ? close * auto_pct / 100.0 : brick_mode == "Percentage (Manual)" ? close * brick_pct / 100.0 : brick_mode == "ATR" ? atr_for_brick * brick_atr_mult : brick_fixed_pts, syminfo.mintick)
+
+// True sequential Renko, not a floor() lattice.
+//
+// floor(close/brick)*brick was wrong: with a brick that tracks price, a small
+// brick change multiplies by the ~151 bricks between zero and Nifty, jumping
+// every lattice line by tens of points per bar. A real Renko chain anchors to
+// the last completed brick and steps only in whole bricks, so a drifting brick
+// size changes the NEXT step by a rupee or two and never rewrites history.
+var float renko_base = na
+var int renko_dir = 0
+
+if na(renko_base)
+    renko_base := close
+else if close >= renko_base + brick_size
+    renko_base := renko_base + math.floor((close - renko_base) / brick_size) * brick_size
+    renko_dir := 1
+else if close <= renko_base - brick_size
+    renko_base := renko_base - math.floor((renko_base - close) / brick_size) * brick_size
+    renko_dir := -1
+
+// Next boundary in each direction: what the range theory calls the room available.
+renko_floor = renko_base - brick_size
+renko_ceil = renko_base + brick_size
+
+plot(show_renko ? renko_base : na, "Renko Level", color=color.new(color.blue, 20), style=plot.style_stepline, linewidth=2)
+plot(show_renko ? renko_ceil : na, "Renko Up Boundary", color=color.new(color.blue, 60), style=plot.style_stepline, linewidth=1)
+plot(show_renko ? renko_floor : na, "Renko Down Boundary", color=color.new(color.blue, 60), style=plot.style_stepline, linewidth=1)
+
+// ==========================================
+// 4. FIRST CANDLE (X CANDLE) LEVELS
+// ==========================================
+var float x_high = na
+var float x_low = na
+var float x_median = na
+var float x_level_56 = na
+var float x_level_44 = na
+
+if is_new_day
+    x_high := high
+    x_low := low
+    x_median := (x_high + x_low) / 2.0
+    x_level_56 := x_low + 0.56 * (x_high - x_low)
+    x_level_44 := x_low + 0.44 * (x_high - x_low)
+
+// The 44-56 buffer renders as a filled band, matching the grey zone on the
+// PRO Edition charts, not as three naked lines.
+plot(show_x_levels ? x_high : na, "X High", color=x_color_high_low, style=plot.style_stepline, linewidth=1)
+plot(show_x_levels ? x_low : na, "X Low", color=x_color_high_low, style=plot.style_stepline, linewidth=1)
+plot(show_x_levels ? x_median : na, "X Median (50%)", color=x_color_mid, style=plot.style_stepline, linewidth=1)
+p_x56 = plot(show_x_levels ? x_level_56 : na, "X Upper (56%)", color=x_color_buffer, style=plot.style_stepline, linewidth=1)
+p_x44 = plot(show_x_levels ? x_level_44 : na, "X Lower (44%)", color=x_color_buffer, style=plot.style_stepline, linewidth=1)
+fill(p_x56, p_x44, color=color.new(x_color_buffer, 88), title="X Buffer Band")
+
+// ==========================================
+// 5. CENTRAL PIVOT RANGE (CPR)
+// ==========================================
+cpp = (pdh + pdl + pdc) / 3.0
+bc = (pdh + pdl) / 2.0
+tc = 2.0 * cpp - bc
+cpr_top = math.max(tc, bc)
+cpr_bottom = math.min(tc, bc)
+
+plot(cpp, "CPR Pivot (CPP)", color=color.blue, style=plot.style_circles, linewidth=1)
+plot(cpr_top, "CPR Top", color=color.teal, style=plot.style_circles, linewidth=1)
+plot(cpr_bottom, "CPR Bottom", color=color.teal, style=plot.style_circles, linewidth=1)
+
+// ==========================================
+// 6. GAP FIBONACCI LEVELS
+// ==========================================
+gap_size = math.abs(day_open - pdc)
+is_gap_up = day_open > pdc
+is_gap_down = day_open < pdc
+gap_dir = is_gap_down ? 1.0 : -1.0
+
+has_gap = gap_size > 0 and not na(pdc)
+gap_near = has_gap ? day_open + gap_dir * 0.44 * gap_size : na
+gap_mid = has_gap ? day_open + gap_dir * 0.50 * gap_size : na
+gap_far = has_gap ? day_open + gap_dir * 0.56 * gap_size : na
+
+// Same treatment: the gap triplet reads as a filled band on the PRO charts.
+p_gap_near = plot(show_gap_levels ? gap_near : na, "Gap Near (44%)", color=gap_color_near, style=plot.style_stepline, linewidth=1)
+plot(show_gap_levels ? gap_mid : na, "Gap Mid (50%)", color=gap_color_mid, style=plot.style_stepline, linewidth=1)
+p_gap_far = plot(show_gap_levels ? gap_far : na, "Gap Far (56%)", color=gap_color_far, style=plot.style_stepline, linewidth=1)
+fill(p_gap_near, p_gap_far, color=color.new(color.red, 90), title="Gap Band")
+
+// ==========================================
+// 7. INSTITUTIONAL ZONES
+// ==========================================
+// Today's active zone: carried from the previous session's closing bars.
+var float inst_zone_high = na
+var float inst_zone_low = na
+
+if is_new_day
+    float max_h = high[1]
+    float min_l = low[1]
+    for i = 1 to inst_bars_count
+        max_h := math.max(max_h, high[i])
+        min_l := math.min(min_l, low[i])
+    inst_zone_high := max_h
+    inst_zone_low := min_l
+
+plot(show_inst_zone ? inst_zone_high : na, "Inst Zone High", color=inst_color, style=plot.style_stepline, linewidth=2)
+plot(show_inst_zone ? inst_zone_low : na, "Inst Zone Low", color=inst_color, style=plot.style_stepline, linewidth=2)
+
+var box inst_box = na
+if is_new_day and show_inst_zone and not na(inst_zone_high)
+    inst_box := box.new(left=bar_index, top=inst_zone_high, right=bar_index, bottom=inst_zone_low, bgcolor=color.new(inst_color, 90), border_color=color.new(inst_color, 50), border_style=line.style_dotted)
+if not is_new_day and not na(inst_box)
+    box.set_right(inst_box, bar_index)
+
+var label inst_label = na
+if show_inst_zone and not na(inst_zone_high) and barstate.islast
+    if not na(inst_label)
+        label.delete(inst_label)
+    inst_label := label.new(bar_index, inst_zone_high, "Institutional Zone", style=label.style_none, textcolor=inst_color, size=size.small)
+
+// Tomorrow's zone, forming live in the closing window of the current session.
+eod_start_mins = (eod_start_hhmm / 100) * 60 + (eod_start_hhmm % 100)
+in_eod_window = timeframe.isintraday and mins_of_day >= eod_start_mins
+
+var float nd_zone_high = na
+var float nd_zone_low = na
+
+if is_new_day
+    nd_zone_high := na
+    nd_zone_low := na
+if in_eod_window
+    nd_zone_high := na(nd_zone_high) ? high : math.max(nd_zone_high, high)
+    nd_zone_low := na(nd_zone_low) ? low : math.min(nd_zone_low, low)
+
+plot(show_next_day_zone ? nd_zone_high : na, "Next Day Inst. Zone High", color=color.new(inst_color, 25), style=plot.style_linebr, linewidth=1)
+plot(show_next_day_zone ? nd_zone_low : na, "Next Day Inst. Zone Low", color=color.new(inst_color, 25), style=plot.style_linebr, linewidth=1)
+
+var label nd_label_hi = na
+var label nd_label_lo = na
+if show_next_day_zone and barstate.islast and not na(nd_zone_high)
+    if not na(nd_label_hi)
+        label.delete(nd_label_hi)
+    if not na(nd_label_lo)
+        label.delete(nd_label_lo)
+    nd_label_hi := label.new(bar_index, nd_zone_high, "Next Day Inst. Zone", style=label.style_none, textcolor=inst_color, size=size.tiny)
+    nd_label_lo := label.new(bar_index, nd_zone_low, "Next Day Inst. Zone", style=label.style_none, textcolor=inst_color, size=size.tiny)
+
+// ==========================================
+// 8. TREND CLOUD
+// ==========================================
+ema_fast = ta.ema(close, ema_fast_len)
+ema_slow = ta.ema(close, ema_slow_len)
+
+// Colour assignment read off the PRO charts: during a downtrend the DARK line
+// sits below the GREEN one, and the dark line crosses above when trend flips
+// (BANKNIFTY, 14:00-14:45). Dark is therefore the fast leg, green the slow.
+p_fast = plot(show_ema ? ema_fast : na, "Fast EMA", color=color.new(#1a1a2e, 10), linewidth=1)
+p_slow = plot(show_ema ? ema_slow : na, "Slow EMA (Mean)", color=color.new(color.green, 20), linewidth=1)
+fill(p_fast, p_slow, color=ema_fast > ema_slow ? color.new(color.green, 85) : color.new(color.red, 85), title="Trend Cloud")
+
+// Trend state: Renko direction leads, EMA structure breaks the tie.
+trend_up = renko_dir == 1 or (renko_dir == 0 and ema_fast > ema_slow)
+trend_txt = renko_dir == 1 ? "Uptrend" : renko_dir == -1 ? "Downtrend" : ema_fast > ema_slow ? "Uptrend" : "Downtrend"
+
+// ==========================================
+// 9. AFTERNOON SESSION (12:45-13:15)
+// ==========================================
+in_aft_window = mins_of_day >= (12 * 60 + 45) and mins_of_day < (13 * 60 + 15)
+
+var float aft_high = na
+var float aft_low = na
+var float aft_level_44 = na
+var float aft_level_56 = na
+var bool aft_levels_set = false
+var bool aft_used = false
+
+if is_new_day
+    aft_high := na
+    aft_low := na
+    aft_level_44 := na
+    aft_level_56 := na
+    aft_levels_set := false
+    aft_used := false
+
+if in_aft_window
+    aft_high := na(aft_high) ? high : math.max(aft_high, high)
+    aft_low := na(aft_low) ? low : math.min(aft_low, low)
+
+if not in_aft_window and in_aft_window[1] and not aft_levels_set and not na(aft_high)
+    aft_level_44 := aft_low + 0.44 * (aft_high - aft_low)
+    aft_level_56 := aft_low + 0.56 * (aft_high - aft_low)
+    aft_levels_set := true
+
+plot(show_aft_levels and aft_levels_set ? aft_level_44 : na, "Afternoon 44%", color=color.orange, style=plot.style_stepline, linewidth=1)
+plot(show_aft_levels and aft_levels_set ? aft_level_56 : na, "Afternoon 56%", color=color.orange, style=plot.style_stepline, linewidth=1)
+
+var box aft_box = na
+if in_aft_window and show_aft_levels
+    if not in_aft_window[1]
+        aft_box := box.new(left=bar_index, top=high, right=bar_index, bottom=low, bgcolor=color.new(color.orange, 92), border_color=color.orange)
+    else if not na(aft_box)
+        box.set_top(aft_box, math.max(box.get_top(aft_box), high))
+        box.set_bottom(aft_box, math.min(box.get_bottom(aft_box), low))
+        box.set_right(aft_box, bar_index)
+if not in_aft_window and not na(aft_box) and aft_levels_set
+    box.set_right(aft_box, bar_index)
+
+// ==========================================
+// 10. RED BAR THEORY SIGNALS
+// ==========================================
+touches_bar(lvl) =>
+    float lo = confluence_use_body ? math.min(open, close) : low
+    float hi = confluence_use_body ? math.max(open, close) : high
+    not na(lvl) and lvl >= lo - level_tol_pts and lvl <= hi + level_tol_pts
+
+conf_cpr = conf_use_cpr and (touches_bar(cpp) or touches_bar(cpr_top) or touches_bar(cpr_bottom))
+conf_gap = conf_use_gap and (touches_bar(gap_near) or touches_bar(gap_mid) or touches_bar(gap_far))
+conf_inst = conf_use_inst and (touches_bar(inst_zone_high) or touches_bar(inst_zone_low))
+conf_x = conf_use_x and (touches_bar(x_high) or touches_bar(x_low) or touches_bar(x_median) or touches_bar(x_level_56) or touches_bar(x_level_44))
+conf_aft = conf_use_aft and (touches_bar(aft_level_44) or touches_bar(aft_level_56))
+conf_renko = conf_use_renko and (touches_bar(renko_floor) or touches_bar(renko_ceil))
+conf_ema = conf_use_ema and touches_bar(ema_slow)
+
+red_at_level = conf_cpr or conf_gap or conf_inst or conf_x or conf_aft or conf_renko or conf_ema
+
+is_red_bar = close < open and not is_new_day
+
+var float red_high = na
+var float red_low = na
+var float red_median = na
+var bool red_qualified = false
+var bool red_used = false
+
+if is_new_day
+    red_high := na
+    red_low := na
+    red_median := na
+    red_qualified := false
+    red_used := false
+
+if is_red_bar
+    red_high := high
+    red_low := low
+    red_median := (high + low) / 2.0
+    red_qualified := not require_level_confluence or red_at_level
+    red_used := false
+
+plot(red_high, "Red Bar High", color=color.new(color.red, 40), style=plot.style_stepline, linewidth=1)
+plot(red_median, "Red Bar 50%", color=color.new(color.orange, 40), style=plot.style_stepline, linewidth=1)
+plot(red_low, "Red Bar Low", color=color.new(color.maroon, 55), style=plot.style_stepline, linewidth=1)
+bgcolor(highlight_qualified and is_red_bar and red_qualified ? color.new(color.orange, 88) : na, title="Qualified Red Bar")
+
+call_trigger = ta.crossover(close, red_high)
+break_median = ta.crossunder(close, red_median)
+break_low = ta.crossunder(close, red_low)
+put_trigger = put_trigger_mode == "Red Bar 50%" ? break_median : put_trigger_mode == "Red Bar Low" ? break_low : break_median or break_low
+
+red_ready = red_qualified and (not one_shot_levels or not red_used)
+aft_ready = trade_afternoon_range and aft_levels_set and (not one_shot_levels or not aft_used)
+
+aft_call_trigger = aft_ready and ta.crossover(close, aft_level_56)
+aft_put_trigger = aft_ready and ta.crossunder(close, aft_level_44)
+
+long_trigger = (call_trigger and red_ready) or aft_call_trigger
+short_trigger = (put_trigger and red_ready) or aft_put_trigger
+
+long_filter = true
+if filter_signals_with_x and not na(x_level_56)
+    long_filter := long_filter and close > x_level_56
+if filter_signals_with_gap and is_gap_down and not na(gap_far)
+    long_filter := long_filter and close > gap_far
+if filter_signals_with_ema
+    long_filter := long_filter and close > ema_slow
+
+short_filter = true
+if filter_signals_with_x and not na(x_level_44)
+    short_filter := short_filter and close < x_level_44
+if filter_signals_with_gap and is_gap_up and not na(gap_far)
+    short_filter := short_filter and close < gap_far
+if filter_signals_with_ema
+    short_filter := short_filter and close < ema_slow
+
+in_x_band = not na(x_level_44) and not na(x_level_56) and close >= x_level_44 and close <= x_level_56
+in_cpr = not na(cpr_top) and not na(cpr_bottom) and close <= cpr_top and close >= cpr_bottom
+zone_ok = (not skip_inside_x_band or not in_x_band) and (not skip_inside_cpr or not in_cpr)
+
+// Room check mirrors what section 12 does at fill time.
+est_sl_long = stop_loss_type == "Previous Candle Low/High" ? low[1] : stop_loss_type == "Red Bar Opposite Side" ? red_low : close - sl_points
+est_sl_short = stop_loss_type == "Previous Candle Low/High" ? high[1] : stop_loss_type == "Red Bar Opposite Side" ? red_high : close + sl_points
+valid_sl_long = not na(est_sl_long) and est_sl_long < close
+valid_sl_short = not na(est_sl_short) and est_sl_short > close
+est_risk_long = valid_sl_long ? close - est_sl_long : sl_points
+est_risk_short = valid_sl_short ? est_sl_short - close : sl_points
+eff_target_long = renko_ceil < close + target_1_rr * est_risk_long ? renko_ceil + brick_size : renko_ceil
+eff_target_short = renko_floor > close - target_1_rr * est_risk_short ? renko_floor - brick_size : renko_floor
+room_long_ok = not require_room or (eff_target_long - close) >= min_target_r * est_risk_long
+room_short_ok = not require_room or (close - eff_target_short) >= min_target_r * est_risk_short
+
+long_signal = use_call_signals and long_trigger and long_filter and zone_ok and room_long_ok
+short_signal = use_put_signals and short_trigger and short_filter and zone_ok and room_short_ok
+
+if long_signal or short_signal
+    red_used := true
+    if aft_call_trigger or aft_put_trigger
+        aft_used := true
+
+// Labelled rather than bare triangles: on a busy chart a small triangle is easy
+// to miss, and an empty side then reads as "the script is broken" when it is
+// actually the trend filter doing its job.
+plotshape(long_signal and label_signals, "CALL BUY", style=shape.labelup, location=location.belowbar, color=color_call_sig, textcolor=color.white, text="BUY", size=size.small)
+plotshape(short_signal and label_signals, "PUT BUY", style=shape.labeldown, location=location.abovebar, color=color_put_sig, textcolor=color.white, text="SELL", size=size.small)
+plotshape(long_signal and not label_signals, "Call Buy Triangle", style=shape.triangleup, location=location.belowbar, color=color_call_sig, size=size.small)
+plotshape(short_signal and not label_signals, "Put Buy Triangle", style=shape.triangledown, location=location.abovebar, color=color_put_sig, size=size.small)
+
+alertcondition(long_signal and barstate.isconfirmed, "CALL Buy Signal", "Red Bar high taken out at a level. Bullish trigger.")
+alertcondition(short_signal and barstate.isconfirmed, "PUT Buy Signal", "Red Bar broken down at a level. Bearish trigger.")
+
+// ==========================================
+// 11. ENGINE PANEL
+// ==========================================
+// Today's signal tally. Without it, a day with no longs looks like a broken
+// script instead of a trend filter correctly refusing to buy a downtrend.
+var int sig_long_today = 0
+var int sig_short_today = 0
+if is_new_day
+    sig_long_today := 0
+    sig_short_today := 0
+if long_signal
+    sig_long_today := sig_long_today + 1
+if short_signal
+    sig_short_today := sig_short_today + 1
+
+var table panel = table.new(position.top_right, 2, 6, border_width=1, frame_width=1, frame_color=color.gray)
+
+if show_panel and barstate.islast
+    color trend_col = trend_txt == "Uptrend" ? color.new(color.green, 20) : color.new(color.red, 20)
+    table.cell(panel, 0, 0, "ASSET", bgcolor=color.new(color.gray, 30), text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 0, asset_class, text_color=color.white, bgcolor=color.new(color.blue, 60), text_size=size.small)
+    table.cell(panel, 0, 1, "BRICK SIZE", bgcolor=color.new(color.gray, 30), text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 1, str.tostring(brick_size, "#.##") + (brick_mode == "Percentage (Auto)" ? "  (" + str.tostring(auto_pct, "#.##") + "%)" : ""), text_color=color.white, bgcolor=color.new(color.blue, 60), text_size=size.small)
+    table.cell(panel, 0, 2, "ENGINE", bgcolor=color.new(color.gray, 30), text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 2, "PRO Edition", text_color=color.white, bgcolor=color.new(color.blue, 60), text_size=size.small)
+    table.cell(panel, 0, 3, "TREND", bgcolor=color.new(color.gray, 30), text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 3, trend_txt, text_color=color.white, bgcolor=trend_col, text_size=size.small)
+    table.cell(panel, 0, 4, "MODE", bgcolor=color.new(color.gray, 30), text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 4, trade_backtest ? "Backtest ON" : "Indicator", text_color=color.white, bgcolor=color.new(color.blue, 60), text_size=size.small)
+    table.cell(panel, 0, 5, "SIGNALS TODAY", bgcolor=color.new(color.gray, 30), text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 5, "BUY " + str.tostring(sig_long_today) + "   SELL " + str.tostring(sig_short_today), text_color=color.white, bgcolor=color.new(color.blue, 60), text_size=size.small)
+
+// ==========================================
+// 12. TRADE EXECUTION (BACKTEST ONLY)
+// ==========================================
+var float entry_price = na
+var float sl_price = na
+var float t1_price = na
+var float t2_price = na
+var float pending_sl = na
+var float init_qty = na
+var float equity_at_entry = na
+var bool levels_ready = false
+var bool t1_filled = false
+var int trades_today = 0
+var int last_exit_bar = na
+var bool last_was_loss = false
+
+if is_new_day
+    trades_today := 0
+
+is_flat = strategy.position_size == 0
+
+if is_flat and not is_flat[1]
+    last_exit_bar := bar_index
+    last_was_loss := not na(equity_at_entry) and strategy.equity < equity_at_entry
+
+if is_flat
+    entry_price := na
+    sl_price := na
+    t1_price := na
+    t2_price := na
+    init_qty := na
+    levels_ready := false
+    t1_filled := false
+
+cooldown_ok = na(last_exit_bar) or not last_was_loss or (bar_index - last_exit_bar) >= cooldown_bars
+
+if trade_backtest
+    block_entry = (square_off_eod and is_session_end) or trades_today >= max_trades_per_day or not cooldown_ok
+
+    if is_flat and not block_entry and long_signal
+        pending_sl := est_sl_long
+        equity_at_entry := strategy.equity
+        trades_today := trades_today + 1
+        strategy.entry("Call Buy", strategy.long)
+    else if is_flat and not block_entry and short_signal
+        pending_sl := est_sl_short
+        equity_at_entry := strategy.equity
+        trades_today := trades_today + 1
+        strategy.entry("Put Buy", strategy.short)
+
+    if strategy.position_size != 0 and not levels_ready
+        entry_price := strategy.position_avg_price
+        init_qty := math.abs(strategy.position_size)
+        bool is_long = strategy.position_size > 0
+        float raw_sl = stop_loss_type == "Fixed Points" ? (is_long ? entry_price - sl_points : entry_price + sl_points) : pending_sl
+        if is_long and (na(raw_sl) or raw_sl >= entry_price)
+            raw_sl := entry_price - sl_points
+        if not is_long and (na(raw_sl) or raw_sl <= entry_price)
+            raw_sl := entry_price + sl_points
+        sl_price := raw_sl
+        float risk = math.abs(entry_price - sl_price)
+        t1_price := is_long ? entry_price + risk * target_1_rr : entry_price - risk * target_1_rr
+
+        if target_mode == "Fixed R:R"
+            t2_price := is_long ? entry_price + risk * target_2_rr : entry_price - risk * target_2_rr
+        else if target_mode == "Structure"
+            float struct_t = is_long ? renko_ceil : renko_floor
+            if is_long and struct_t < t1_price
+                struct_t := struct_t + brick_size
+            if not is_long and struct_t > t1_price
+                struct_t := struct_t - brick_size
+            t2_price := struct_t
+        else
+            t2_price := na
+        levels_ready := true
+
+    if levels_ready and not t1_filled and not na(init_qty) and math.abs(strategy.position_size) < init_qty * 0.99
+        t1_filled := true
+
+    if levels_ready and strategy.position_size != 0
+        float runner_sl = t1_filled and trail_to_breakeven ? entry_price : sl_price
+        if strategy.position_size > 0
+            if not t1_filled
+                strategy.exit("Call T1", "Call Buy", qty_percent=50, limit=t1_price, stop=sl_price)
+            strategy.exit("Call T2", "Call Buy", limit=t2_price, stop=runner_sl)
+        else
+            if not t1_filled
+                strategy.exit("Put T1", "Put Buy", qty_percent=50, limit=t1_price, stop=sl_price)
+            strategy.exit("Put T2", "Put Buy", limit=t2_price, stop=runner_sl)
+
+    if target_mode == "Trail Slow EMA" and t1_filled
+        if strategy.position_size > 0 and ta.crossunder(close, ema_slow)
+            strategy.close("Call Buy", "EMA trail exit")
+        if strategy.position_size < 0 and ta.crossover(close, ema_slow)
+            strategy.close("Put Buy", "EMA trail exit")
+
+    if square_off_eod and is_session_end and strategy.position_size != 0
+        strategy.close_all("EOD Square-off")
+
+plot(trade_backtest and levels_ready ? sl_price : na, "Active Stop Loss", color=color.red, style=plot.style_linebr, linewidth=1)
+plot(trade_backtest and levels_ready ? t1_price : na, "Active Target 1", color=color.green, style=plot.style_linebr, linewidth=1)
+plot(trade_backtest and levels_ready ? t2_price : na, "Active Target 2", color=color.blue, style=plot.style_linebr, linewidth=1)
+
+// ==========================================
+// 13. EDGE DIAGNOSTIC
+// ==========================================
+// Does price travel further in the signalled direction than against it?
+// No stops, no targets, no commission, no look-ahead.
+//
+// Two limitations, so nobody over-reads the table:
+//   1. MFE/MAE is ORDER-BLIND. A setup can show MFE > MAE and still lose every
+//      time if the adverse leg lands first. "avg Return" is the tiebreaker.
+//   2. N below ~100 means nothing. The table flags it rather than pretend.
+var int diag_long_n = 0
+var int diag_short_n = 0
+var float diag_long_mfe = 0.0
+var float diag_long_mae = 0.0
+var float diag_long_ret = 0.0
+var float diag_short_mfe = 0.0
+var float diag_short_mae = 0.0
+var float diag_short_ret = 0.0
+var int diag_long_win = 0
+var int diag_short_win = 0
+
+fwd_high = ta.highest(high, fwd_bars)
+fwd_low = ta.lowest(low, fwd_bars)
+
+// A window straddling the overnight gap measures a move this intraday system
+// squares off before it happens. Grade only windows inside one session.
+bars_since_day = ta.barssince(is_new_day)
+window_same_session = na(bars_since_day) or bars_since_day >= fwd_bars
+
+if show_diagnostic and bar_index > fwd_bars and window_same_session
+    if long_signal[fwd_bars]
+        float ref = close[fwd_bars]
+        float mfe = fwd_high - ref
+        float mae = ref - fwd_low
+        diag_long_n := diag_long_n + 1
+        diag_long_mfe := diag_long_mfe + mfe
+        diag_long_mae := diag_long_mae + mae
+        diag_long_ret := diag_long_ret + (close - ref)
+        diag_long_win := diag_long_win + (mfe > mae ? 1 : 0)
+    if short_signal[fwd_bars]
+        float ref = close[fwd_bars]
+        float mfe = ref - fwd_low
+        float mae = fwd_high - ref
+        diag_short_n := diag_short_n + 1
+        diag_short_mfe := diag_short_mfe + mfe
+        diag_short_mae := diag_short_mae + mae
+        diag_short_ret := diag_short_ret + (ref - close)
+        diag_short_win := diag_short_win + (mfe > mae ? 1 : 0)
+
+avg(total, n) => n > 0 ? total / n : 0.0
+fmt(v) => str.tostring(v, "#.##")
+
+var table t = table.new(position.bottom_right, 6, 5, border_width=1, frame_width=1, frame_color=color.gray)
+
+if show_diagnostic and barstate.islast
+    int all_n = diag_long_n + diag_short_n
+    float a_mfe = avg(diag_long_mfe + diag_short_mfe, all_n)
+    float a_mae = avg(diag_long_mae + diag_short_mae, all_n)
+    float a_ret = avg(diag_long_ret + diag_short_ret, all_n)
+    float edge = a_mae > 0 ? a_mfe / a_mae : 0.0
+
+    table.cell(t, 0, 0, "Signal edge, " + str.tostring(fwd_bars) + " bars fwd", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 1, 0, "N", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 2, 0, "avg MFE", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 3, 0, "avg MAE", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 4, 0, "avg Return", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 5, 0, "MFE>MAE", bgcolor=color.gray, text_color=color.white)
+
+    table.cell(t, 0, 1, "CALL")
+    table.cell(t, 1, 1, str.tostring(diag_long_n))
+    table.cell(t, 2, 1, fmt(avg(diag_long_mfe, diag_long_n)))
+    table.cell(t, 3, 1, fmt(avg(diag_long_mae, diag_long_n)))
+    table.cell(t, 4, 1, fmt(avg(diag_long_ret, diag_long_n)))
+    table.cell(t, 5, 1, diag_long_n > 0 ? fmt(100.0 * diag_long_win / diag_long_n) + "%" : "-")
+
+    table.cell(t, 0, 2, "PUT")
+    table.cell(t, 1, 2, str.tostring(diag_short_n))
+    table.cell(t, 2, 2, fmt(avg(diag_short_mfe, diag_short_n)))
+    table.cell(t, 3, 2, fmt(avg(diag_short_mae, diag_short_n)))
+    table.cell(t, 4, 2, fmt(avg(diag_short_ret, diag_short_n)))
+    table.cell(t, 5, 2, diag_short_n > 0 ? fmt(100.0 * diag_short_win / diag_short_n) + "%" : "-")
+
+    table.cell(t, 0, 3, "ALL")
+    table.cell(t, 1, 3, str.tostring(all_n))
+    table.cell(t, 2, 3, fmt(a_mfe))
+    table.cell(t, 3, 3, fmt(a_mae))
+    table.cell(t, 4, 3, fmt(a_ret))
+    table.cell(t, 5, 3, all_n > 0 ? fmt(100.0 * (diag_long_win + diag_short_win) / all_n) + "%" : "-")
+
+    color verdict = edge >= 1.3 ? color.green : edge >= 1.1 ? color.orange : color.red
+    string verdict_txt = edge >= 1.3 ? "tradeable edge" : edge >= 1.1 ? "marginal" : "no edge - stop tuning"
+    table.cell(t, 0, 4, "Edge ratio (MFE/MAE)", bgcolor=verdict, text_color=color.white)
+    table.cell(t, 1, 4, fmt(edge), bgcolor=verdict, text_color=color.white)
+    table.cell(t, 2, 4, verdict_txt, bgcolor=verdict, text_color=color.white)
+    table.cell(t, 3, 4, "signals/day")
+    table.cell(t, 4, 4, fmt(all_n / math.max(1.0, (bar_index + 1) / 75.0)))
+    table.cell(t, 5, 4, all_n < 100 ? "N<100: not significant" : "sample ok", bgcolor=all_n < 100 ? color.orange : color.gray, text_color=color.white)

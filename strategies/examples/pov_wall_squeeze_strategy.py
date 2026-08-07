@@ -521,9 +521,32 @@ def fetch_option_ltp(opt_symbol, opt_exchange, underlying_ltp=None, max_retries=
     log.error(f"Failed to get valid option LTP for {opt_symbol} after {max_retries} attempts")
     return None
 
-PRE_OI_MIN = 50000
+# Per-underlying OI thresholds.
+#
+# Absolute open-interest counts DO NOT port across books. Measured
+# 2026-08-05..08-07 on the population POV actually scans (front weekly,
+# ATM +/- 2, both sides): NIFTY median 4-bar positive OI change 159,575 and
+# median |dOI| 79,430, versus SENSEX 5,160 and 1,460 -- roughly 31x and 54x
+# smaller at the same moneyness.
+#
+# One absolute constant therefore gated the two books in OPPOSITE directions:
+#     pre-gate >= 50,000   NIFTY 71% pass   SENSEX 11%  (starved it)
+#     c2       <  30,000   NIFTY 26% pass   SENSEX 95%  (free point)
+# which is why POV traded NIFTY normally but stopped taking SENSEX trades
+# after 2026-07-30: as the SENSEX weekly moved away from expiry its 5-minute
+# OI churn fell under a floor sized for NIFTY, and the evaluator returned
+# score 0 on every leg, every poll (45/45 on 2026-08-07).
+#
+# The SENSEX values are NIFTY's rescaled by SENSEX's own churn, so both books
+# get the SAME selectivity (SENSEX lands at 76% / 30% against NIFTY's
+# 71% / 26%). NIFTY is unchanged -- it is the working book and must not move.
+# Unlisted underlyings keep NIFTY's values.
+_DEF_PRE_OI_MIN = {"NIFTY": 50000, "SENSEX": 1600}
+_DEF_OI_ABS_THRESHOLD = {"NIFTY": 30000, "SENSEX": 550}
+_U = UNDERLYING.upper()
+PRE_OI_MIN = float(os.getenv("PRE_OI_MIN", _DEF_PRE_OI_MIN.get(_U, 50000)))
 PRE_LOOKBACK = 4
-OI_ABS_THRESHOLD = 30000
+OI_ABS_THRESHOLD = float(os.getenv("OI_ABS_THRESHOLD", _DEF_OI_ABS_THRESHOLD.get(_U, 30000)))
 OI_PCT_MIDCP = 0.07
 VOL_MULT = 3.0
 RANGE_MULT = 2.0

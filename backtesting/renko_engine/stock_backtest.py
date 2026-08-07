@@ -61,16 +61,13 @@ def fetch_stock(ticker, tf_str):
 
 
 def stock_pnl(t):
-    """Compute Rupees P&L under risk-sizing and 5x leverage MIS cost model."""
+    """Compute Rupees P&L under a raw flat-size allocation (no risk-sizing)."""
     if t.empty:
         return pd.DataFrame()
     t = t.copy()
-    risk = (t["entry"] - t["sl"]).abs()
-    # shares = risk budget / stop distance
-    qty = RISK_PER_TRADE / risk
-    # cap by 5x leverage on capital
-    val_cap = MAX_VAL / t["entry"]
-    t["qty"] = np.minimum(qty, val_cap).astype(int)
+    # No risk sizing: flat position value of Rs 1,00,000 per trade
+    TRADE_VALUE = 100000.0
+    t["qty"] = (TRADE_VALUE / t["entry"]).astype(int)
 
     t["turnover"] = (t["entry"] + t["exit"].abs()) * t["qty"]
     t["friction"] = t["turnover"] * COST_PCT / 100.0
@@ -81,8 +78,8 @@ def stock_pnl(t):
 
 
 def main():
-    print(f"Dr Devendra Smart Renko Engine PRO -- Stock Intraday Study")
-    print(f"Notional: Rs {BACKTEST_CAPITAL:,} | 1% Risk (Rs {RISK_PER_TRADE:,.0f}) | 5x MIS")
+    print(f"Dr Devendra Smart Renko Engine PRO -- Stock Intraday Study (RAW)")
+    print(f"Capital: Rs {BACKTEST_CAPITAL:,} | Position Size: Rs 1,00,000 flat per trade")
     print(f"Friction: {COST_PCT}% of turnover | yfinance 60-day limit\n")
 
     for tf in [15, 30]:
@@ -93,7 +90,6 @@ def main():
             df = fetch_stock(s, tf_str)
             if df is None:
                 continue
-            # run the exact same Pine-logic simulator
             raw = run(df, s)
             t = stock_pnl(raw)
             if t.empty:
@@ -102,21 +98,37 @@ def main():
             gw, gl = t.loc[t["net"] > 0, "net"].sum(), -t.loc[t["net"] < 0, "net"].sum()
             pf = gw / gl if gl > 0 else np.inf
             win = (t["net"] > 0).mean() * 100
+
+            # Raw stats: drawdown on Rs 2,00,000 capital and trade Sharpe
+            eq = t["net"].cumsum() + BACKTEST_CAPITAL
+            dd = (eq.cummax() - eq).max()
+            dd_pct = (dd / BACKTEST_CAPITAL) * 100.0
+            sharpe = (t["net"].mean() / t["net"].std() * np.sqrt(len(t))) if len(t) > 1 and t["net"].std() > 0 else 0.0
+
             print(f"  {s:12s} n={len(t):3d}  win={win:4.1f}%  PF={pf:4.2f}  "
                   f"net={t['net'].sum():+7,.0f}  avg={t['net'].mean():+5.0f}  "
-                  f"fric={t['friction'].mean():3.0f}/tr  turn={t['turnover'].mean():6,.0f}")
+                  f"maxDD={dd:5,.0f} ({dd_pct:4.1f}%)  Sharpe={sharpe:5.2f}")
             summary.append(t)
         if not summary:
             continue
-        all_t = pd.concat(summary)
+        all_t = pd.concat(summary).sort_index()
         aw = (all_t["net"] > 0).mean() * 100
         agw = all_t.loc[all_t["net"] > 0, "net"].sum()
         agl = -all_t.loc[all_t["net"] < 0, "net"].sum()
         apf = agw / agl if agl > 0 else np.inf
+
+        # Portfolio level stats
+        eq = all_t["net"].cumsum() + BACKTEST_CAPITAL
+        dd = (eq.cummax() - eq).max()
+        dd_pct = (dd / BACKTEST_CAPITAL) * 100.0
+        asharpe = (all_t["net"].mean() / all_t["net"].std() * np.sqrt(len(all_t))) if len(all_t) > 1 and all_t["net"].std() > 0 else 0.0
+
         print(f"  {'ALL':12s} n={len(all_t):3d}  win={aw:4.1f}%  PF={apf:4.2f}  "
               f"net={all_t['net'].sum():+7,.0f}  avg={all_t['net'].mean():+5.0f}  "
-              f"({all_t['net'].sum() / BACKTEST_CAPITAL * 100:+.1f}% on 2L notional)")
+              f"maxDD={dd:5,.0f} ({dd_pct:4.1f}%)  Sharpe={asharpe:5.2f}  "
+              f"({all_t['net'].sum() / BACKTEST_CAPITAL * 100:+.1f}% on 2L)")
         print()
+
 
 
 if __name__ == "__main__":

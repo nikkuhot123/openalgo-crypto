@@ -20,11 +20,11 @@ An append-only record of wiki updates, backtests, and VPS operations.
 - Ported `Doctor_Diven_Smart_Renko_Engine_Pro_Combined.pine` to Python.
 - Backtested NIFTY 5m/15m/30m 2023-2026. Positive in index points (+4.1 at 30m) but loses on option friction.
 
-## [2026-08-07] research | Renko Stock Intraday Backtest
+## [2026-08-07] research | Renko Stock Intraday Backtest (RAW)
 - Backtested the Renko PRO strategy on 5 liquid stocks (RELIANCE, SBIN, HDFCBANK, ICICIBANK, TCS) using 60 days of 15m/30m data.
-- Modelled 1% risk-sizing with 5x leverage MIS and cash friction (0.035% turnover).
-- Finding: Disastrous results (15m: −78.0% return, 327 trades, PF 0.64; 30m: −20.3% return, 192 trades, PF 0.79). The leverage maxed out due to tight stops, and the lack of a directional edge accelerated losses.
-- Finding: 51% of profits came from 5 trades. Cross-symbol tests (BANKNIFTY, FINNIFTY) failed. Edge is noise.
+- Modelled flat Rs 1,00,000 position size per trade (no stop-based risk sizing) and cash friction (0.035% turnover).
+- Finding: Consistently negative results (15m: -Rs 23,500 / -11.7% net, PF 0.66, maxDD 12.5%, Sharpe -3.16; 30m: -Rs 6,670 / -3.3% net, PF 0.83, maxDD 6.7%, Sharpe -1.01). Removing stop-based risk sizing confirms the core signal itself lacks a directional edge on stocks.
+
 
 ## [2026-08-07] research | Judas strike selection
 - Replayed 4 live Judas trades across 7 strikes (OTM3 to ITM3).

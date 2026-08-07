@@ -109,6 +109,9 @@ MAX_LOTS = int(os.getenv("MAX_LOTS", "1"))
 LOT_MODE = os.getenv("LOT_MODE", "manual").lower()  # 'manual' | 'auto'
 RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "1.0"))
 LOT_SIZE = QUANTITY  # contract size; order qty = lots * LOT_SIZE
+# Seconds to wait for the exchange master to publish a lot size on a cold
+# start. The 09:10 schedule start precedes the master being queryable.
+LOT_SIZE_WAIT_SECS = int(os.getenv("LOT_SIZE_WAIT_SECS", "600"))
 # Strike selection passed to optionsymbol. MUST be one of ATM / ITM1-ITM50 /
 # OTM1-OTM50 as a STRING -- the endpoint rejects numbers ("Not a valid
 # string"). Both harnesses priced the ATM weekly, so ATM is the default.
@@ -384,7 +387,16 @@ def compute_auto_lots(capital, risk_pct, max_loss_per_unit, lot_size, hard_cap_l
 def fetch_option_ltp(opt_symbol, opt_exchange, max_retries=3, retry_delay=1.0):
     for attempt in range(max_retries):
         try:
-            resp = client.quote(symbol=opt_symbol, exchange=opt_exchange)
+            # client.quotes(), NOT client.quote(). The SDK has no singular
+            # method, so every call raised AttributeError, fetch_option_ltp
+            # returned None on every invocation, and the strategy could never
+            # price a leg -- no entry was possible from deployment until
+            # 2026-08-07, including the first overnight carry. Every other
+            # strategy in this repo already calls quotes(); this one was alone.
+            resp = client.quotes(symbol=opt_symbol, exchange=opt_exchange)
+            if isinstance(resp, dict) and resp.get("status") not in (None, "success"):
+                log.warning("fetch_option_ltp %s: status=%s", opt_symbol, resp.get("status"))
+                resp = {}
             data = resp.get("data") if isinstance(resp, dict) else None
             if isinstance(data, dict):
                 ltp = data.get("ltp") or data.get("last_price") or data.get("close")
@@ -398,25 +410,37 @@ def fetch_option_ltp(opt_symbol, opt_exchange, max_retries=3, retry_delay=1.0):
 
 
 def fetch_fill_price(order_id, symbol, max_retries=4, retry_delay=0.8):
-    """Average TRADED price for an order. P&L must rest on fills, never quotes."""
+    """Average TRADED price for an order. P&L must rest on fills, never quotes.
+
+    Was client.orderhistory(), which the SDK does not have -- so this raised
+    AttributeError on every attempt and always returned None, exactly like
+    fetch_option_ltp. Mirrors judas_swing_strategy: orderstatus returns a DICT
+    (not the list this used to walk), with tradebook as the fallback.
+    """
     for attempt in range(max_retries):
         try:
-            resp = client.orderhistory(order_id=order_id)
-            rows = resp.get("data") if isinstance(resp, dict) else None
-            if isinstance(rows, list):
-                for row in rows:
-                    if row.get("symbol") or row.get("tradingsymbol"):
-                        avg = (
-                            row.get("averageprice")
-                            or row.get("average_price")
-                            or row.get("avg_price")
-                        )
-                        if avg is not None:
-                            return float(avg)
+            r = client.orderstatus(order_id=order_id, strategy=STRATEGY_NAME)
+            d = (r.get("data") or {}) if isinstance(r, dict) else {}
+            for k in ("average_price", "averageprice", "avgprice", "avg_price", "price"):
+                v = d.get(k)
+                if v not in (None, "", 0, "0") and float(v) > 0:
+                    return float(v)
         except Exception as e:
-            log.warning("fetch_fill_price %s attempt %s: %s", symbol, attempt + 1, e)
+            log.debug("orderstatus %s attempt %s: %s", order_id, attempt + 1, e)
+        try:
+            tb = client.tradebook()
+            if isinstance(tb, dict) and tb.get("status") == "success":
+                for t in tb.get("data", []) or []:
+                    if str(t.get("orderid", "")) == str(order_id):
+                        for k in ("average_price", "averageprice", "price", "tradeprice"):
+                            v = t.get(k)
+                            if v not in (None, "", 0, "0") and float(v) > 0:
+                                return float(v)
+        except Exception as e:
+            log.debug("tradebook %s attempt %s: %s", order_id, attempt + 1, e)
         if attempt < max_retries - 1:
             time.sleep(retry_delay)
+    log.warning("fetch_fill_price %s: no fill price after %s attempts", symbol, max_retries)
     return None
 
 
@@ -1058,8 +1082,22 @@ def run_strategy():
             persist_state(_active_trade, _day_state)
     if LOT_SIZE <= 0:
         LOT_SIZE = fetch_lot_size(UNDERLYING, _opt_exchange) or 0
+    # The 09:10 schedule start lands before the exchange master answers, so a
+    # cold start failed here and sys.exit(1) turned that into a platform
+    # restart loop -- 7 restarts on 2026-08-07 before one happened to stick
+    # after the market opened. Wait for the master rather than dying; SIGTERM
+    # still breaks out immediately.
+    _waited = 0
+    while LOT_SIZE <= 0 and not _shutdown_requested and _waited < LOT_SIZE_WAIT_SECS:
+        log.info("lot size not published yet; retrying in 10s (%ss/%ss)", _waited, LOT_SIZE_WAIT_SECS)
+        time.sleep(10)
+        _waited += 10
+        LOT_SIZE = fetch_lot_size(UNDERLYING, _opt_exchange) or 0
     if LOT_SIZE <= 0:
-        log.error("lot size unavailable; set QUANTITY")
+        if _shutdown_requested:
+            log.info("shutdown while waiting for lot size")
+            sys.exit(0)
+        log.error("lot size unavailable after %ss; set QUANTITY", _waited)
         sys.exit(1)
     log.info(
         "sizing: lot=%s mode=%s max_lots=%s risk=%.2f%% (auto sizing uses the entry premium)",

@@ -109,6 +109,10 @@ MAX_LOTS = int(os.getenv("MAX_LOTS", "1"))
 LOT_MODE = os.getenv("LOT_MODE", "manual").lower()  # 'manual' | 'auto'
 RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "1.0"))
 LOT_SIZE = QUANTITY  # contract size; order qty = lots * LOT_SIZE
+# Strike selection passed to optionsymbol. MUST be one of ATM / ITM1-ITM50 /
+# OTM1-OTM50 as a STRING -- the endpoint rejects numbers ("Not a valid
+# string"). Both harnesses priced the ATM weekly, so ATM is the default.
+STRIKE_OFFSET = os.getenv("STRIKE_OFFSET", "ATM")
 # Both harnesses take exactly ONE entry per session -- keep live in step.
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "1"))
 DRY_RUN = os.getenv("DRY_RUN", "1") in ("1", "true", "yes")
@@ -630,10 +634,13 @@ def get_nearest_expiry(underlying, exchange):
         resp = client.expiry(symbol=underlying, exchange=exchange, instrumenttype="options")
         if resp.get("status") == "success" and resp.get("data"):
             data = resp["data"]
+            # optionsymbol wants the compact form: the expiry endpoint returns
+            # "11-AUG-26" and the symbol endpoint answers 404 "No strikes
+            # found" for it, but resolves "11AUG26" (verified live 2026-08-07).
             if isinstance(data, list):
-                return str(data[0])
+                return str(data[0]).replace("-", "")
             if isinstance(data, dict):
-                return str(data.get("expiry") or data.get("expiries") or "")
+                return str(data.get("expiry") or data.get("expiries") or "").replace("-", "")
     except Exception as e:
         log.warning("get_nearest_expiry: %s", e)
     return None
@@ -668,6 +675,8 @@ def is_expiry_today(expiry_str):
 
 
 def fetch_lot_size(underlying, opt_exchange):
+    """Contract lot size, read from the optionsymbol response (it carries
+    `lotsize` at the top level, e.g. 65 for NIFTY / 20 for SENSEX)."""
     try:
         expiry = get_nearest_expiry(underlying, opt_exchange)
         if not expiry:
@@ -676,28 +685,43 @@ def fetch_lot_size(underlying, opt_exchange):
             underlying=underlying,
             exchange=opt_exchange,
             expiry_date=expiry,
+            offset=STRIKE_OFFSET,
             option_type="CE",
-            strike=0,
         )
-        if resp.get("status") == "success" and resp.get("data"):
-            val = resp["data"].get("lotsize") or resp["data"].get("lot_size") or 0
+        if resp.get("status") == "success":
+            d = resp.get("data") or resp
+            val = d.get("lotsize") or d.get("lot_size") or 0
             return int(val) or None
+        log.warning("fetch_lot_size: %s", str(resp)[:160])
     except Exception as e:
         log.warning("fetch_lot_size: %s", e)
     return None
 
 
 def get_option_symbol(underlying, exchange, expiry, offset, option_type):
+    """Resolve the tradable option symbol. Contract verified live 2026-08-07:
+
+        optionsymbol(underlying, exchange, expiry_date='11AUG26',
+                     offset='ATM', option_type='CE')
+        -> {"status":"success","symbol":"NIFTY11AUG2624550CE","lotsize":65,...}
+
+    `offset` is REQUIRED and must be a STRING (ATM / ITM1-50 / OTM1-50) --
+    passing a number returns "Not a valid string", and omitting it raises
+    TypeError before the request is even sent. The symbol comes back at the
+    top level, not under "data".
+    """
     try:
         resp = client.optionsymbol(
             underlying=underlying,
             exchange=exchange,
             expiry_date=expiry,
-            instrument_type=option_type,
-            strike=offset,
+            offset=str(offset),
+            option_type=option_type,
         )
-        if resp.get("status") == "success" and resp.get("data"):
-            return str(resp["data"].get("symbol") or resp["data"].get("tradingsymbol") or "")
+        if resp.get("status") == "success":
+            d = resp.get("data") or resp
+            return str(d.get("symbol") or d.get("tradingsymbol") or "") or None
+        log.warning("get_option_symbol: %s", str(resp)[:160])
     except Exception as e:
         log.warning("get_option_symbol: %s", e)
     return None
@@ -857,7 +881,7 @@ def _enter_position(side, reason, levels, df_1m, intraday=False):
         if not expiry:
             log.warning("no expiry")
             return None
-        sym = get_option_symbol(UNDERLYING, _opt_exchange, expiry, 0, side)
+        sym = get_option_symbol(UNDERLYING, _opt_exchange, expiry, STRIKE_OFFSET, side)
         if not sym:
             log.warning("no option symbol")
             return None

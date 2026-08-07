@@ -111,3 +111,69 @@ def test_per_symbol_defaults_match_the_backtested_configs(monkeypatch):
     monkeypatch.delenv("EXIT_TIME", raising=False)
     s = load(monkeypatch, MODE="overnight", UNDERLYING="SENSEX")
     assert s.USE_EMA is False and s.EXIT_TIME.strftime("%H:%M") == "09:20"
+
+
+# ------------------------------------------------- option-symbol resolution
+# Live contract, verified 2026-08-07:
+#   optionsymbol(underlying, exchange, expiry_date='11AUG26', offset='ATM',
+#                option_type='CE')
+#   -> {"status":"success","symbol":"NIFTY11AUG2624550CE","lotsize":65,...}
+# offset is REQUIRED and must be a STRING; the payload is top-level, not
+# under "data". Getting any of that wrong crashed the strategy at startup
+# ("lot size unavailable; set QUANTITY") on 2026-08-07.
+OPTSYM_OK = {"status": "success", "symbol": "NIFTY11AUG2624550CE",
+             "exchange": "NFO", "lotsize": 65, "tick_size": 0.05,
+             "freeze_qty": 1800, "underlying_ltp": 24565.6}
+
+
+def _capture(m, monkeypatch, resp=OPTSYM_OK):
+    seen = {}
+
+    def fake(**kw):
+        seen.update(kw)
+        return resp
+    monkeypatch.setattr(m, "client", types.SimpleNamespace(
+        optionsymbol=fake,
+        expiry=lambda **kw: {"status": "success", "data": ["11-AUG-26"]}))
+    return seen
+
+
+def test_expiry_is_compacted_for_the_symbol_endpoint(monkeypatch):
+    m = load(monkeypatch, MODE="overnight")
+    _capture(m, monkeypatch)
+    assert m.get_nearest_expiry("NIFTY", "NFO") == "11AUG26", \
+        "the dashed form 404s with 'No strikes found'"
+
+
+def test_option_symbol_sends_a_string_offset_and_option_type(monkeypatch):
+    m = load(monkeypatch, MODE="overnight")
+    seen = _capture(m, monkeypatch)
+    sym = m.get_option_symbol("NIFTY", "NFO", "11AUG26", "ATM", "CE")
+    assert sym == "NIFTY11AUG2624550CE"
+    assert seen["offset"] == "ATM" and isinstance(seen["offset"], str)
+    assert seen["option_type"] == "CE"
+    assert "strike" not in seen and "instrument_type" not in seen
+
+
+def test_lot_size_reads_the_top_level_lotsize(monkeypatch):
+    m = load(monkeypatch, MODE="overnight")
+    _capture(m, monkeypatch)
+    assert m.fetch_lot_size("NIFTY", "NFO") == 65
+
+
+def test_lot_size_survives_a_data_wrapped_payload(monkeypatch):
+    m = load(monkeypatch, MODE="overnight")
+    _capture(m, monkeypatch, {"status": "success", "data": {"lotsize": 20}})
+    assert m.fetch_lot_size("SENSEX", "BFO") == 20
+
+
+def test_option_symbol_returns_none_on_api_error(monkeypatch):
+    m = load(monkeypatch, MODE="overnight")
+    _capture(m, monkeypatch, {"status": "error", "message": "No strikes found"})
+    assert m.get_option_symbol("NIFTY", "NFO", "11AUG26", "ATM", "CE") is None
+
+
+def test_default_strike_offset_is_atm(monkeypatch):
+    monkeypatch.delenv("STRIKE_OFFSET", raising=False)
+    m = load(monkeypatch, MODE="overnight")
+    assert m.STRIKE_OFFSET == "ATM"

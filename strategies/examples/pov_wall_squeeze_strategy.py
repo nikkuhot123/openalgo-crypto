@@ -1013,6 +1013,26 @@ def run_strategy():
                         persist_positions(positions)
                         sync_direction_locks(positions, STRATEGY_NAME, UNDERLYING)
 
+                    # Premium path, one line per monitored cycle. POV trades the
+                    # FRONT weekly, so its contracts drop out of the broker's
+                    # master within days and no post-hoc study can reconstruct
+                    # what a position did between entry and exit: of 28 round
+                    # trips only 2 were still replayable on 2026-08-07. Without
+                    # this line there is no way to tell whether POV gives back
+                    # open profit (the question that produced Judas's break-even
+                    # ratchet) -- live_ltp is already fetched every cycle here
+                    # and was simply being discarded.
+                    if live_ltp is not None and pos.get("entry_opt_price"):
+                        _e = float(pos["entry_opt_price"])
+                        _sl = pos.get("sl_price")
+                        _r = (_e - float(_sl)) if _sl else 0.0
+                        log.info(
+                            f"PATH {symbol} ltp={live_ltp:.2f} entry={_e:.2f} "
+                            f"R={_r:.2f} rmult={((live_ltp - _e) / _r):+.2f}"
+                            if _r > 0 else
+                            f"PATH {symbol} ltp={live_ltp:.2f} entry={_e:.2f}"
+                        )
+
                     # ── Safety-net exits: max-hold-time and premium-decay ──
                     # Prevents slow-bleed when SL is cancelled (e.g. by RECONCILE on restart)
                     # and position sits unmonitored. Based on live evidence 2026-07-02:

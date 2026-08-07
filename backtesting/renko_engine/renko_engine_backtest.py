@@ -56,6 +56,9 @@ import duckdb
 import numpy as np
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config import BACKTEST_CAPITAL  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[2]
 DB = ROOT / "backtesting" / "data" / "market_cache.duckdb"
 
@@ -394,12 +397,16 @@ def report(t, symbol, tf, label=""):
     eq = pts.cumsum()
     dd = (eq.cummax() - eq).max()
     breakeven_pts = cost_rt / rs_per_point
+    # Sized on the standard Rs 2,00,000 research notional, never the live
+    # balance -- see backtesting/config.py for why.
+    lots = max(int((BACKTEST_CAPITAL * 0.5) // (prem * lot)), 1)
     print(f"  {label or 'ALL':12s} n={len(t):4d}  win={100*(pts>0).mean():4.1f}%  "
           f"PF={pf:4.2f}  pts={pts.sum():+8.0f}  avg={pts.mean():+6.1f}  "
           f"maxDD={dd:6.0f}  | need {breakeven_pts:.1f}pts/trade  "
-          f"option Rs={rs.sum():+9,.0f}")
+          f"1lot Rs={rs.sum():+9,.0f}  "
+          f"{lots}lot={rs.sum() * lots / BACKTEST_CAPITAL * 100:+6.1f}% of 2L")
     return {"n": len(t), "pf": pf, "pts": pts.sum(), "rs": rs.sum(),
-            "avg": pts.mean(), "be": breakeven_pts}
+            "avg": pts.mean(), "be": breakeven_pts, "lots": lots}
 
 
 def main():

@@ -4,6 +4,14 @@ An append-only record of wiki updates, backtests, and VPS operations.
 
 ---
 
+## [2026-08-10] research | Variance Risk Premium -- selling vs buying
+- Researched (agent-reach/web): documented statistically significant positive VRP in Indian index options; implied variance systematically exceeds realized. All five prior strategies BOUGHT options and paid it.
+- Volrix test 1, short ATM straddle 30% SL: NIFTY PF 0.90 -Rs 22,921; SENSEX PF 1.00 -Rs 16,466. Win rate 38% = stop firing on noise, mis-specified.
+- Volrix test 2, iron fly (defined risk, no stop): NIFTY PF 1.00 -Rs 1,261 Sharpe -0.09 maxDD 13.2%; SENSEX PF 1.00 -Rs 3,392 maxDD 8.4%. Drawdown halved, Sharpe near zero.
+- Finding: VRP edge is real and almost exactly consumed by 4-leg friction. avgWin +1,548 vs avgLoss -1,550 on NIFTY.
+- Six strategies now land between PF 0.70 and 1.00. Binding constraint is friction and capital, not signal.
+- Selling needs ~Rs 1.5-2L margin/lot -- not accessible at live balance regardless.
+
 ## [2026-08-10] research | Stochastic Crossover (SKB) -- OpenAlgo + Volrix
 - Analysed the SKB chart: Stochastic (14,3,3), buy on %K/%D cross up from <20, sell on cross down from >80, NIFTY 15m.
 - OpenAlgo engine: chart defaults lose on every timeframe (15m PF 0.88, Sharpe -3.77).

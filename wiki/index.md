@@ -21,6 +21,7 @@ A catalog of everything in the wiki. Updated on every ingestion.
 | [[research/stock_intraday\|Stock Intraday Backtest]] | `backtesting/renko_engine/stock_backtest.py` | 2026-08-07 | Wipes out 78% on 15m and 20% on 30m. Leverage accelerates losses. |
 | [[research/stochastic_crossover\|Stochastic Crossover (SKB)]] | `backtesting/stochastic/` | 2026-08-10 | Chart defaults lose on all TFs. Tuned config is in-sample only; Volrix PF 0.90/0.70. |
 | [[research/variance_risk_premium\|Variance Risk Premium (sell vs buy)]] | Volrix MCP | 2026-08-10 | VRP is real but friction eats it. Iron fly = PF 1.00, best-behaved system tested. |
+| [[research/openmtops_narrative\|OpenMTOps upstream + narrative tape reading]] | github/CApsUNlocked123 | 2026-08-12 | POV port faithful. OI feed verified 0.017%. Narrative = descriptive, not predictive. |
 
 ## Operations & Incidents
 

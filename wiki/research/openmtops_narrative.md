@@ -96,6 +96,23 @@ If the annotation shows outcomes separating cleanly by quadrant, *that* becomes 
 
 ## 5. Separate finding: the greeks collector is not collecting options
 
-`cas_ticks_2026-08-{10,11,12}.csv` contain **zero option rows** — only `spot` (936) and `future` (624) kinds. The `delta/theta/gamma/vega/iv` columns exist but are empty throughout, because no option leg is ever sampled.
+**Correction to a first-pass claim on this page.** An initial check filtered on `kind == "option"`; the real values are `optCE` / `optPE`, so it wrongly reported zero rows on all days. The truth:
 
-This matters: the collector was retained specifically as "the only forward source of real ATM option quote/greek data". It is not currently fulfilling that purpose. Needs a separate fix.
+| file | option rows |
+|---|---|
+| 2026-08-06 | 1,363 |
+| 2026-08-07 | 1,369 |
+| 2026-08-10 | 1,380 |
+| 2026-08-11 | 1,376 |
+| **2026-08-12** | **0** |
+
+The collector worked for four sessions and broke only on 08-12.
+
+**Cause**: `build_watchlist()` runs once at startup (09:20). That morning the broker's contract lookups were still cold, `client.expiry()` returned non-success, `resolve_atm_options()` returned an empty list via a **silent** `return out`, and the collector logged spot+futures for the entire session with nothing in the log to explain it. The same cold-lookup window also broke lot-size detection that morning.
+
+**Fixed** (deployed `e95ea6d6`):
+- the silent bail now logs a warning naming the failing status
+- `build_watchlist()` warns when `CAS_LOG_GREEKS` is on but zero legs resolve
+- the poll loop re-attempts resolution every `CAS_OPT_RETRY_SECS` (default 300) so a cold start costs minutes, not a day
+
+Verified against a simulated cold start: healthy build 9 symbols, cold build 3 with warnings, retry recovers all 4 legs.

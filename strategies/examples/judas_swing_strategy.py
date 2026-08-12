@@ -355,6 +355,46 @@ def fetch_lot_size(underlying, idx_exchange, opt_exchange):
         log.warning(f"optionsymbol lot-size lookup raised: {e}")
     return None
 
+
+# Tape-reading context, ported from openmtops narrative.py `_action_label`.
+QUAD_WINDOW = int(os.getenv("QUAD_WINDOW", "15"))   # 1m candles to look back
+QUAD_OI_MIN_PCT = 1.0                               # upstream OI_MILD_PCT
+QUAD_PRICE_MIN_PCT = 1.0                            # upstream PRICE_SIG_PCT / 3
+
+
+def oi_price_quadrant(df, window=None):
+    """Positioning read: OI change x price change over `window` candles.
+
+        OI up   + price up   -> long buildup    (new longs paying up)
+        OI up   + price down -> fresh writing   (new shorts, sellers in control)
+        OI down + price up   -> short covering  (shorts buying back = squeeze)
+        OI down + price down -> long unwinding  (longs giving up)
+
+    DIAGNOSTIC ONLY -- never gates a trade. Recorded at entry so the give-back
+    study has a covariate to explain outcomes against. Judas reads SPOT
+    structure and otherwise never inspects the option's own book, so this is
+    the only place that positioning context is captured.
+
+    Returns (label_or_None, d_oi_pct, d_price_pct). Never raises.
+    """
+    w = QUAD_WINDOW if window is None else window
+    try:
+        if df is None or len(df) < w + 1 or "oi" not in df.columns:
+            return None, 0.0, 0.0
+        oi_now, oi_then = float(df["oi"].iloc[-1]), float(df["oi"].iloc[-1 - w])
+        px_now, px_then = float(df["close"].iloc[-1]), float(df["close"].iloc[-1 - w])
+        if oi_then <= 0 or px_then <= 0:
+            return None, 0.0, 0.0
+        d_oi = (oi_now - oi_then) / oi_then * 100.0
+        d_px = (px_now - px_then) / px_then * 100.0
+        if abs(d_oi) < QUAD_OI_MIN_PCT or abs(d_px) < QUAD_PRICE_MIN_PCT:
+            return None, d_oi, d_px
+        if d_oi > 0:
+            return ("long_buildup" if d_px > 0 else "fresh_writing"), d_oi, d_px
+        return ("short_covering" if d_px > 0 else "long_unwinding"), d_oi, d_px
+    except Exception:
+        return None, 0.0, 0.0
+
 def statutory_cost(entry_px, exit_px, qty):
     """Round-trip statutory cost in rupees for an option BUY->SELL.
 
@@ -1053,6 +1093,24 @@ def run_strategy():
                     persist_trade(active_trade)
                     last_entry_candle_fp = sig["candle_fp"]
                     log.info(f"Entered Trade! Spot Entry: {entry_spot:.2f} | SL: {sl_spot:.2f} | Target: {target_spot:.2f} | Opt entry: {entry_opt_price}")
+                    # Tape context at entry -- diagnostic only, never a gate.
+                    # Judas trades off SPOT structure and never looks at the
+                    # option's own book, so this is the one place it does. One
+                    # extra call per trade (not per cycle), wrapped so it can
+                    # never affect the position that was just opened.
+                    try:
+                        _df_opt = client.history(
+                            symbol=opt_symbol, exchange=opt_exchange, interval="1m",
+                            start_date=f"{date.today():%Y-%m-%d}",
+                            end_date=f"{date.today():%Y-%m-%d}",
+                        )
+                        _q, _doi, _dpx = oi_price_quadrant(_df_opt)
+                        log.info(
+                            "TAPE %s quadrant=%s dOI=%+.1f%% dPx=%+.1f%% (%dm window)",
+                            opt_symbol, _q or "unclear", _doi, _dpx, QUAD_WINDOW,
+                        )
+                    except Exception as _terr:
+                        log.debug(f"tape annotation failed: {_terr}")
                 else:
                     # Entry failed — release lock so other strategies can try
                     release_symbol_lock(opt_symbol, STRATEGY_NAME)

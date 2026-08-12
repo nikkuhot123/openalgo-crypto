@@ -68,11 +68,25 @@ OUT_SUBDIR = os.getenv("CAS_LOG_SUBDIR", "cas_window")
 OUT_DIR = Path("log") / "strategies" / OUT_SUBDIR
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Underlyings whose ATM CE/PE are sampled when CAS_LOG_GREEKS is on.
+OPTION_UNDERLYINGS = [("NIFTY", "NSE_INDEX", "NFO"), ("SENSEX", "BSE_INDEX", "BFO")]
+
+# The watchlist is built once at startup. On 2026-08-12 that build ran at 09:20
+# while the broker's contract lookups were still cold, no option leg resolved,
+# and the collector logged spot+futures for the whole session -- 0 option rows
+# against ~1,370 on each of the four preceding days. Re-attempt inside the
+# window instead of losing the day to one cold call.
+OPT_RETRY_SECS = int(os.getenv("CAS_OPT_RETRY_SECS", "300"))
+
 FIELDS = ["ts", "symbol", "exchange", "kind", "ltp", "bid", "ask", "spread",
           "volume", "oi", "open", "high", "low", "prev_close",
           "delta", "theta", "gamma", "vega", "iv", "dte"]
 
 _shutdown = False
+
+# Mutable holder so the in-window option-resolve retry clock survives without
+# needing a global statement inside run().
+_last_opt_retry = [datetime.min]
 
 
 def _hhmm(s):
@@ -118,6 +132,13 @@ def resolve_atm_options(underlying, idx_exchange, opt_exchange):
     try:
         e = client.expiry(symbol=underlying, exchange=opt_exchange, instrumenttype="options")
         if e.get("status") != "success" or not e.get("data"):
+            # Was a silent `return out`. On 2026-08-12 this fired at the 09:20
+            # build while the broker's contract lookups were still cold, and the
+            # collector then ran the whole session with spot+futures only --
+            # 0 option rows against ~1,370 on each of the four preceding days,
+            # with nothing in the log to say why.
+            log.warning("ATM option resolve for %s: expiry lookup returned %s (%s)",
+                        underlying, e.get("status"), str(e.get("message"))[:80])
             return out
         exp_str = e["data"][0]
         exp_date = datetime.strptime(str(exp_str).upper(), "%d-%b-%y").date()
@@ -150,30 +171,47 @@ def build_watchlist():
             log.warning(f"No future resolved for {und} — spot only")
 
     if LOG_GREEKS:
-        for und, idx_ex, opt_ex in [("NIFTY", "NSE_INDEX", "NFO"),
-                                    ("SENSEX", "BSE_INDEX", "BFO")]:
+        for und, idx_ex, opt_ex in OPTION_UNDERLYINGS:
             for leg in resolve_atm_options(und, idx_ex, opt_ex):
                 wl.append(leg)
                 log.info(f"Watching ATM option: {leg[0]} (expiry {leg[5]})")
+        if not has_option_legs(wl):
+            log.warning(
+                "CAS_LOG_GREEKS is on but NO option legs resolved -- this run "
+                "would collect spot/futures only. Will retry every %ss inside "
+                "the window.", OPT_RETRY_SECS)
     return wl
 
 
+def has_option_legs(wl):
+    return any(str(row[2]).startswith("opt") for row in wl)
+
+
 def fetch_greeks(symbol, exchange, underlying, idx_exchange):
-    """Broker-computed Greeks, or empty dict. Never raises."""
+    """Broker-computed Greeks, or empty dict. Never raises.
+
+    The endpoint returns the greeks at the TOP level of the response, not
+    nested under "data":
+        {"status": "success", "greeks": {"delta":..., "theta":...},
+         "implied_volatility": 11.78, "days_to_expiry": 5.13, ...}
+    Reading r["data"] therefore yielded {}, and every greek logged empty --
+    0 of 682 option rows on 2026-08-06 carried a theta. The `or r` fallback
+    keeps this working if a future build nests the payload under "data".
+    """
     try:
         r = client.optiongreeks(symbol=symbol, exchange=exchange,
                                 underlying_symbol=underlying,
                                 underlying_exchange=idx_exchange)
         if not isinstance(r, dict) or r.get("status") != "success":
             return {}
-        d = r.get("data", {}) or {}
-        g = d.get("greeks", d) or {}
+        d = r.get("data") or r
+        g = d.get("greeks") or {}
         return {
             "delta": g.get("delta"),
             "theta": g.get("theta"),
             "gamma": g.get("gamma"),
             "vega": g.get("vega"),
-            "iv": g.get("iv") or g.get("implied_volatility"),
+            "iv": d.get("implied_volatility", g.get("iv")),
         }
     except Exception as e:
         log.debug(f"greeks failed {symbol}: {e}")
@@ -260,6 +298,18 @@ def run():
 
             while not _shutdown and datetime.now().time() <= T_STOP and date.today() == today:
                 cycle = datetime.now()
+
+                # Recover a cold start: if greeks are requested but no option
+                # leg resolved, keep trying inside the window rather than
+                # collecting spot/futures only for the rest of the session.
+                if LOG_GREEKS and not has_option_legs(watchlist):
+                    if (cycle - _last_opt_retry[0]).total_seconds() >= OPT_RETRY_SECS:
+                        _last_opt_retry[0] = cycle
+                        for _u, _ix, _ox in OPTION_UNDERLYINGS:
+                            for leg in resolve_atm_options(_u, _ix, _ox):
+                                watchlist.append(leg)
+                                log.info("Option leg resolved on retry: %s (expiry %s)",
+                                         leg[0], leg[5])
                 for symbol, exchange, kind, und, idx_ex, exp in watchlist:
                     row = poll_row(symbol, exchange, kind, und, idx_ex, exp)
                     if row:

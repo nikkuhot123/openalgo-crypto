@@ -634,6 +634,49 @@ def fetch_lot_size(underlying, idx_exchange, opt_exchange):
     return None
 
 
+# Tape-reading context, ported from openmtops narrative.py `_action_label`.
+# Thresholds are upstream's: below these the move is too small to call.
+QUAD_WINDOW = int(os.getenv("QUAD_WINDOW", "15"))   # candles (1m) to look back
+QUAD_OI_MIN_PCT = 1.0                               # upstream OI_MILD_PCT
+QUAD_PRICE_MIN_PCT = 1.0                            # upstream PRICE_SIG_PCT / 3
+
+
+def oi_price_quadrant(df, window=None):
+    """Positioning read: OI change x price change over `window` candles.
+
+    The four-quadrant label every options desk uses, and the one openmtops
+    narrates in plain English:
+        OI up   + price up   -> long buildup    (new longs paying up)
+        OI up   + price down -> fresh writing   (new shorts, sellers in control)
+        OI down + price up   -> short covering  (shorts buying back = squeeze)
+        OI down + price down -> long unwinding  (longs giving up)
+
+    DIAGNOSTIC ONLY. This never gates a trade. It is recorded at entry so the
+    exit study has something to explain outcomes against -- POV's edge already
+    lives in positioning rather than price geometry, so the tape state at fill
+    is the natural covariate to test. If outcomes separate by quadrant it
+    becomes a pre-registered filter hypothesis; if not, nothing is lost.
+
+    Returns (label_or_None, d_oi_pct, d_price_pct). Never raises.
+    """
+    w = QUAD_WINDOW if window is None else window
+    try:
+        if df is None or len(df) < w + 1 or "oi" not in df.columns:
+            return None, 0.0, 0.0
+        oi_now, oi_then = float(df["oi"].iloc[-1]), float(df["oi"].iloc[-1 - w])
+        px_now, px_then = float(df["close"].iloc[-1]), float(df["close"].iloc[-1 - w])
+        if oi_then <= 0 or px_then <= 0:
+            return None, 0.0, 0.0
+        d_oi = (oi_now - oi_then) / oi_then * 100.0
+        d_px = (px_now - px_then) / px_then * 100.0
+        if abs(d_oi) < QUAD_OI_MIN_PCT or abs(d_px) < QUAD_PRICE_MIN_PCT:
+            return None, d_oi, d_px
+        if d_oi > 0:
+            return ("long_buildup" if d_px > 0 else "fresh_writing"), d_oi, d_px
+        return ("short_covering" if d_px > 0 else "long_unwinding"), d_oi, d_px
+    except Exception:
+        return None, 0.0, 0.0
+
 def evaluate_pov(symbol, df, is_midcp=False):
     """
     Evaluate short-squeeze pattern on closed 1-minute candles.
@@ -1207,6 +1250,17 @@ def run_strategy():
                             persist_positions(positions)
                             sync_direction_locks(positions, STRATEGY_NAME, UNDERLYING)
                             log.info(f"Trade entered: {symbol} | SL: {res['sl']} | T1: {res['t1']} | T2: {res['t2']} | T3: {res['t3']} | Opt entry: {entry_opt_price}")
+                            # Tape context at entry -- diagnostic only, never a
+                            # gate. The OI x price quadrant from openmtops'
+                            # narrative.py: it is the read POV's own edge lives
+                            # in (positioning, not price geometry), and having
+                            # it on every fill lets the exit study ask whether
+                            # outcomes separate by what the tape was doing.
+                            _q, _doi, _dpx = oi_price_quadrant(df_opt)
+                            log.info(
+                                "TAPE %s quadrant=%s dOI=%+.1f%% dPx=%+.1f%% (%dm window)",
+                                symbol, _q or "unclear", _doi, _dpx, QUAD_WINDOW,
+                            )
                         else:
                             # Entry failed — release lock so other strategies can try
                             release_symbol_lock(symbol, STRATEGY_NAME)

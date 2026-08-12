@@ -303,25 +303,56 @@ def is_expiry_today(expiry_str):
         return False
 
 def fetch_lot_size(underlying, idx_exchange, opt_exchange):
-    """Fetch actual lot size from option chain. Returns lot size or None."""
+    """Actual contract lot size, or None if it genuinely cannot be determined.
+
+    TWO independent sources, because relying on one produced invalid orders on
+    2026-08-12: optionchain returned
+        404 "No strikes found for NIFTY expiring 18-AUG-26 ... update master
+        contract"
+    all session, on BOTH indices, even though the master held 462 CE rows for
+    that very expiry. Detection fell through to a hardcoded guess and every
+    order that day was rejected with "Quantity must be in multiples of lot
+    size". symbol() kept answering correctly (lotsize 65) throughout, so it is
+    now the second source rather than a guess.
+    """
+    expiry = None
     try:
         expiry = get_nearest_expiry(underlying, opt_exchange)
-        if not expiry:
-            return None
-        resp = client.optionchain(
-            underlying=underlying, exchange=idx_exchange,
-            expiry_date=expiry, strike_count=1
-        )
-        if resp.get("status") == "success":
-            for item in resp.get("chain", []):
-                ce = item.get("ce") or {}
-                if ce.get("lotsize"):
-                    return int(ce["lotsize"])
-                pe = item.get("pe") or {}
-                if pe.get("lotsize"):
-                    return int(pe["lotsize"])
+        if expiry:
+            resp = client.optionchain(
+                underlying=underlying, exchange=idx_exchange,
+                expiry_date=expiry, strike_count=1
+            )
+            if resp.get("status") == "success":
+                for item in resp.get("chain", []):
+                    ce = item.get("ce") or {}
+                    if ce.get("lotsize"):
+                        return int(ce["lotsize"])
+                    pe = item.get("pe") or {}
+                    if pe.get("lotsize"):
+                        return int(pe["lotsize"])
+            else:
+                log.warning("optionchain lot-size lookup failed: %s",
+                            str(resp.get("message"))[:120])
     except Exception as e:
-        log.error(f"Error fetching lot size: {e}")
+        log.warning(f"optionchain lot-size lookup raised: {e}")
+
+    # Source 2: optionsymbol returns lotsize at the TOP LEVEL of its response,
+    # alongside the symbol. This is the same endpoint the strategy already
+    # calls successfully on every cycle to resolve its leg, so if the strategy
+    # can trade at all, this can size it. One call, no extra dependency.
+    try:
+        if expiry:
+            resp = client.optionsymbol(
+                underlying=underlying, exchange=opt_exchange,
+                expiry_date=expiry, offset="ATM", option_type="CE",
+            )
+            if resp.get("status") == "success" and resp.get("lotsize"):
+                log.info("lot size via optionsymbol(%s) = %s",
+                         resp.get("symbol"), resp["lotsize"])
+                return int(resp["lotsize"])
+    except Exception as e:
+        log.warning(f"optionsymbol lot-size lookup raised: {e}")
     return None
 
 def statutory_cost(entry_px, exit_px, qty):
@@ -651,9 +682,19 @@ def run_strategy():
             LOT_SIZE = detected
             log.info(f"Auto-detected lot size: {QUANTITY}")
         else:
-            QUANTITY = 75  # fallback
-            LOT_SIZE = 75
-            log.warning(f"Could not detect lot size, using default: {QUANTITY}")
+            # NEVER guess. The old fallback was a hardcoded 75 -- the NIFTY lot
+            # size from before the 2025-12-31 change to 65, and never correct
+            # for SENSEX (20). On 2026-08-12 detection failed and that guess
+            # produced 51 rejected orders across both books:
+            #   "Quantity must be in multiples of lot size 65" / "... 20"
+            # Analyzer rejects a wrong size outright, which is the benign case.
+            # LIVE would risk a wrong-sized REAL position, so stand down instead.
+            log.error(
+                "Lot size undetectable for %s (both optionchain and symbol() "
+                "failed) -- standing down. Set QUANTITY explicitly to override.",
+                UNDERLYING,
+            )
+            sys.exit(1)
     else:
         LOT_SIZE = QUANTITY
         log.info(f"Using configured lot size: {QUANTITY}")

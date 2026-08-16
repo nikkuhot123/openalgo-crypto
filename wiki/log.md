@@ -16,6 +16,7 @@ An append-only record of wiki updates, backtests, and VPS operations.
 - FIX: sync_positions_with_book now requires POSITIVE evidence. entry rejected/cancelled -> prune. SL complete -> prune. entry complete + SL live -> DISCREPANCY, keep position AND keep stop armed, log error. Undetermined -> RECON_MISS_LIMIT (3) consecutive misses before touching a stop. entry_orderid now stored on the position so the check is possible at all.
 - Judas and PDH/PDL checked: neither cancels a stop on a passive book miss. POV only.
 - 9 new tests reproducing the exact 14-Aug scenario; 132 pass. Deployed pov eb149dbf.
+- FOLLOW-UP FIX (same day): POV treated order ACCEPTANCE as a fill. 77800CE was accepted then rejected by the exchange; fetch_fill_price() returns None for both "rejected" and "unreadable", so the caller fell back to the pre-trade quote, armed a stop and logged "Trade entered ... Opt entry: 499.45" for a position that never existed. New confirm_entry_fill() returns complete/dead/unknown: dead aborts the entry with no stop and no position; unknown is deliberately treated as LIVE (an untracked real fill is worse than a phantom, and RECONCILE now settles it). 8 more tests, 140 pass. Deployed pov c073b360.
 
 ## [2026-08-12] research | OpenMTOps upstream review + OI feed verification
 - Reviewed CApsUNlocked123/openmtops pov_engine.py: our POV port is faithful, every constant matches (PRE 50k, C2 30k, 5/5 gate, 1.5/3/5R targets). Upstream sources OI from the candle feed, same as us.

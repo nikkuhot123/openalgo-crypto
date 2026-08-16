@@ -161,3 +161,76 @@ def test_order_state_none_without_id():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry confirmation: acceptance is not a fill.
+#
+# 2026-08-14: SENSEX20AUG2677800CE was ACCEPTED by placeorder (status success,
+# orderid returned) and then REJECTED by the exchange. fetch_fill_price()
+# returns None for both "rejected" and "unreadable", so the caller could not
+# tell them apart -- it fell back to the pre-trade quote, armed a stop, and
+# logged "Trade entered ... Opt entry: 499.45" for a position that never
+# existed. confirm_entry_fill() keeps the three states distinct.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _orderstatus(monkeypatch, payload, fail_times=0):
+    calls = {"n": 0}
+
+    def _st(order_id=None, **kw):
+        calls["n"] += 1
+        if calls["n"] <= fail_times:
+            return {"status": "success", "data": {"order_status": "pending"}}
+        return payload
+
+    monkeypatch.setattr(pov.client, "orderstatus", _st, raising=False)
+    monkeypatch.setattr(pov.time, "sleep", lambda *_a, **_k: None)
+    return calls
+
+
+def test_rejected_entry_reports_dead(monkeypatch):
+    """The exact 77800CE case."""
+    _orderstatus(monkeypatch, {"status": "success", "data": {"order_status": "rejected"}})
+    assert pov.confirm_entry_fill("O1", "SENSEX20AUG2677800CE") == ("dead", None)
+
+
+def test_cancelled_entry_reports_dead(monkeypatch):
+    _orderstatus(monkeypatch, {"status": "success", "data": {"order_status": "cancelled"}})
+    assert pov.confirm_entry_fill("O1", "X") == ("dead", None)
+
+
+def test_filled_entry_returns_real_average(monkeypatch):
+    _orderstatus(monkeypatch, {"status": "success",
+                               "data": {"order_status": "complete", "average_price": 433.95}})
+    assert pov.confirm_entry_fill("O1", "X") == ("complete", 433.95)
+
+
+def test_filled_without_readable_average_is_still_complete(monkeypatch):
+    """A real position with an unreadable price must NOT be discarded."""
+    _orderstatus(monkeypatch, {"status": "success",
+                               "data": {"order_status": "complete", "average_price": 0}})
+    assert pov.confirm_entry_fill("O1", "X") == ("complete", None)
+
+
+def test_pending_then_filled_is_retried(monkeypatch):
+    calls = _orderstatus(monkeypatch, {"status": "success",
+                                       "data": {"order_status": "complete",
+                                                "average_price": 333.05}}, fail_times=2)
+    assert pov.confirm_entry_fill("O1", "X") == ("complete", 333.05)
+    assert calls["n"] == 3
+
+
+def test_still_pending_reports_unknown_not_dead(monkeypatch):
+    """Unknown must never be conflated with dead -- an unconfirmed order may
+    still fill, and an untracked real position is worse than a phantom."""
+    _orderstatus(monkeypatch, {"status": "success", "data": {"order_status": "trigger_pending"}})
+    assert pov.confirm_entry_fill("O1", "X") == ("unknown", None)
+
+
+def test_broker_error_reports_unknown(monkeypatch):
+    _orderstatus(monkeypatch, {"status": "error", "message": "boom"})
+    assert pov.confirm_entry_fill("O1", "X") == ("unknown", None)
+
+
+def test_no_order_id_is_unknown():
+    assert pov.confirm_entry_fill(None, "X") == ("unknown", None)

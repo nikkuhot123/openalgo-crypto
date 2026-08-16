@@ -382,6 +382,47 @@ def fetch_fill_price(order_id, context="", max_retries=4, retry_delay=0.7):
     log.warning(f"Could not read fill price for order {order_id} {context}".strip())
     return None
 
+
+def confirm_entry_fill(order_id, symbol, context="", max_retries=6, retry_delay=0.7):
+    """Did the ENTRY actually fill? Returns (state, fill_price).
+
+        'complete' -> the broker confirms a fill; fill_price is the real average
+        'dead'     -> the broker confirms rejected/cancelled; do NOT trade it
+        'unknown'  -> still pending, or unreadable, after max_retries
+
+    fetch_fill_price() collapses 'rejected' and 'unreadable' into the same None,
+    which is what let a REJECTED order be treated as a position on 2026-08-14:
+    the caller fell back to the pre-trade quote, armed a stop and logged an
+    entry for SENSEX20AUG2677800CE, which never existed. Callers need the three
+    states kept apart, because the correct response differs for each.
+    """
+    if not order_id:
+        return "unknown", None
+    for attempt in range(max_retries):
+        try:
+            st = client.orderstatus(order_id=order_id, strategy=STRATEGY_NAME)
+            if isinstance(st, dict) and st.get("status") == "success":
+                d = st.get("data", {}) or {}
+                status = str(d.get("order_status", "")).strip().lower()
+                if status in ("rejected", "cancelled", "canceled"):
+                    return "dead", None
+                for key in ("average_price", "averageprice", "avg_price", "price"):
+                    try:
+                        px = float(d.get(key) or 0)
+                    except (TypeError, ValueError):
+                        px = 0.0
+                    if px > 0:
+                        return "complete", px
+                if status in ("complete", "completed", "filled"):
+                    # Filled but the average is unreadable -- still a real position.
+                    return "complete", None
+        except Exception as e:
+            log.debug(f"confirm_entry_fill {order_id} attempt {attempt + 1}: {e}")
+        if attempt < max_retries - 1:
+            time.sleep(retry_delay)
+    log.warning(f"Entry fill state undetermined for order {order_id} {context}".strip())
+    return "unknown", None
+
 def statutory_cost(entry_px, exit_px, qty):
     """Round-trip statutory cost in rupees for an option BUY->SELL, premium-based.
 
@@ -1286,12 +1327,35 @@ def run_strategy():
                         )
                         log.info(f"Entry Order Response: {order_resp}")
                         if order_resp.get("status") == "success":
-                            # Book the ACTUAL entry fill for P&L; the pre-trade quote
-                            # was only needed for auto-lot sizing (bug 2026-07-28:
-                            # quote said 32.65, the real fill was 32.45).
-                            _fill_entry = fetch_fill_price(order_resp.get("orderid"), context=f"(entry {symbol})")
+                            # ACCEPTANCE IS NOT A FILL. placeorder returning
+                            # success only means the order was taken; the
+                            # exchange can still reject it. On 2026-08-14
+                            # SENSEX20AUG2677800CE was accepted, then REJECTED,
+                            # and the old code could not tell that apart from
+                            # "fill price unreadable" -- both surfaced as None.
+                            # It fell back to the pre-trade QUOTE, armed a stop
+                            # and logged "Trade entered ... Opt entry: 499.45"
+                            # for a position that never existed.
+                            _state, _fill_entry = confirm_entry_fill(
+                                order_resp.get("orderid"), symbol, context=f"(entry {symbol})")
+                            if _state == "dead":
+                                log.error(
+                                    "ENTRY NOT FILLED for %s (order %s came back %s) — "
+                                    "no stop armed, no position recorded.",
+                                    symbol, order_resp.get("orderid"), _state)
+                                release_symbol_lock(symbol, STRATEGY_NAME)
+                                continue
                             if _fill_entry is not None:
                                 entry_opt_price = _fill_entry
+                            elif _state == "unknown":
+                                # Treat as LIVE deliberately: an unconfirmed order
+                                # may still fill, and an untracked real position
+                                # with no stop is far worse than a phantom one.
+                                # RECONCILE resolves it either way now.
+                                log.warning(
+                                    "Entry fill UNCONFIRMED for %s (order %s) — tracking as "
+                                    "live on the pre-trade quote %.2f; RECONCILE will settle it.",
+                                    symbol, order_resp.get("orderid"), float(entry_opt_price or 0))
                             sl_orderid = None
 
                             # Place the protective stop as SL (stop-LIMIT).

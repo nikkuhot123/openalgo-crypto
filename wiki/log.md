@@ -4,6 +4,19 @@ An append-only record of wiki updates, backtests, and VPS operations.
 
 ---
 
+## [2026-08-16] bugfix | RECONCILE cancelled stops on two LIVE positions (14-Aug)
+- 14-Aug ran LIVE. All three prior fixes held: lot sizes correct (65/20, zero rejections vs 51 on 12-Aug), greeks collector 1,356 option rows (was 0), TAPE quadrant tagging live on 7 entries.
+- Recorded P&L +Rs 1,661 (Judas 24300CE +2,507 target; POV SENSEX 78000CE +352 target; POV 24450CE -714 max-hold; POV 24400CE -483 SL).
+- BUT: POV opened 3 SENSEX legs at 12:49 and RECONCILE pruned all three, cancelling their stops. Only one was correct:
+    77800CE entry REJECTED          -> prune correct
+    78100CE entry COMPLETE @ 333.05 -> LIVE position, stop cancelled
+    77900CE entry COMPLETE @ 433.95 -> LIVE position, stop cancelled (stop 420.1, leg trading 426-436 at prune time)
+- Both ran unprotected to broker MIS auto-squareoff. P&L never reached the books or the circuit breakers. Exits unrecoverable (broker serves current session only; those thin strikes have no candle history).
+- Second occurrence of this failure mode; July lost 75-80% on three legs the same way via a different trigger.
+- FIX: sync_positions_with_book now requires POSITIVE evidence. entry rejected/cancelled -> prune. SL complete -> prune. entry complete + SL live -> DISCREPANCY, keep position AND keep stop armed, log error. Undetermined -> RECON_MISS_LIMIT (3) consecutive misses before touching a stop. entry_orderid now stored on the position so the check is possible at all.
+- Judas and PDH/PDL checked: neither cancels a stop on a passive book miss. POV only.
+- 9 new tests reproducing the exact 14-Aug scenario; 132 pass. Deployed pov eb149dbf.
+
 ## [2026-08-12] research | OpenMTOps upstream review + OI feed verification
 - Reviewed CApsUNlocked123/openmtops pov_engine.py: our POV port is faithful, every constant matches (PRE 50k, C2 30k, 5/5 gate, 1.5/3/5R targets). Upstream sources OI from the candle feed, same as us.
 - Verified the optionchain 404 did NOT degrade OI scoring: optionchain was only ever called in fetch_lot_size. Cross-checked history() OI against the collector's independent quote path (NIFTY25AUG26FUT, 312 minutes): mean abs diff 2,128 = 0.017% of OI, early samples exact. Feed is trustworthy.

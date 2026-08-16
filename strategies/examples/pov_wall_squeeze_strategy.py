@@ -447,30 +447,116 @@ def verified_exit_sell(symbol, opt_exchange, qty, sl_oid, reason):
         fill_px = fetch_fill_price(resp.get("orderid"), context=f"({reason} {symbol})")
     return "sold", fill_px
 
+# Consecutive positionbook misses required before RECONCILE will cancel a
+# protective stop on evidence it could not confirm. One miss is not proof.
+RECON_MISS_LIMIT = int(os.getenv("RECON_MISS_LIMIT", "3"))
+_recon_miss = {}   # symbol -> consecutive unexplained positionbook misses
+
+def order_state(order_id, context=""):
+    """Terminal state of an order per the broker: 'complete', 'rejected',
+    'cancelled', 'pending', or None when it cannot be determined.
+
+    The positionbook is NOT sufficient evidence on its own -- see
+    sync_positions_with_book below for what that cost on 2026-08-14.
+    """
+    if not order_id:
+        return None
+    try:
+        r = client.orderstatus(order_id=order_id, strategy=STRATEGY_NAME)
+        d = (r.get("data") or {}) if isinstance(r, dict) else {}
+        st = str(d.get("order_status", "")).strip().lower()
+        if st in ("complete", "completed", "filled"):
+            return "complete"
+        if st in ("rejected",):
+            return "rejected"
+        if st in ("cancelled", "canceled"):
+            return "cancelled"
+        if st:
+            return "pending"
+    except Exception as e:
+        log.debug(f"order_state({order_id}) {context} failed: {e}")
+    return None
+
+
 def sync_positions_with_book(positions, underlying):
-    """Drop tracked positions that are no longer open on the broker side.
-    Cancels any associated SL order and releases the symbol lock.
-    Returns the number of stale entries pruned.
+    """Drop tracked positions the broker no longer holds -- but only on POSITIVE
+    evidence, never on a bare positionbook miss.
+
+    2026-08-14, live money: POV opened three SENSEX legs at 12:49. The
+    positionbook did not list them, so this function pruned all three and
+    cancelled their stop-losses:
+        77800CE  entry REJECTED           -> pruning was correct
+        78100CE  entry COMPLETE @ 333.05  -> live position, SL cancelled
+        77900CE  entry COMPLETE @ 433.95  -> live position, SL cancelled
+    77900CE's stop was 420.1 and the leg was trading 426-436 when it was
+    pruned, so it was genuinely open and simply unprotected from then on. Both
+    ran naked to the broker's MIS auto-squareoff, and neither P&L ever reached
+    the strategy's books or its circuit breakers. This is the second occurrence
+    of this failure mode; the July one lost 75-80% on three legs the same way.
+
+    A missing positionbook row is ambiguous -- it can equally mean the broker
+    simply is not reporting that leg. So:
+      * entry rejected/cancelled  -> the position never existed. Prune.
+      * SL order complete         -> stopped out. Prune.
+      * entry complete, SL live   -> DISCREPANCY. Keep the position, KEEP THE
+                                     STOP ARMED, and shout. max-hold and the
+                                     decay floor remain as backstops.
+      * nothing determinable      -> require MISS_LIMIT consecutive misses
+                                     before touching a protective stop.
     """
     pruned = 0
     for symbol in list(positions.keys()):
         qty = live_position_qty(underlying, symbol)
         if qty is None:
+            _recon_miss.pop(symbol, None)
             continue  # could not verify; leave intact
-        if qty == 0:
-            pos = positions.get(symbol, {})
-            sl_oid = pos.get("sl_orderid")
-            if sl_oid:
-                ok, msg = safe_cancel_order(sl_oid, context=f"reconcile-{symbol}")
-                level = log.info if ok else log.error
-                level(f"RECONCILE: {symbol} not in positionbook; cancel SL {sl_oid} → {msg}")
-            else:
-                log.warning(f"RECONCILE: {symbol} not in positionbook; dropping from tracking")
-            release_symbol_lock(symbol, STRATEGY_NAME)
-            del positions[symbol]
-            persist_positions(positions)
-            sync_direction_locks(positions, STRATEGY_NAME, UNDERLYING)
-            pruned += 1
+        if qty != 0:
+            _recon_miss.pop(symbol, None)
+            continue
+
+        pos = positions.get(symbol, {})
+        sl_oid = pos.get("sl_orderid")
+        entry_state = order_state(pos.get("entry_orderid"), f"entry {symbol}")
+        sl_state = order_state(sl_oid, f"sl {symbol}") if sl_oid else None
+
+        if entry_state == "complete" and sl_state not in ("complete", "rejected", "cancelled"):
+            log.error(
+                "RECONCILE DISCREPANCY: %s absent from positionbook but its ENTRY "
+                "order is COMPLETE and the SL is %s. Treating the position as LIVE "
+                "and leaving the stop armed. Verify manually.",
+                symbol, sl_state or "unknown",
+            )
+            _recon_miss.pop(symbol, None)
+            continue
+
+        if entry_state in ("rejected", "cancelled"):
+            reason = f"entry {entry_state}"
+        elif sl_state == "complete":
+            reason = "SL filled"
+        else:
+            misses = _recon_miss.get(symbol, 0) + 1
+            _recon_miss[symbol] = misses
+            if misses < RECON_MISS_LIMIT:
+                log.warning(
+                    "RECONCILE: %s absent from positionbook (%s/%s) and its state is "
+                    "undetermined -- holding the stop until confirmed.",
+                    symbol, misses, RECON_MISS_LIMIT,
+                )
+                continue
+            reason = f"absent {misses}x, state undetermined"
+
+        if sl_oid and sl_state != "complete":
+            ok, msg = safe_cancel_order(sl_oid, context=f"reconcile-{symbol}")
+            level = log.info if ok else log.error
+            level(f"RECONCILE: {symbol} pruned ({reason}); cancel SL {sl_oid} → {msg}")
+        else:
+            log.info(f"RECONCILE: {symbol} pruned ({reason}); no SL to cancel")
+        _recon_miss.pop(symbol, None)
+        release_symbol_lock(symbol, STRATEGY_NAME)
+        del positions[symbol]
+        persist_positions(positions)
+        sync_direction_locks(positions, STRATEGY_NAME, UNDERLYING)
+        pruned += 1
     return pruned
 
 def fetch_available_capital():
@@ -1241,6 +1327,12 @@ def run_strategy():
                             positions[symbol] = {
                                 "qty": entry_qty,
                                 "sl_orderid": sl_orderid,
+                                # RECONCILE needs to be able to ask the broker
+                                # what actually happened to the ENTRY before it
+                                # will cancel a protective stop. Without this it
+                                # can only see a positionbook miss, which on
+                                # 2026-08-14 pruned two live legs.
+                                "entry_orderid": order_resp.get("orderid"),
                                 "sl_price": res["sl"],
                                 "target_price": res["t1"],
                                 "entry_opt_price": entry_opt_price,

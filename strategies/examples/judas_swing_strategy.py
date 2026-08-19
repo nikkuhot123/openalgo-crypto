@@ -181,6 +181,31 @@ def load_persisted_trade():
         log.warning(f"load_persisted_trade failed: {e}")
     return {}
 
+def persist_done(day):
+    """Record that the one permitted trade for `day` is finished.
+
+    `state = "DONE"` lives only in memory. Before this, a mid-session restart
+    reloaded an empty snapshot, came up IDLE, and could open a SECOND position
+    on a day Judas had already traded -- breaking the one-trade-per-day rule
+    that the entry logic and every backtest of it rest on. The 2026-08-19
+    external-close fix makes that reachable: standing down now clears the trade
+    and leaves nothing behind to say why.
+    """
+    try:
+        STATE_FILE.write_text(json.dumps({"done_date": day.isoformat()}))
+    except Exception as e:
+        log.debug(f"persist_done failed: {e}")
+
+def load_done_date():
+    """The date Judas last finished trading for, or None."""
+    try:
+        raw = (load_persisted_trade() or {}).get("done_date")
+        if raw:
+            return date.fromisoformat(str(raw))
+    except Exception as e:
+        log.debug(f"load_done_date failed: {e}")
+    return None
+
 def reconcile_orphan_position(underlying):
     """Check positionbook for an open position matching this underlying. Returns adopted trade dict or None."""
     try:
@@ -394,6 +419,117 @@ def oi_price_quadrant(df, window=None):
         return ("short_covering" if d_px > 0 else "long_unwinding"), d_oi, d_px
     except Exception:
         return None, 0.0, 0.0
+
+
+# Consecutive positionbook misses before an open trade is declared externally
+# closed. One miss is not proof -- assuming it was cancelled the stops on two
+# live POV legs on 2026-08-14.
+EXT_CLOSE_MISS_LIMIT = int(os.getenv("EXT_CLOSE_MISS_LIMIT", "3"))
+_ext_close_miss = [0]
+
+# How often the open position is reconciled against the broker, in seconds.
+# With MISS_LIMIT 3 an undetermined entry is resolved in ~90s worst case.
+RECON_SECS = float(os.getenv("RECON_SECS", "30"))
+_last_recon = [0.0]
+
+
+def detect_external_close(active_trade, underlying, symbol):
+    """Was this position closed by someone other than this strategy?
+
+    Returns (True, reason) only on positive evidence. Judas never places a
+    resting stop, so the only broker-side records are the entry it placed and
+    whatever closed the position. The tests:
+
+      entry order rejected/cancelled -> it never became a position
+      broker flat, entry complete    -> something else closed it (manual
+                                        square-off, broker action)
+      broker flat, entry unreadable  -> require EXT_CLOSE_MISS_LIMIT misses
+      broker holds qty > 0           -> still open, reset the counter
+      broker unverifiable            -> no decision at all
+    """
+    if not active_trade or not symbol:
+        return False, ""
+    qty = live_position_qty(underlying, symbol)
+    if qty is None:
+        return False, ""            # cannot verify -- decide nothing
+    if qty > 0:
+        _ext_close_miss[0] = 0
+        return False, ""
+
+    entry_state = order_state(active_trade.get("entry_orderid"), f"entry {symbol}")
+    if entry_state in ("rejected", "cancelled"):
+        _ext_close_miss[0] = 0
+        return True, f"entry {entry_state}"
+    if entry_state == "complete":
+        _ext_close_miss[0] = 0
+        return True, "broker flat, entry was filled"
+
+    _ext_close_miss[0] += 1
+    if _ext_close_miss[0] >= EXT_CLOSE_MISS_LIMIT:
+        n = _ext_close_miss[0]
+        _ext_close_miss[0] = 0
+        return True, f"broker flat {n}x, entry state undetermined"
+    log.warning("%s absent from positionbook (%s/%s) and entry state undetermined — holding.",
+                symbol, _ext_close_miss[0], EXT_CLOSE_MISS_LIMIT)
+    return False, ""
+
+
+def order_state(order_id, context=""):
+    """'complete' | 'rejected' | 'cancelled' | 'pending', or None if unreadable."""
+    if not order_id:
+        return None
+    try:
+        r = client.orderstatus(order_id=order_id, strategy=STRATEGY_NAME)
+        d = (r.get("data") or {}) if isinstance(r, dict) else {}
+        st = str(d.get("order_status", "")).strip().lower()
+        if st in ("complete", "completed", "filled"):
+            return "complete"
+        if st == "rejected":
+            return "rejected"
+        if st in ("cancelled", "canceled"):
+            return "cancelled"
+        if st:
+            return "pending"
+    except Exception as e:
+        log.debug(f"order_state({order_id}) {context} failed: {e}")
+    return None
+
+
+def find_external_exit_price(symbol, active_trade):
+    """Average price of the SELL that closed us, per the broker's own books.
+
+    An externally-closed trade has no exit order in this strategy's records, so
+    the price has to come from the broker. Tradebook first (actual fills), then
+    the orderbook. Returns None when neither can supply it -- the caller still
+    closes out tracking, because a permanent ghost is worse than an unpriced
+    trade.
+    """
+    want = str(symbol).upper()
+    for source, fn in (("tradebook", client.tradebook), ("orderbook", client.orderbook)):
+        try:
+            r = fn()
+            if not isinstance(r, dict) or r.get("status") != "success":
+                continue
+            data = r.get("data") or {}
+            rows = data.get("orders", data) if isinstance(data, dict) else data
+            for row in rows or []:
+                if str(row.get("symbol", "")).upper() != want:
+                    continue
+                if str(row.get("action", "")).upper() != "SELL":
+                    continue
+                if str(row.get("order_status", "complete")).lower() not in ("complete", "completed", "filled"):
+                    continue
+                for key in ("average_price", "averageprice", "price", "tradeprice"):
+                    try:
+                        px = float(row.get(key) or 0)
+                    except (TypeError, ValueError):
+                        px = 0.0
+                    if px > 0:
+                        log.info("External exit price for %s from %s: %.2f", symbol, source, px)
+                        return px
+        except Exception as e:
+            log.debug(f"find_external_exit_price {source} failed: {e}")
+    return None
 
 def statutory_cost(entry_px, exit_px, qty):
     """Round-trip statutory cost in rupees for an option BUY->SELL.
@@ -775,7 +911,19 @@ def run_strategy():
         trade_date = date.today()  # seed so the new-day reset does NOT wipe the adopted IN_TRADE state
         persist_trade(active_trade)
     else:
-        persist_trade({})  # broker holds nothing — clear any stale snapshot
+        # Read the day-marker BEFORE touching the snapshot -- persist_trade({})
+        # would erase the very record we need. An open position always wins:
+        # if the broker holds something we adopt and manage it (above), marker
+        # or not.
+        _done_on = load_done_date()
+        if _done_on == date.today():
+            state = "DONE"
+            trade_date = date.today()
+            log.warning("Already traded today (%s) — standing down for the session. "
+                        "Judas is one-trade-per-day; a restart must not open a second.", _done_on)
+            persist_done(_done_on)      # keep the marker; do NOT clear it
+        else:
+            persist_trade({})  # broker holds nothing — clear any stale snapshot
 
     while True:
         try:
@@ -818,6 +966,60 @@ def run_strategy():
                     log.info(f"Monitoring Trade: {symbol} | Spot: {underlying_ltp:.2f} | SL: {sl_spot:.2f} | Target: {target_spot:.2f}")
 
                 log_premium_path(symbol, opt_exchange, active_trade, underlying_ltp, qty)
+
+                # ---- reconcile against the broker --------------------------
+                # Judas is otherwise a pure SPOT watcher: live_position_qty()
+                # appears nowhere except inside `if exit_triggered`. So a
+                # position closed by anything OTHER than this strategy -- a
+                # manual square-off, a broker action -- is invisible to it.
+                # 2026-08-19: a manual square-off at 11:58 left Judas still
+                # logging "Monitoring Trade" at 12:16, holding the symbol lock
+                # and blocking the session, and the +Rs 520 never reached the
+                # books or the circuit breakers.
+                #
+                # Positive evidence only, same rule as POV's RECONCILE: a bare
+                # positionbook miss is NOT proof (that assumption cancelled the
+                # stops on two live legs on 2026-08-14).
+                # Throttled: the in-trade loop polls every 5s and this costs a
+                # positionbook call, so at 5s it would add ~12 calls/min for the
+                # whole session. RECON_SECS keeps it cheap; a ghost surviving
+                # 30s longer costs nothing, since no exit decision depends on it.
+                _closed, _detail = (False, "")
+                if time.time() - _last_recon[0] >= RECON_SECS:
+                    _last_recon[0] = time.time()
+                    _closed, _detail = detect_external_close(active_trade, UNDERLYING, symbol)
+                if _closed:
+                    _ext_px = find_external_exit_price(symbol, active_trade)
+                    _entry_fill = active_trade.get("entry_fill_price") or active_trade.get("entry_opt_price")
+                    if _ext_px is not None and _entry_fill is not None:
+                        _gross = (_ext_px - _entry_fill) * qty
+                        _cost = statutory_cost(_entry_fill, _ext_px, qty)
+                        _pnl = _gross - _cost
+                        if _pnl < 0:
+                            consecutive_losses += 1
+                            daily_loss_rs += abs(_pnl)
+                            log.info(f"Trade P&L: ₹{_pnl:+.2f} (gross ₹{_gross:+.2f} − cost ₹{_cost:.2f}, "
+                                     f"externally closed) | Loss streak: {consecutive_losses} "
+                                     f"| Daily losses: ₹{daily_loss_rs:.0f}")
+                        else:
+                            consecutive_losses = 0
+                            log.info(f"Trade P&L: ₹{_pnl:+.2f} (gross ₹{_gross:+.2f} − cost ₹{_cost:.2f}, "
+                                     f"externally closed) | Loss streak reset")
+                    else:
+                        # Close the tracking regardless. An unpriced closed trade
+                        # is recoverable from the broker later; a permanent ghost
+                        # blocks the strategy and lies on the dashboard.
+                        log.warning(
+                            "EXTERNAL CLOSE %s (%s) — exit price unavailable, P&L NOT booked. "
+                            "Reconcile manually from the broker orderbook.", symbol, _detail)
+                    log.info("EXTERNAL CLOSE: %s no longer held (%s) — releasing and standing down.",
+                             symbol, _detail)
+                    release_symbol_lock(symbol, STRATEGY_NAME)
+                    state = "DONE"
+                    active_trade = {}
+                    _active_trade = {}
+                    persist_done(today)   # a restart must not open a second trade
+                    continue
 
                 # ---- break-even ratchet -------------------------------------
                 # Measured 2026-08-06 over the 25 live round trips since
@@ -931,7 +1133,7 @@ def run_strategy():
                     state = "DONE"
                     active_trade = {}
                     _active_trade = {}
-                    persist_trade({})
+                    persist_done(today)   # survives a restart, unlike `state`
                 else:
                     time.sleep(5)  # Fast poll when in trade
                     continue
@@ -1087,6 +1289,13 @@ def run_strategy():
                         "entry_fill_price": (
                             fetch_fill_price(order_resp.get("orderid"))
                             if isinstance(order_resp, dict) else None
+                        ),
+                        # Needed to ask the broker what happened to the ENTRY.
+                        # detect_external_close() distinguishes "never filled"
+                        # from "filled then closed by someone else"; without the
+                        # id it can only count positionbook misses.
+                        "entry_orderid": (
+                            order_resp.get("orderid") if isinstance(order_resp, dict) else None
                         ),
                     }
                     _active_trade = active_trade

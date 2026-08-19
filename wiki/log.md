@@ -4,6 +4,37 @@ An append-only record of wiki updates, backtests, and VPS operations.
 
 ---
 
+## [2026-08-19] bugfix | Judas monitored a ghost position for 18 minutes
+
+- LIVE. A manual square-off closed `NIFTY25AUG2624050CE` at 11:58 (+Rs 520).
+  Judas was still logging `Monitoring Trade` at 12:16.
+- Root cause: `live_position_qty()` appeared **nowhere** except inside
+  `if exit_triggered`. Judas is otherwise a pure spot watcher, so a close it
+  did not initiate was invisible. POV had `sync_positions_with_book`; Judas had
+  no equivalent.
+- Consequences: symbol lock held, session blocked, and the +Rs 520 never
+  reached the books or the circuit breakers.
+- Not a money risk: every SELL path (exit + shutdown) already verifies the
+  broker holds the position. Verified live -- SIGTERM logged
+  `broker reports ... qty=0 - already flat, no SELL` and placed no order.
+- Fix 1: `detect_external_close()` on positive evidence only -- entry
+  rejected/cancelled -> never a position; broker flat + entry complete ->
+  externally closed; flat + entry undetermined -> 3 consecutive misses;
+  positionbook unverifiable -> no decision (the 2026-08-14 lesson).
+  Throttled to RECON_SECS=30 (in-trade poll is 5s).
+- Fix 2: `find_external_exit_price()` reads the closing SELL from the broker's
+  tradebook, then orderbook. Tracking closes even when unpriced -- a permanent
+  ghost is worse than an unpriced trade.
+- Fix 3 (latent, made reachable by Fix 1): `state = "DONE"` was memory-only, so
+  a mid-session restart came up IDLE and could open a SECOND trade on a day
+  Judas had already traded. Added `persist_done()`/`load_done_date()`; boot
+  reads the marker before `persist_trade({})` can erase it.
+- Verified against the real ghost on the live broker: exit 167.75 reconstructs
+  gross Rs +520.00 exactly (matching the broker), net Rs +468.29 after cost.
+- End-to-end on the VPS: booted the real strategy with today's marker ->
+  `Already traded today (2026-08-19) - standing down`, zero orders placed.
+- 31 new tests, 171 pass. Deployed judas 418e4461 (md5 verified both dirs).
+
 ## [2026-08-16] bugfix | RECONCILE cancelled stops on two LIVE positions (14-Aug)
 - 14-Aug ran LIVE. All three prior fixes held: lot sizes correct (65/20, zero rejections vs 51 on 12-Aug), greeks collector 1,356 option rows (was 0), TAPE quadrant tagging live on 7 entries.
 - Recorded P&L +Rs 1,661 (Judas 24300CE +2,507 target; POV SENSEX 78000CE +352 target; POV 24450CE -714 max-hold; POV 24400CE -483 SL).

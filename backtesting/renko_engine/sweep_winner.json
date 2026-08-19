@@ -1,0 +1,18 @@
+{
+  "tf": 15,
+  "cfg": {
+    "PCT_INDEX": 1.0,
+    "LEVEL_TOL": 16.0,
+    "MIN_TARGET_R": 2.0,
+    "T1_RR": 2.5,
+    "FILTER_EMA": false,
+    "REQUIRE_CONFLUENCE": false
+  },
+  "is": {
+    "n": 598.0,
+    "pts": 4412.022749999967,
+    "pf": 1.421080923090134,
+    "sharpe": 3.0246884807526393,
+    "win": 39.297658862876254
+  }
+}

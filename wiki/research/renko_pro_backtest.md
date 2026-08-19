@@ -57,3 +57,97 @@ Although NIFTY 30m shows a net profit (+Rs 315,534), it is rejected for live dep
 **Verdict: No edge.** The index-point edge is a statistical artifact driven by a tiny handful of outlier trades on one side of the book, and it does not survive the option friction hurdle.
 
 *Script: `backtesting/renko_engine/renko_engine_backtest.py`*
+
+---
+
+## 5. Parameter Sweep Under A Pre-Registered Protocol (2026-08-19)
+
+Sections 2-4 tested the Pine's **shipped defaults**. The remaining question was
+tuning: does *any* parameter set carry a real edge? Because sweeping until
+something looks good is how the previous four price-pattern studies in this repo
+manufactured headlines that died on contact, the protocol was fixed in the
+script **before any result was inspected** (`backtesting/renko_engine/renko_sweep.py`).
+
+**Selection.** 576 configs x 3 timeframes = **1,728 runs**, NIFTY only, on the
+**first 60% of sessions**. Grid: brick 0.33/0.50/0.66/1.00%, tolerance 4/8/16 pts,
+room 1.0/1.5/2.0/3.0R, T1 1.0/1.5/2.5R, EMA filter on/off, confluence required
+on/off. Ranked by in-sample net points, minimum 60 IS trades. Exactly one winner
+carried forward.
+
+### The first result is the sweep itself
+
+**1,708 of 1,726 qualifying configs (99.0%) were profitable in-sample.** Pure
+noise produces ~50%. In-sample profitability therefore carries almost no
+information here, and "the best tuning" is close to meaningless as a selection
+signal.
+
+Winner: **15m, brick 1.00%, tolerance 16, room 2.0R, T1 2.5R, EMA filter OFF,
+confluence NOT required** — IS n=598, win 39.3%, PF 1.42, +4,412 pts, Sharpe 3.02.
+
+Note what tuning chose: it switched **off both of the engine's signature gates**.
+The best version of the Dr Devendra Renko engine is the one that ignores
+structural confluence and the trend cloud entirely.
+
+### The five pre-registered gates
+
+| Gate | Test | Result | |
+|---|---|---|---|
+| G1 | NIFTY OOS (last 40%) net > 0 | n=398, win 36.7%, PF 1.09, **+755 pts**, Sharpe 0.63 | PASS |
+| G2 | >=2 of 4 other indices net > 0 | MIDCPNIFTY +4,964, FINNIFTY +776; BANKNIFTY -480, SENSEX -283 | PASS (bare 2/4) |
+| G3 | Beat 200 random-entry permutations, z > 2 on net AND Sharpe | **z(pts) +1.78, z(Sharpe) +1.10; 7/200 nulls beat it outright** | **FAIL** |
+| G4 | Net Rs > 0 after delta + statutory + spread | +Rs 76,705 on 1 lot | PASS |
+| G5 | Net > 0 after deleting top 5 trades | +3,866 pts | PASS |
+
+**Verdict: NO EDGE.**
+
+### Why G3 is the one that matters
+
+The null randomises **entry timing only** — same session, same side, same EMA
+side, same per-day count — and runs the *identical* exit engine via an
+`entry_override` hook, so no reimplementation can flatter either arm. The
+baseline was regression-checked first: 435/746/1407 trades and identical net
+points on 30m/15m/5m after the refactor.
+
+Random entries earn **+3,040 points on average**. The red-bar trigger earns
++5,167. The gap is 1.78 standard deviations of the null — not significant, and
+7 of 200 random seeds beat the real trigger outright.
+
+This independently reproduces the Pine author's own header note
+(z(sharpe) = +0.14, z(win) = +0.77, 2 of 4 null seeds beating it). Their
+conclusion was to delete the strategy layer. This sweep says they were right,
+and that tuning does not rescue it.
+
+### Where the money actually was
+
+| Exit | n | Net pts | Mean |
+|---|---|---|---|
+| EOD | 398 | +18,072 | +45.41 |
+| SL | 564 | -17,913 | -31.76 |
+| T2 | 34 | +5,008 | +147.31 |
+
+EOD and stops nearly cancel (**+159 points across 962 trades**). **34 T2 hits —
+3.4% of trades — carry 97% of the net.**
+
+| Book | n | Avg pts/trade | vs 1.88 breakeven | Net Rs (1 lot) |
+|---|---|---|---|---|
+| All trades | 996 | +5.19 | clears | +Rs 76,705 |
+| Excluding T2 exits | 962 | **+0.17** | fails | **-Rs 38,355** |
+| Excluding top 5% | 946 | **-3.58** | fails | negative |
+
+G5 passed only because "top 5 trades" was calibrated on the earlier 435-trade
+study (1.1% of the sample); on 996 trades it is 0.5% and tests a quarter as
+much. A scale-invariant gate was added **post-hoc and labelled as such** (G6,
+top 5% measured against the friction hurdle rather than zero): **-3.58 pts/trade,
+FAIL**. It did not decide the verdict — G3 had already failed.
+
+### Conclusion
+
+Five price-pattern methods have now been tested in this repo (Red Bar, Renko PRO
+defaults, HA-EMA, Stochastic, Renko PRO tuned) and all five died the same way: a
+thin in-sample signal that does not survive option friction, cross-symbol
+validation, or a randomised-entry null. The tuned Renko engine adds one sharper
+lesson — with 99% of configs profitable in-sample, this family of backtest is
+not capable of distinguishing signal from drift, and the only test that
+discriminated was the permutation null.
+
+*Scripts: `backtesting/renko_engine/renko_sweep.py`, `backtesting/renko_engine/renko_engine_backtest.py`*

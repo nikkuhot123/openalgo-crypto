@@ -201,7 +201,17 @@ def touches(level, lo, hi):
     return (not np.isnan(level)) and (lo - LEVEL_TOL) <= level <= (hi + LEVEL_TOL)
 
 
-def run(df, symbol):
+def run(df, symbol, entry_override=None):
+    """entry_override: {bar_index: 'long'|'short'} replaces the SIGNAL only.
+
+    Everything downstream -- SL from the prior candle, T1 at T1_RR, the Renko
+    T2, stop-before-target resolution, the per-day trade cap, the cooldown and
+    the EOD flat -- runs through the identical code path. That is the point: a
+    random-entry null built by reimplementing the exits would be measuring the
+    reimplementation. Used by renko_sweep.py to ask whether the red-bar trigger
+    beats random timing on the same EMA side, which is the claim the Pine's own
+    header reports failing (z(sharpe) = +0.14).
+    """
     is_index = symbol.upper() in LOT
     pct = PCT_INDEX if is_index else PCT_STOCK
     ema_f = df["close"].ewm(span=EMA_FAST, adjust=False).mean().values
@@ -351,6 +361,12 @@ def run(df, symbol):
             day.red_used = True
             if aft_long or aft_short:
                 day.aft_used = True
+
+        # Null mode: the trigger is replaced, the management is not.
+        if entry_override is not None:
+            _ov = entry_override.get(i)
+            long_sig = _ov == "long"
+            short_sig = _ov == "short"
 
         # ---------------- entry ----------------------------------------------
         blocked = is_last_of_day or day.trades >= MAX_TRADES_DAY or (last_was_loss and i < cooldown_until)

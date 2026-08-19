@@ -35,6 +35,28 @@ An append-only record of wiki updates, backtests, and VPS operations.
   `Already traded today (2026-08-19) - standing down`, zero orders placed.
 - 31 new tests, 171 pass. Deployed judas 418e4461 (md5 verified both dirs).
 
+## [2026-08-19] research | Renko PRO parameter sweep -- pre-registered protocol
+
+- Swept 1,728 configs (576 params x 5/15/30m) on NIFTY in-sample only, with the
+  selection rule and five validation gates fixed in the script beforehand.
+- **99.0% of configs were profitable in-sample** (1,708/1,726). Noise gives ~50%,
+  so IS ranking carries almost no information for this strategy family.
+- Winner (15m, brick 1.00%, T1 2.5R) switched OFF both signature gates --
+  confluence and the trend cloud.
+- Passed G1 OOS (+755 pts), G2 transfer (bare 2/4), G4 friction (+Rs 76,705),
+  G5 top-5. **Failed G3, the random-entry null**: nulls average +3,040 pts vs
+  +5,167 real, z(pts) +1.78 / z(Sharpe) +1.10, and 7/200 seeds beat it outright.
+- Added `entry_override` to the faithful port so the null reuses the IDENTICAL
+  exit engine; regression-checked that 30m/15m/5m reproduce 435/746/1407 trades
+  and identical net points.
+- Money source: EOD +18,072 and SL -17,913 nearly cancel; 34 T2 hits (3.4%)
+  carry 97% of net. Excluding T2: +0.17 pts/trade against a 1.88-pt friction
+  breakeven = -Rs 38,355.
+- G5 was mis-specified (top-5 = 0.5% of 996 trades vs 1.1% of the earlier 435).
+  Post-hoc G6 (top 5% vs friction hurdle) fails at -3.58 pts/trade; recorded as
+  post-hoc since G3 had already decided it.
+- Verdict: no edge. Fifth price-pattern method to die the same way.
+
 ## [2026-08-16] bugfix | RECONCILE cancelled stops on two LIVE positions (14-Aug)
 - 14-Aug ran LIVE. All three prior fixes held: lot sizes correct (65/20, zero rejections vs 51 on 12-Aug), greeks collector 1,356 option rows (was 0), TAPE quadrant tagging live on 7 entries.
 - Recorded P&L +Rs 1,661 (Judas 24300CE +2,507 target; POV SENSEX 78000CE +352 target; POV 24450CE -714 max-hold; POV 24400CE -483 SL).

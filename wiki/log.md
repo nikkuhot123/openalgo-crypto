@@ -35,6 +35,39 @@ An append-only record of wiki updates, backtests, and VPS operations.
   `Already traded today (2026-08-19) - standing down`, zero orders placed.
 - 31 new tests, 171 pass. Deployed judas 418e4461 (md5 verified both dirs).
 
+## [2026-08-20] ops | Renko registered in the UI; restart hazard found and fixed
+
+- User: "strategies are not visible after restart", then "integrate the renko
+  strategies in the UI". Three separate causes, none of them data loss.
+- **Nothing was lost**: strategy_configs.json was intact with all 7 entries the
+  whole time. An empty UI list is the session -- /python/api/strategies is behind
+  @check_session_validity, which 401s the SPA after a restart.
+- **Judas x2 and PDH/PDL x2 carry `manually_stopped: True`**, and
+  python_strategy.py:1160 makes the scheduler SKIP auto-start on that flag. Only
+  pressing Start in the UI clears it (1822-3), so they stay down across every
+  restart. Left alone -- four real-money strategies, flag may be deliberate.
+- **Real bug: restarts were unclean.** `TimeoutStopSec=20` while every strategy
+  polls on a ~20s cycle, so they needed up to 20s just to NOTICE SIGTERM.
+  journal showed "State 'final-sigterm' timed out. Killing." then "Found
+  left-over process in control group while starting unit" at both 12:20 and
+  14:32 -- systemd was starting a second app instance beside an orphan, which is
+  exactly how state goes inconsistent across a restart. Raised to 75s (backup
+  kept). The subsequent stop/start was verified clean: port free, no leftovers,
+  ONE gunicorn master.
+- Registered both renko instances -> **9 registrations, "Restored 9 scheduled
+  strategies"**, visible in the UI. Shadow is belt-and-braces: env DRY_RUN=true
+  AND "SHADOW" in the registration name (the only channel that survives the
+  UI-only upload path).
+- Retired the standalone path first (systemd renko-shadow.timer disabled,
+  processes killed, pidfiles removed) so the platform scheduler cannot end up
+  running duplicates.
+- They start tomorrow 09:16 -- the boot path only relaunches strategies that
+  were already is_running, and today's entry window closed at 15:00 anyway, so
+  running the last 5 minutes had no value.
+- Caveat recorded: log/openalgo.log grows ~67 KB/s (~240 MB/h) from `data: Raw
+  Response` INFO lines dumping full broker payloads. The hourly logcap timer
+  stops the disk filling; the verbosity is the real fix and is untouched.
+
 ## [2026-08-20] deploy | Renko Engine SHADOW on SENSEX + MIDCPNIFTY (intraday only)
 
 - User asked to deploy SENSEX and MIDCPNIFTY for forward testing, overruling my

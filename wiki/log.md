@@ -35,6 +35,26 @@ An append-only record of wiki updates, backtests, and VPS operations.
   `Already traded today (2026-08-19) - standing down`, zero orders placed.
 - 31 new tests, 171 pass. Deployed judas 418e4461 (md5 verified both dirs).
 
+## [2026-08-20] deploy | Renko Engine promoted to LIVE on SENSEX + MIDCPNIFTY
+
+- User explicitly confirmed: make both registrations genuinely LIVE.
+- Checked capital first: SENSEX ATM CE ~Rs 1,420/lot (lot 20), MIDCPNIFTY
+  ~Rs 9,372/lot (lot 120, monthly) against Rs 31,420 cash. Book flat (0 open).
+- Promoted via `scripts/promote_renko_live.py`:
+  Renamed "Renko Engine (SENSEX) SHADOW" -> "Renko Engine (SENSEX)"
+  Renamed "Renko Engine (MIDCPNIFTY) SHADOW" -> "Renko Engine (MIDCPNIFTY)"
+  env: {"DRY_RUN": "false"} on both
+  Cleared manually_stopped
+- App restarted with TimeoutStopSec=75 -- clean stop (inactive, port free),
+  restart verified with single gunicorn master 1281408, HTTP 200.
+- SENSEX came up automatically (was running pre-stop) and log confirms:
+  `[WARNING] LIVE MODE -- real orders. lot=20 lots=1 qty=20` (pid 1287524).
+- MIDCPNIFTY registered live (`is_running=False`), scheduled start tomorrow 09:16.
+- POV x2 and greeks collector relaunched and running.
+- Restated the risk profile for the record: SENSEX is profitable in 2 of 7 months
+  on real premiums with March 2026 carrying the whole result; MIDCPNIFTY has zero
+  real-premium validation (unsupported on Volrix, monthly only, 1.94x hurdle).
+
 ## [2026-08-20] ops | Renko registered in the UI; restart hazard found and fixed
 
 - User: "strategies are not visible after restart", then "integrate the renko

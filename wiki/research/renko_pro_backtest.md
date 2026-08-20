@@ -483,3 +483,80 @@ profitable months. Nothing about the index-point work needs redoing -- it agreed
 with reality on matched windows.
 
 *Scripts: `renko_window_match.py`, `volrix_renko.py`*
+
+---
+
+## 9. "Deploy The Other Indexes?" -- Corrected Economics Says Mostly No
+
+The section-6b ranking priced all five indices as **weekly ATM at 0.45% of spot,
+delta 0.358**. Both inputs are now measured against real Volrix fills, and the
+premium one is wrong by 3x for three of the five indices.
+
+### Measured inputs
+
+| Quantity | Model assumed | **Measured on real fills** |
+|---|---|---|
+| \|dOption\| per favourable index point | 0.358 | **0.52** (0.533 NIFTY wk, 0.520 SENSEX wk, 0.516 BANKNIFTY monthly) |
+| ATM premium, weekly | 0.45% of spot | consistent |
+| ATM premium, **monthly** | (assumed weekly) | **1.469% of spot** (n=138 BANKNIFTY fills) = **3.26x** |
+
+Delta was *understated* by 46% -- which is why SENSEX real beat SENSEX model. But
+premium for a monthly is **3.26x** a weekly, and premium sets both the friction
+hurdle and the capital tied per lot.
+
+**BANKNIFTY, FINNIFTY and MIDCPNIFTY have no weekly options** (section 7), so a
+monthly is the only instrument available to them.
+
+### Recomputed, each index against its own correct hurdle
+
+| Index | Expiry | avg pts | hurdle | **edge x** | cap/lot | model net | net/DD | real-premium verified? |
+|---|---|---|---|---|---|---|---|---|
+| NIFTY | weekly | 5.11 | 1.29 | 3.96 | 6,707 | +112,076 | 5.04 | yes |
+| SENSEX | weekly | 35.21 | 4.37 | 8.07 | 6,984 | +17,963 | 1.06 | yes |
+| BANKNIFTY | monthly | 5.04 | 9.35 | **0.54** | 22,448 | -52,601 | -0.63 | yes |
+| FINNIFTY | monthly | 3.63 | 4.27 | **0.85** | 20,517 | -16,441 | -0.17 | **NO** |
+| MIDCPNIFTY | monthly | 4.11 | 2.12 | **1.94** | 20,328 | +106,561 | 2.26 | **NO** |
+
+Hurdles under the old wrong assumption were ~1.98 / 0.90 / 0.45 points. Correcting
+them moves BANKNIFTY and FINNIFTY **below breakeven** and cuts MIDCPNIFTY's edge
+from 4.36x to 1.94x.
+
+### The corrected model predicts the one monthly result we could verify
+
+| BANKNIFTY | Says |
+|---|---|
+| Old model (weekly assumption) | **+Rs 7,388** |
+| Corrected model (monthly premium) | **-Rs 52,601**, edge 0.54x |
+| **Volrix real premiums** | **-Rs 44,870**, PF 0.80 |
+
+The corrected economics calls BANKNIFTY's real-premium failure; the old one had
+the sign wrong. That is a meaningful validation of the corrected inputs -- and it
+is the only monthly symbol Volrix supports, so it is the only place the monthly
+correction can be checked at all.
+
+### Answer
+
+**Forward-test SENSEX. Nothing else.**
+
+| Index | Call | Why |
+|---|---|---|
+| **SENSEX** | **paper forward-test, 1 lot** | Only index positive on REAL premiums (PF 1.10 / 6m, 1.30 matched-window, real beat model 4x). Weekly options exist. ~Rs 7,000/lot. |
+| NIFTY | no | Real premiums PF 0.80 over 6m; matched-window PF 1.00. Its problem is recent decay, NOT economics -- it has the cheapest hurdle of all five (1.29 pts). Revisit if the regime turns. |
+| BANKNIFTY | **no** | Rejected twice independently: corrected model 0.54x hurdle, and real premiums -Rs 44,870 at PF 0.80. |
+| FINNIFTY | **no** | 0.85x hurdle -- below breakeven before any regime question. Unverified on real premiums. |
+| MIDCPNIFTY | **not yet** | The only interesting unverified case: 1.94x hurdle, +Rs 106,561 model. But **zero real-premium evidence** (unsupported on Volrix), monthly-only so it is a different instrument (lower gamma, intraday hold on a 22-day option), and Rs 20,328/lot -- 3x SENSEX capital. Deploying this would be acting on model-only evidence, which is the exact failure pattern this file documents five times. |
+
+Two caveats that apply even to the SENSEX recommendation:
+
+1. **Paper, not live.** SENSEX is profitable in only **2 of 7 months** on real
+   premiums and March 2026 alone carries the whole result (section 8).
+2. **Pre-registered pass condition**: SENSEX profitable in a **majority** of
+   forward months at 1 lot. One month in seven is what we already have and it is
+   not enough.
+
+Also corrected in this pass: `LOT["FINNIFTY"]` was 65 in the harness; the exchange
+lot is **60**, which had overstated every FINNIFTY rupee figure by ~8%. No verdict
+changes -- FINNIFTY is below its hurdle either way. NIFTY 30m/15m/5m regression
+still reproduces 435/746/1407 trades after the fix.
+
+*Script: `renko_monthly_econ.py`*

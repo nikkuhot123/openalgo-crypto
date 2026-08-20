@@ -35,6 +35,31 @@ An append-only record of wiki updates, backtests, and VPS operations.
   `Already traded today (2026-08-19) - standing down`, zero orders placed.
 - 31 new tests, 171 pass. Deployed judas 418e4461 (md5 verified both dirs).
 
+## [2026-08-19] decision | which indexes to forward-test -- SENSEX only
+
+- Question: drop NIFTY and deploy the other indexes? Mostly no, and the reason
+  is structural.
+- Measured the model's two key inputs against real Volrix fills:
+  realised |dOpt| per favourable index point = **0.52** (not the assumed 0.358 --
+  model understated rupees/point by 46%, which is why SENSEX real beat model);
+  MONTHLY ATM premium = **1.469% of spot** (n=138 real fills) = **3.26x** the
+  0.45% weekly figure the model applied to all five indices.
+- BANKNIFTY / FINNIFTY / MIDCPNIFTY have no weeklies, so monthly is their only
+  instrument. Repricing each against its own correct hurdle:
+  NIFTY 3.96x, SENSEX 8.07x, MIDCPNIFTY 1.94x (was 4.36x), FINNIFTY 0.85x,
+  BANKNIFTY 0.54x. Monthly capital is ~Rs 20-22k/lot vs ~Rs 7k weekly.
+- Validation of the correction: BANKNIFTY old model +Rs 7,388, corrected model
+  -Rs 52,601, real premiums -Rs 44,870 (PF 0.80). The corrected inputs get the
+  sign right; the old ones did not.
+- DECISION: paper forward-test **SENSEX only, 1 lot**. NIFTY no (real PF 0.80,
+  but decay not economics -- cheapest hurdle at 1.29 pts, revisit on regime).
+  BANKNIFTY no (rejected by corrected model AND real premiums). FINNIFTY no
+  (0.85x, below hurdle). MIDCPNIFTY NOT YET -- 1.94x and +Rs 106k look fine but
+  there is zero real-premium evidence, it is monthly-only, and Rs 20,328/lot.
+  Deploying it would be acting on model-only evidence.
+- Fixed LOT["FINNIFTY"] 65 -> 60 (live symbol master); overstated FINNIFTY
+  rupees by ~8%, changes no verdict. NIFTY regression still 435/746/1407.
+
 ## [2026-08-19] correction | matched windows: the delta model was RIGHT
 
 - User challenged the section-7 conclusion ("OpenAlgo showed strong results

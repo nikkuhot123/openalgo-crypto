@@ -113,7 +113,11 @@ DELTA = 0.358
 OPT_COST_PCT = 0.12
 SPREAD_PCT = 0.41
 PREMIUM_PCT = 0.45        # ATM weekly premium as % of index, measured 2026-08-07
-LOT = {"NIFTY": 65, "BANKNIFTY": 30, "SENSEX": 20, "FINNIFTY": 65, "MIDCPNIFTY": 120}
+# Verified against the live symbol master 2026-08-19. FINNIFTY was wrong here
+# (65); the exchange lot is 60, which overstated every FINNIFTY rupee figure by
+# ~8%. It changes no verdict -- FINNIFTY sits below its friction hurdle either
+# way -- but the numbers were wrong and are now right.
+LOT = {"NIFTY": 65, "BANKNIFTY": 30, "SENSEX": 20, "FINNIFTY": 60, "MIDCPNIFTY": 120}
 
 
 def load_bars(symbol, tf_min):

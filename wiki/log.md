@@ -35,6 +35,38 @@ An append-only record of wiki updates, backtests, and VPS operations.
   `Already traded today (2026-08-19) - standing down`, zero orders placed.
 - 31 new tests, 171 pass. Deployed judas 418e4461 (md5 verified both dirs).
 
+## [2026-08-20] study | resting broker stop for Judas -- translated NO, disaster stop YES
+
+- Question: should Judas rest its stop at the broker like POV does? A resting
+  order cannot watch SPOT, only premium, so the real question is whether Judas's
+  spot stop can be translated to a premium stop accurately enough.
+- Evidence: 19 live sessions, 6,493 Monitoring lines (spot+stop), 1,345 PATH
+  lines (premium), paired by timestamp -> 1,338 (spot, premium) samples inside
+  live positions across 8 contracts.
+- **Mapping is not stable**: |dPrem/dSpot| median 0.642, range 0.019-0.856 = a
+  46x spread. One contract (NIFTY18AUG2624350CE) had R^2 = 0.00 -- premium moved
+  76 pts while spot moved 42, i.e. IV/theta dominated.
+- **Translation error at the stop**: median Rs 17.86/unit = 14.3% of premium,
+  worst 25.6%. ~Rs 1,161/trade on a NIFTY lot, and BOTH directions (+25.6% exits
+  early, -18.6% takes a deeper loss). Judas's mean outcome is +0.33R, so that is
+  material. -> translated premium stop REJECTED.
+- **Benefit is smaller than assumed**: of 19 shutdowns, 3 arrived with a live
+  position and ALL 3 were handled by the SIGTERM handler. No observed in-process
+  stop failure. Real exposure is crash/SIGKILL -- which is real on this box
+  (journal: "final-sigterm timed out. Killing." at 12:20 and 14:32 today) and
+  whose realised cost is POV's 2026-07-02 incident (3 legs, 3+ hours, -75-80%).
+- **What the evidence supports**: a WIDE disaster stop, spot stop unchanged.
+  Worst adverse premium excursion on any contract -48.6%, median -14.7%.
+  A resting stop at -40% would have fired on 2/8 (pre-empting the real stop);
+  -50% on 0/8 but only 1.4pp of margin; **-60% on 0/8 with 11.4pp margin**.
+  Recommend -60% as a crash backstop: ~zero expected cost, converts an 80-100%
+  tail into 60%.
+- Conditions before shipping: stop-LIMIT not SL-M (SL-M rejected 33/33 on
+  options); must be cancelled on every normal exit or it becomes a naked short;
+  n=8 contracts is small, re-check at the 15-trade give-back target.
+- NOT implemented -- Judas is live money and this is a stop-architecture change
+  on n=8. Analysis only, awaiting a decision.
+
 ## [2026-08-20] harden | renko: cross-strategy locks + circuit breakers
 
 - Renko went live with neither locks nor breakers, while POV SENSEX trades the

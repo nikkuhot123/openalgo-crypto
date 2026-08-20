@@ -35,6 +35,33 @@ An append-only record of wiki updates, backtests, and VPS operations.
   `Already traded today (2026-08-19) - standing down`, zero orders placed.
 - 31 new tests, 171 pass. Deployed judas 418e4461 (md5 verified both dirs).
 
+## [2026-08-19] correction | matched windows: the delta model was RIGHT
+
+- User challenged the section-7 conclusion ("OpenAlgo showed strong results
+  across all indexes"). Correct challenge -- section 7 compared a 3.3-year
+  offline run against a 6-month Volrix run and blamed the delta translation.
+- Matched window (2026-02-20..2026-05-27), same config:
+  NIFTY model -Rs 75 vs real -Rs 5,902 (PF 1.06 vs 1.00);
+  SENSEX model +Rs 6,383 vs real **+Rs 25,129** (PF 1.23 vs 1.30).
+  The delta model (0.358, premium 0.45%) is ACCURATE on NIFTY and PESSIMISTIC
+  on SENSEX. My "premium decay kills it" attribution was wrong.
+- Decomposition of the NIFTY gap: regime/window (Jun-Aug 2026, outside offline
+  data) -Rs 42,631; premium translation error, matched window -Rs 5,827.
+  ~88% was regime, not premiums.
+- Also: the offline model does NOT claim a strong NIFTY result on that window --
+  70 trades, avg +1.92 pts/trade against a 1.87 friction hurdle, model -Rs 75.
+  The +Rs 65,371 headline is a 3.3-year number.
+- Real reason it still fails, now measured on real premiums:
+  NIFTY total -48,533, March alone +42,911, without March **-91,444**, 2/7 months positive.
+  SENSEX total +18,483, March alone +67,965, without March **-49,482**, 2/7 months positive.
+  SENSEX's whole positive result is ONE month. Same concentration the index-point
+  run found (34/996 trades = 97% of net), now visible monthly in a second engine.
+- Jun-Aug 2026 (most recent data): NIFTY -42,631, SENSEX -12,838.
+- Verdict unchanged (not deployable) but the reason is concentration + recent
+  decay, NOT measurement error. The delta translation is validated for reuse.
+- Falsifiable condition to revisit: SENSEX profitable in a MAJORITY of forward
+  months at 1 lot, rather than one month in seven.
+
 ## [2026-08-19] gate | Renko PRO on REAL option premiums -- rejected
 
 - Ran the exit-tuned config on Volrix real ATM premiums, 2026-02-20..2026-08-19,

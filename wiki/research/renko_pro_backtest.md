@@ -393,3 +393,93 @@ win), and it is still the only one that trades **OI/positioning data rather than
 price geometry**. That is now six price-pattern methods tested and six rejected.
 
 *Scripts: `volrix_renko.py`; Volrix reports linked in `wiki/log.md`.*
+
+---
+
+## 8. Correction To Section 7 -- The Delta Model Was Right; The Windows Were Different
+
+Section 7 concluded that real premiums contradicted the index-point study and
+blamed the delta translation. **That attribution was wrong**, and the user was
+right to challenge it. The two runs covered different periods:
+
+- OpenAlgo offline: 2023-04 .. 2026-05 (3.3 years)
+- Volrix real premiums: 2026-02 .. 2026-08 (6 months)
+
+The offline quarterly breakdown had already flagged 2026Q2 as the worst quarter
+of the whole sample. The Volrix window sits on exactly that patch and extends
+three months past the end of the offline data.
+
+### Matched-window test
+
+Same config, same window (2026-02-20 .. 2026-05-27, where local 5m data ends):
+
+| Symbol | OpenAlgo model Rs | Volrix REAL Rs | model PF | real PF |
+|---|---|---|---|---|
+| NIFTY | **-75** | **-5,902** | 1.06 | 1.00 |
+| SENSEX | **+6,383** | **+25,129** | 1.23 | **1.30** |
+
+**The delta model is roughly accurate, not optimistic.** On NIFTY both say
+breakeven. On SENSEX the model was *pessimistic* -- real premiums returned four
+times what it predicted. The translation (DELTA 0.358, premium 0.45% of index)
+is validated as a reasonable first-order proxy, which is a useful result for
+every future study in this repo.
+
+Two things were conflated in section 7 and are now separated:
+
+| Effect | Size on NIFTY |
+|---|---|
+| Window / regime (Jun-Aug 2026, outside offline data) | **-Rs 42,631** |
+| Premium translation error, matched window | **-Rs 5,827** |
+
+So ~88% of the "real premiums kill it" result was **regime**, not premiums.
+
+### But the strategy still fails, for a different and better-evidenced reason
+
+Month by month on real premiums (0.25% slippage + costs):
+
+| Month | NIFTY | SENSEX |
+|---|---|---|
+| 2026-02 | -16,470 | -17,081 |
+| **2026-03** | **+42,911** | **+67,965** |
+| 2026-04 | +2,130 | -18,779 |
+| 2026-05 | -34,473 | -784 |
+| 2026-06 | -22,284 | -17,502 |
+| 2026-07 | -16,976 | -1,984 |
+| 2026-08 | -3,372 | +6,648 |
+
+| | NIFTY | SENSEX |
+|---|---|---|
+| Total | -48,533 | **+18,483** |
+| March alone | +42,911 | **+67,965** |
+| **Without March** | **-91,444** | **-49,482** |
+| Months positive | **2 / 7** | **2 / 7** |
+
+**SENSEX's entire positive result is one month.** Strip March 2026 and it loses
+Rs 49,482. Both indices are profitable in only 2 of 7 months.
+
+This is the same failure mode the index-point study found -- 34 of 996 trades
+carrying 97% of net points -- reappearing at monthly resolution on real
+premiums. The concentration is a property of the strategy, not of the
+measurement, and it now shows up in both independent engines.
+
+### Verdict -- unchanged, but for the correct reason
+
+**Not deployable.** Not because real premiums invalidate the backtest -- they
+broadly confirm it -- but because:
+
+1. The edge is carried by isolated windows. One month of seven produces the
+   entire result on both indices.
+2. The recent regime is adverse on both. Jun-Aug 2026: NIFTY -Rs 42,631,
+   SENSEX -Rs 12,838. This is the most recent data available and it is negative,
+   which matches the offline model's own warning that its worst quarter was its
+   last one.
+3. Only NIFTY and SENSEX can trade it at all -- BANKNIFTY, FINNIFTY and
+   MIDCPNIFTY have no weekly options (section 7).
+
+**What would change the verdict:** SENSEX positive across a majority of months
+in a forward sample, not one month in seven. That is a measurable, falsifiable
+condition and it can be checked by paper-running SENSEX 15m at 1 lot and counting
+profitable months. Nothing about the index-point work needs redoing -- it agreed
+with reality on matched windows.
+
+*Scripts: `renko_window_match.py`, `volrix_renko.py`*

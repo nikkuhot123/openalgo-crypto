@@ -55,6 +55,7 @@ gives and it is not enough. Every simulated round trip is appended to
 log/strategies/renko_shadow_<UNDERLYING>.csv for exactly that count.
 """
 import json
+import re
 import os
 import signal
 import sys
@@ -157,6 +158,148 @@ def nap(total):
     while not _shutdown and time.time() < end:
         time.sleep(min(2.0, end - time.time()))
 
+
+# ---- circuit breakers -------------------------------------------------------
+# Same defaults and semantics as Judas and POV, so all three halt on the same
+# terms. POV's behaviour is the one copied: halt NEW ENTRIES but keep managing
+# an open position, rather than Judas's "done for the day" -- abandoning a live
+# position because a breaker tripped would be strictly worse.
+LOSS_STREAK_LIMIT = int(os.getenv('LOSS_STREAK_LIMIT', '3'))
+DAILY_LOSS_LIMIT_RS = float(os.getenv('DAILY_LOSS_LIMIT_RS', '10000'))
+
+# ---- cross-strategy locks ---------------------------------------------------
+# Byte-compatible with POV and Judas ON PURPOSE: same directory, same filenames,
+# same "owner|iso|pid" body. A private scheme here would coordinate with nothing,
+# and POV SENSEX + Renko SENSEX are live on the same underlying.
+LOCKS_DIR = Path("log") / "strategies" / "locks"
+LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+LOCK_TTL_MIN = float(os.getenv('LOCK_TTL_MIN', '360'))
+
+
+def _pid_alive(pid):
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return True
+
+
+def _lock_is_stale(ts_str, pid):
+    """Stale if written on an earlier session, past its TTL, or its owner died.
+
+    Without this a leaked lock blocks valid entries forever -- 9 orphaned .lock
+    files were found on 2026-07-29, some on already-expired contracts."""
+    try:
+        when = datetime.fromisoformat(str(ts_str))
+    except (ValueError, TypeError):
+        return True
+    if when.date() != date.today():
+        return True
+    if (datetime.now() - when).total_seconds() / 60.0 > LOCK_TTL_MIN:
+        return True
+    if pid and not _pid_alive(pid):
+        return True
+    return False
+
+
+def _strategy_slug(name):
+    return re.sub(r'[^A-Za-z0-9]+', '_', str(name)).strip('_')
+
+
+def acquire_symbol_lock(symbol):
+    """Claim one CONTRACT so two strategies cannot hold the same option."""
+    if DRY_RUN:
+        return True                     # a shadow must never block a live sibling
+    f = LOCKS_DIR / f"{symbol}.lock"
+    if f.exists():
+        try:
+            parts = f.read_text().split("|")
+            if parts[0] == STRATEGY_NAME:
+                return True
+            ts = parts[1] if len(parts) > 1 else ""
+            pid = int(parts[2]) if len(parts) > 2 and parts[2].strip().isdigit() else 0
+            if not _lock_is_stale(ts, pid):
+                log.info("CONTRACT LOCKED: %s held by '%s' -- standing aside",
+                         symbol, parts[0])
+                return False
+            log.warning("stale contract lock on %s (owner '%s') -- reclaiming",
+                        symbol, parts[0])
+        except Exception:
+            return False
+    try:
+        f.write_text(f"{STRATEGY_NAME}|{datetime.now().isoformat()}|{os.getpid()}")
+        return True
+    except Exception:
+        return False
+
+
+def release_symbol_lock(symbol):
+    f = LOCKS_DIR / f"{symbol}.lock"
+    try:
+        if f.exists() and f.read_text().split("|", 1)[0] == STRATEGY_NAME:
+            f.unlink()
+    except Exception:
+        pass
+
+
+def acquire_direction_lock(side):
+    """Claim a DIRECTION on the underlying. Two strategies holding opposite sides
+    of the same index is a delta-neutral straddle paying double premium -- which
+    is exactly what buying CE while POV holds PE would produce."""
+    if DRY_RUN:
+        return True
+    und, me, want = UNDERLYING.upper(), _strategy_slug(STRATEGY_NAME), side.upper()
+    try:
+        for f in LOCKS_DIR.glob(f"{und}.*.dir"):
+            parts = f.name.split(".")
+            if len(parts) < 4:
+                continue
+            owner, held = parts[1], parts[2].upper()
+            if owner == me:
+                continue
+            try:
+                body = f.read_text().split("|")
+                ts = body[0] if body else ""
+                pid = int(body[1]) if len(body) > 1 and body[1].strip().isdigit() else 0
+            except Exception:
+                ts, pid = "", 0
+            if _lock_is_stale(ts, pid):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+                continue
+            if held != want:
+                log.info("DIRECTION CONFLICT on %s: '%s' holds %s, we want %s -- "
+                         "standing aside", und, owner, held, want)
+                return False
+    except Exception as e:
+        log.debug("direction lock scan failed: %s", e)
+    try:
+        (LOCKS_DIR / f"{und}.{me}.{want}.dir").write_text(
+            f"{datetime.now().isoformat()}|{os.getpid()}")
+    except Exception:
+        pass
+    return True
+
+
+def release_direction_lock(side=None):
+    und, me = UNDERLYING.upper(), _strategy_slug(STRATEGY_NAME)
+    pat = f"{und}.{me}.{str(side).upper()}.dir" if side else f"{und}.{me}.*.dir"
+    try:
+        for f in LOCKS_DIR.glob(pat):
+            try:
+                f.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 # ------------------------------------------------------------------ helpers
 def get_nearest_expiry():
@@ -464,6 +607,9 @@ def main():
     pos = None
     trades_today = 0
     daily_pnl = 0.0
+    daily_loss_rs = 0.0
+    consecutive_losses = 0
+    halted = False
     last_bar_ts = None
     prev_close = prev_red_hi = prev_red_med = None
 
@@ -521,6 +667,10 @@ def main():
             pos = None
             trades_today = 0
             daily_pnl = 0.0
+            daily_loss_rs = 0.0
+            consecutive_losses = 0
+            halted = False
+            release_direction_lock()      # never carry a claim into a new session
             last_bar_ts = None
             prev_close = prev_red_hi = prev_red_med = None
             log.info("--- new session %s ---", trade_day)
@@ -562,7 +712,15 @@ def main():
                                   action="SELL", exchange=OPT_EXCHANGE,
                                   price_type="MARKET", product=PRODUCT,
                                   quantity=q_out)
+            net_eod = gross - cost
+            daily_pnl += net_eod
+            if net_eod < 0:
+                consecutive_losses += 1
+                daily_loss_rs += abs(net_eod)
+            release_symbol_lock(pos["symbol"])
+            release_direction_lock("CE" if pos["side"] == "long" else "PE")
             pos = None
+            persist({})
 
         df = fetch_15m()
         if df.empty or len(df) < 2:
@@ -685,11 +843,23 @@ def main():
                                       action="SELL", exchange=OPT_EXCHANGE,
                                       price_type="MARKET", product=PRODUCT, quantity=q)
                 daily_pnl += net
+                # Feed the breakers off the REALISED net, same as Judas and POV.
+                # A part-book at T1 is not a closed trade, so only a full exit
+                # updates the loss streak.
                 if hit == "T1" and CAN_SPLIT:
                     pos["t1_done"] = True
                     pos["qty"] -= q
                     persist(pos)
                 else:
+                    if net < 0:
+                        consecutive_losses += 1
+                        daily_loss_rs += abs(net)
+                        log.info("loss streak %d | daily losses Rs %.0f",
+                                 consecutive_losses, daily_loss_rs)
+                    else:
+                        consecutive_losses = 0
+                    release_symbol_lock(pos["symbol"])
+                    release_direction_lock("CE" if pos["side"] == "long" else "PE")
                     pos = None
                     persist({})
                     continue
@@ -720,7 +890,20 @@ def main():
                 short_trig = prev_close >= prev_red_med and c < cur_med
         prev_close, prev_red_hi, prev_red_med = c, cur_hi, cur_med
 
-        if (pos is not None or trades_today >= MAX_TRADES_DAY or bar_min >= entry_end
+        # ---- circuit breakers: halt NEW ENTRIES, keep managing ---------------
+        # POV's semantics, not Judas's "done for the day": an open position must
+        # still be managed after a breaker trips, or a bad day becomes a worse one.
+        if not halted:
+            if consecutive_losses >= LOSS_STREAK_LIMIT:
+                log.warning("CIRCUIT BREAKER: %d consecutive losses. New entries "
+                            "halted for today.", consecutive_losses)
+                halted = True
+            elif daily_loss_rs >= DAILY_LOSS_LIMIT_RS:
+                log.warning("CIRCUIT BREAKER: Rs %.0f daily losses exceed Rs %.0f. "
+                            "New entries halted.", daily_loss_rs, DAILY_LOSS_LIMIT_RS)
+                halted = True
+        if (pos is not None or halted or trades_today >= MAX_TRADES_DAY
+                or bar_min >= entry_end
                 or day["red_used"] or not day["red_ok"] or not (long_trig or short_trig)):
             log.info("Regime | spot %.1f | renko %.1f-%.1f | red %s | trig %s/%s | trades %d/%d",
                      c, r_floor, r_ceil, "ok" if day["red_ok"] else "-",
@@ -764,6 +947,20 @@ def main():
             nap(POLL_SECS)
             continue
 
+        # ---- cross-strategy locks, BEFORE any order goes out ----------------
+        # POV SENSEX and Renko SENSEX are both live on the same underlying. The
+        # direction lock is the one that matters: holding CE while POV holds PE
+        # is a delta-neutral straddle paying double premium for no view.
+        if not acquire_direction_lock(opt_type):
+            day["red_used"] = True        # the level is spent; do not retry it
+            nap(POLL_SECS)
+            continue
+        if not acquire_symbol_lock(symbol):
+            release_direction_lock(opt_type)
+            day["red_used"] = True
+            nap(POLL_SECS)
+            continue
+
         sgn = 1.0 if side == "long" else -1.0
         t1 = c + sgn * risk * T1_RR
         t2 = c + sgn * risk * T2_RR
@@ -786,6 +983,10 @@ def main():
             if state == "dead":
                 log.warning("ENTRY NOT FILLED (%s rejected/cancelled) -- no position "
                             "recorded, no stop armed.", oid)
+                # Holding a lock for a position that does not exist would block
+                # this contract and this direction for the rest of the session.
+                release_symbol_lock(symbol)
+                release_direction_lock(opt_type)
                 day["red_used"] = True      # the level is spent either way
                 nap(POLL_SECS)
                 continue
@@ -835,6 +1036,13 @@ def main():
                 persist({})
             except Exception as e:
                 log.error("shutdown close failed: %s -- snapshot kept", e)
+    # Always drop our claims on the way out. A leaked lock on a live contract
+    # blocks valid entries for the rest of the session -- 9 orphaned .lock files
+    # were found this way on 2026-07-29.
+    if not DRY_RUN:
+        if pos is not None:
+            release_symbol_lock(pos["symbol"])
+        release_direction_lock()
     log.info("Shutdown complete.")
     return 0
 

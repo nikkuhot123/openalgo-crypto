@@ -511,3 +511,101 @@ def test_nap_sleeps_when_not_shutting_down():
     t0 = _t.time()
     m.nap(1.0)
     assert 0.8 <= _t.time() - t0 < 3.0
+
+
+# ================================================= locks + circuit breakers
+# Added 2026-08-20 after review. POV SENSEX and Renko SENSEX are both live on
+# the same underlying, and renko had neither locks nor breakers.
+
+def test_breaker_defaults_match_judas_and_pov():
+    m = load(UNDERLYING="SENSEX")
+    assert m.LOSS_STREAK_LIMIT == 3
+    assert m.DAILY_LOSS_LIMIT_RS == 10000.0
+
+
+def test_breakers_halt_entries_but_keep_managing():
+    """POV semantics, not Judas's 'done for the day'. Abandoning an open
+    position because a breaker tripped would be strictly worse."""
+    src = (ROOT / "strategies" / "examples" / "renko_engine_strategy.py").read_text(encoding="utf-8")
+    assert "CIRCUIT BREAKER" in src
+    assert "halted = True" in src
+    # the entry gate must consult it
+    gate = src[src.index("if (pos is not None or halted"):]
+    assert "halted" in gate[:120]
+    # ...and the EOD/exit management must NOT be gated on halted
+    eod = src[src.index("HARD intraday square-off"):src.index("df = fetch_15m()")]
+    assert "halted" not in eod
+
+
+def test_losses_feed_the_breakers_only_on_full_exit():
+    src = (ROOT / "strategies" / "examples" / "renko_engine_strategy.py").read_text(encoding="utf-8")
+    assert "consecutive_losses += 1" in src
+    assert "daily_loss_rs += abs(net" in src
+    # a T1 part-book is not a closed trade
+    assert "A part-book at T1 is not a closed trade" in src
+
+
+def test_lock_files_are_byte_compatible_with_pov(tmp_path, monkeypatch):
+    """A private lock scheme would coordinate with nothing. Same dir, same
+    filenames, same owner|iso|pid body as POV and Judas."""
+    m = load(UNDERLYING="SENSEX", DRY_RUN="false", STRATEGY_NAME="Renko Engine (SENSEX)")
+    monkeypatch.setattr(m, "LOCKS_DIR", tmp_path)
+    assert m.acquire_symbol_lock("SENSEX20AUG2677600CE") is True
+    f = tmp_path / "SENSEX20AUG2677600CE.lock"
+    assert f.exists()
+    owner, ts, pid = f.read_text().split("|")
+    assert owner == "Renko Engine"   # the strategy TAG, as POV uses its own constant
+    assert pid.isdigit()
+    from datetime import datetime as _dt
+    _dt.fromisoformat(ts)          # must be ISO, as POV writes it
+
+
+def test_contract_lock_blocks_a_foreign_owner(tmp_path, monkeypatch):
+    from datetime import datetime as _dt
+    import os as _os
+    m = load(UNDERLYING="SENSEX", DRY_RUN="false", STRATEGY_NAME="Renko Engine (SENSEX)")
+    monkeypatch.setattr(m, "LOCKS_DIR", tmp_path)
+    sym = "SENSEX20AUG2677600CE"
+    (tmp_path / f"{sym}.lock").write_text(
+        f"POV Wall-Squeeze|{_dt.now().isoformat()}|{_os.getpid()}")
+    assert m.acquire_symbol_lock(sym) is False      # live foreign lock -> stand aside
+
+
+def test_stale_lock_is_reclaimed(tmp_path, monkeypatch):
+    m = load(UNDERLYING="SENSEX", DRY_RUN="false", STRATEGY_NAME="Renko Engine (SENSEX)")
+    monkeypatch.setattr(m, "LOCKS_DIR", tmp_path)
+    sym = "SENSEX20AUG2677600CE"
+    # yesterday's session -> stale, must not wedge us forever
+    (tmp_path / f"{sym}.lock").write_text("POV Wall-Squeeze|2020-01-01T09:20:00|999999")
+    assert m.acquire_symbol_lock(sym) is True
+
+
+def test_direction_lock_blocks_the_opposite_side(tmp_path, monkeypatch):
+    from datetime import datetime as _dt
+    import os as _os
+    m = load(UNDERLYING="SENSEX", DRY_RUN="false", STRATEGY_NAME="Renko Engine (SENSEX)")
+    monkeypatch.setattr(m, "LOCKS_DIR", tmp_path)
+    # POV already holds PE on SENSEX
+    (tmp_path / "SENSEX.POV_Wall_Squeeze.PE.dir").write_text(
+        f"{_dt.now().isoformat()}|{_os.getpid()}")
+    assert m.acquire_direction_lock("CE") is False   # would be a paid straddle
+    assert m.acquire_direction_lock("PE") is True    # same side is fine
+
+
+def test_shadow_never_takes_locks(tmp_path, monkeypatch):
+    """A shadow instance must not block a live sibling."""
+    m = load(UNDERLYING="SENSEX")          # DRY_RUN defaults true
+    monkeypatch.setattr(m, "LOCKS_DIR", tmp_path)
+    assert m.DRY_RUN is True
+    assert m.acquire_symbol_lock("X") is True
+    assert m.acquire_direction_lock("CE") is True
+    assert list(tmp_path.iterdir()) == []   # wrote nothing
+
+
+def test_locks_released_on_every_exit_path():
+    src = (ROOT / "strategies" / "examples" / "renko_engine_strategy.py").read_text(encoding="utf-8")
+    # full exit, EOD, rejected entry, shutdown, and new session
+    assert src.count("release_symbol_lock(") >= 4
+    assert src.count("release_direction_lock(") >= 5
+    rej = src[src.index("ENTRY NOT FILLED"):]
+    assert "release_symbol_lock(symbol)" in rej[:400]

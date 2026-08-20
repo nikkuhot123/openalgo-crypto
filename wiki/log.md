@@ -35,6 +35,34 @@ An append-only record of wiki updates, backtests, and VPS operations.
   `Already traded today (2026-08-19) - standing down`, zero orders placed.
 - 31 new tests, 171 pass. Deployed judas 418e4461 (md5 verified both dirs).
 
+## [2026-08-20] harden | renko: cross-strategy locks + circuit breakers
+
+- Renko went live with neither locks nor breakers, while POV SENSEX trades the
+  same underlying. Both added, deliberately copying the EXISTING semantics rather
+  than inventing new ones.
+- **Breakers** (same defaults as Judas and POV): LOSS_STREAK_LIMIT=3,
+  DAILY_LOSS_LIMIT_RS=10000. Behaviour copied from POV, not Judas: halt NEW
+  ENTRIES but keep managing an open position. Judas sets state=DONE, which is
+  equivalent for a one-trade-per-day strategy but would abandon a live position
+  here. Losses feed the breakers only on a FULL exit -- a T1 part-book is not a
+  closed trade.
+- **Locks**: byte-compatible with POV/Judas on purpose -- same dir, same
+  filenames, same `owner|iso|pid` body. A private scheme would coordinate with
+  nothing. Contract lock per option symbol; DIRECTION lock per underlying, which
+  is the one that matters (holding CE while POV holds PE is a delta-neutral
+  straddle paying double premium for no view). Shadow instances take no locks so
+  they can never block a live sibling. Released on every path: full exit, EOD,
+  rejected entry, shutdown, and new session.
+- **Finding: THREE incompatible lock conventions exist in this repo.**
+  PDH-PML EMA writes a JSON body with `{UND}.lock` and `{UND}_{SIDE}.dir`;
+  POV/Judas/renko use a pipe body with `{option_symbol}.lock` and
+  `{UND}.{slug}.{SIDE}.dir`. The two schemes cannot see each other, so renko
+  coordinates with POV/Judas but NOT with PDH/PDL. Overlap is small in practice
+  (PDH exits 09:20-09:30, renko's first entry is 09:30+), so this is recorded
+  rather than refactored the night before trading.
+- 223 tests pass. Deployed renko 7c834cb46f (md5 verified both dirs, compiles on
+  VPS).
+
 ## [2026-08-20] review | 4 real defects in the just-deployed LIVE renko strategy
 
 Reviewed the code I had promoted to live the same hour. Four money-losing

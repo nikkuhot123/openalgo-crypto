@@ -35,6 +35,41 @@ An append-only record of wiki updates, backtests, and VPS operations.
   `Already traded today (2026-08-19) - standing down`, zero orders placed.
 - 31 new tests, 171 pass. Deployed judas 418e4461 (md5 verified both dirs).
 
+## [2026-08-20] deploy | Renko Engine SHADOW on SENSEX + MIDCPNIFTY (intraday only)
+
+- User asked to deploy SENSEX and MIDCPNIFTY for forward testing, overruling my
+  MIDCPNIFTY caution (no real-premium evidence). Deployed both.
+- **Shadow, not live.** analyzer is a single GLOBAL flag and POV is live with
+  real money, so sandboxing globally would paper-trade the one profitable
+  strategy. Used the in-strategy DRY_RUN pattern instead: signals and P&L are
+  computed from LIVE option quotes, no orders, no locks, no capital. DRY_RUN
+  defaults TRUE here (inverted vs the other strategies) because SENSEX carries
+  its whole backtest in one month and MIDCPNIFTY has zero real-premium checks.
+- **Intraday only** (user requirement): PRODUCT pinned to MIS, not env-readable,
+  no NRML path in code. Found and fixed a real flaw doing this -- the EOD
+  square-off sat BEHIND the once-per-bar gate, so a stalled feed after 15:15
+  would have carried a position overnight. Hard clock-driven exit now runs every
+  poll, above the bar gate, and the off-hours idle guard is `pos is None`-gated
+  so it can never skip that exit.
+- Live bug found and fixed during bring-up: the 1m feed carries a PRE-OPEN
+  artefact (flat 09:00 SENSEX candle o=h=l=c=77468.45) which resampled into its
+  own 15m bucket and became bar[0], making the X candle DEGENERATE
+  (x_high == x_low -> x_44 == x_56), silently neutering the X-band zone block
+  and the close>x_56 filter. Now filtered to 09:15..15:30 before resampling.
+  After the fix: SENSEX X 77375.8-77494.8, MIDCPNIFTY X 14906.3-14960.8.
+- Lot sizes auto-detected correctly: SENSEX 20, MIDCPNIFTY 120, two-source with
+  fail-closed (no hardcoded guess -- the 2026-08-12 lesson).
+- Launcher is pidfile-idempotent; a pgrep check could not work because the
+  command line carries no UNDERLYING and would have spawned duplicates of both.
+  systemd `renko-shadow.timer` (OnBootSec + Mon..Fri 09:16 IST) for resilience;
+  the strategy idles overnight and resets per session, so one launch persists.
+- Live platform strategies untouched -- no app restart, POV still live
+  (analyze_mode = 0). Running: POV x2, greeks collector, renko shadow x2.
+- 30 new tests (201 total). Deployed renko_engine_strategy d7532f99.
+- PASS CONDITION (pre-registered): profitable in a MAJORITY of forward months,
+  counted from log/strategies/renko_shadow_<UND>.csv. One month in seven is what
+  the backtest already gives and is not enough.
+
 ## [2026-08-19] decision | which indexes to forward-test -- SENSEX only
 
 - Question: drop NIFTY and deploy the other indexes? Mostly no, and the reason

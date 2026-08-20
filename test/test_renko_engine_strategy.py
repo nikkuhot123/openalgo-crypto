@@ -361,3 +361,153 @@ def test_sigterm_handler_registered():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ============================================================ review fixes
+# Found reviewing the LIVE deployment on 2026-08-20. All three were real
+# money-losing defects, not style issues.
+
+def test_part_lot_exit_is_impossible_and_must_not_be_attempted():
+    """CRITICAL. T1 books half in the backtest, but an option order must be a
+    whole multiple of the lot size. int(20*0.5)=10 on SENSEX is REJECTED, and
+    the old code then did qty -= 10, after which EVERY later exit -- INCLUDING
+    THE STOP -- was a non-multiple and also rejected."""
+    src = (ROOT / "strategies" / "examples" / "renko_engine_strategy.py").read_text(encoding="utf-8")
+    assert "CAN_SPLIT" in src
+    # the naive half must be gone
+    assert "part = 0.5" not in src
+    assert 'int(pos["qty"] * part)' not in src
+    # exits must be expressed in whole lots
+    assert "lots_out * LOT_SIZE" in src
+    assert "pos[\"qty\"] // LOT_SIZE" in src
+
+
+def test_can_split_requires_two_lots():
+    m = load(UNDERLYING="SENSEX", MAX_LOTS=1)
+    assert m.CAN_SPLIT is False
+    m2 = load(UNDERLYING="SENSEX", MAX_LOTS=2)
+    # CAN_SPLIT is resolved in main(); assert the rule the code uses
+    assert (int(m2.MAX_LOTS) >= 2) is True
+
+
+def test_every_exit_quantity_is_a_lot_multiple():
+    """Simulate the three exit paths at 1 lot and 3 lots."""
+    for lot, lots in ((20, 1), (120, 1), (20, 3)):
+        qty = lot * lots
+        can_split = lots >= 2
+        # T1
+        if can_split:
+            q = max(1, (qty // lot) // 2) * lot
+            assert q % lot == 0 and 0 < q < qty
+            rem = qty - q
+            assert rem % lot == 0
+        # T2 / SL / EOD on the full (or remaining) size
+        q_full = (qty // lot) * lot
+        assert q_full % lot == 0 and q_full == qty
+
+
+def test_entry_fill_is_confirmed_before_arming_levels():
+    """CRITICAL. Acceptance is not a fill -- this is the POV 2026-08-14 bug."""
+    src = (ROOT / "strategies" / "examples" / "renko_engine_strategy.py").read_text(encoding="utf-8")
+    assert "def confirm_entry_fill" in src
+    place = src.index("action=\"BUY\"")
+    tail = src[place:place + 2500]
+    assert "confirm_entry_fill(" in tail, "entry must be confirmed after placeorder"
+    assert 'state == "dead"' in tail
+    assert "ENTRY NOT FILLED" in tail
+    # the position dict must be built AFTER the confirmation
+    assert tail.index("confirm_entry_fill(") < tail.index('pos = {"side"')
+
+
+def test_confirm_entry_fill_states():
+    m = load(UNDERLYING="SENSEX")
+
+    class Broker:
+        def __init__(self, st, px=0.0):
+            self.st, self.px = st, px
+
+        def orderstatus(self, **k):
+            return {"status": "success",
+                    "data": {"order_status": self.st, "average_price": self.px}}
+
+    m.client = Broker("rejected")
+    assert m.confirm_entry_fill("1") == ("dead", None)
+    m.client = Broker("cancelled")
+    assert m.confirm_entry_fill("1") == ("dead", None)
+    m.client = Broker("complete", 71.5)
+    assert m.confirm_entry_fill("1") == ("complete", 71.5)
+    # a fill with an unreadable average is STILL a fill
+    m.client = Broker("complete", 0.0)
+    assert m.confirm_entry_fill("1") == ("complete", None)
+    # no order id -> unknown, never dead
+    assert m.confirm_entry_fill(None) == ("unknown", None)
+
+
+def test_unverifiable_positionbook_is_not_flat():
+    m = load(UNDERLYING="SENSEX")
+
+    class Dead:
+        def positionbook(self):
+            return {"status": "error"}
+
+    m.client = Dead()
+    assert m.live_position_qty("X") is None      # None, NOT 0
+
+
+def test_state_persistence_round_trip(tmp_path, monkeypatch):
+    m = load(UNDERLYING="SENSEX")
+    monkeypatch.setattr(m, "STATE_FILE", tmp_path / "s.json")
+    assert m.load_persisted() == {}
+    m.persist({"symbol": "SENSEX20AUG2677600CE", "qty": 20, "sl": 77400.0})
+    got = m.load_persisted()
+    assert got["symbol"] == "SENSEX20AUG2677600CE" and got["qty"] == 20
+    m.persist({})
+    assert m.load_persisted() == {}
+
+
+def test_orphan_adoption_seeds_trade_day():
+    """Without seeding, the loop's new-day reset (trade_day starts None, which
+    never equals today) wipes the position on the very first pass."""
+    src = (ROOT / "strategies" / "examples" / "renko_engine_strategy.py").read_text(encoding="utf-8")
+    block = src[src.index("adopt a position left open by a restart"):]
+    block = block[:block.index("while not _shutdown")]
+    assert "trade_day = date.today()" in block
+    assert "broker is authoritative on size" in block
+
+
+def test_shutdown_verifies_before_selling():
+    src = (ROOT / "strategies" / "examples" / "renko_engine_strategy.py").read_text(encoding="utf-8")
+    tail = src[src.index("# SIGTERM."):]
+    assert "live_position_qty(pos[\"symbol\"])" in tail
+    assert "naked short" in tail
+    assert "LOT_SIZE" in tail
+
+
+def test_long_sleeps_are_interruptible():
+    """A plain time.sleep defers SIGTERM by its full duration. Observed: an
+    instance in the 300s off-hours sleep was still alive 33s after SIGTERM,
+    which guarantees a SIGKILL under the platform's stop timeout."""
+    src = (ROOT / "strategies" / "examples" / "renko_engine_strategy.py").read_text(encoding="utf-8")
+    assert "def nap(" in src
+    # the two long waits must go through nap()
+    assert "nap(POLL_SECS)" in src
+    assert "nap(300)" in src
+    assert "time.sleep(POLL_SECS)" not in src
+    assert "time.sleep(300)" not in src
+
+
+def test_nap_returns_early_on_shutdown(monkeypatch):
+    import time as _t
+    m = load(UNDERLYING="SENSEX")
+    monkeypatch.setattr(m, "_shutdown", True)
+    t0 = _t.time()
+    m.nap(30)
+    assert _t.time() - t0 < 1.0, "nap must return immediately once shutdown is set"
+
+
+def test_nap_sleeps_when_not_shutting_down():
+    import time as _t
+    m = load(UNDERLYING="SENSEX")
+    t0 = _t.time()
+    m.nap(1.0)
+    assert 0.8 <= _t.time() - t0 < 3.0

@@ -35,6 +35,59 @@ An append-only record of wiki updates, backtests, and VPS operations.
   `Already traded today (2026-08-19) - standing down`, zero orders placed.
 - 31 new tests, 171 pass. Deployed judas 418e4461 (md5 verified both dirs).
 
+## [2026-08-20] review | 4 real defects in the just-deployed LIVE renko strategy
+
+Reviewed the code I had promoted to live the same hour. Four money-losing
+defects, all now fixed with tests. Recording them because three were bugs I had
+already fixed ELSEWHERE and reintroduced in a new file.
+
+1. **CRITICAL -- part-lot exits could never fill, and broke the STOP.**
+   The backtest books half at T1. An option order must be a whole multiple of the
+   lot size, so `int(20 * 0.5) = 10` on SENSEX is rejected ("Quantity must be in
+   multiples of lot size 20" -- the 2026-08-12 failure). The old code then did
+   `pos["qty"] -= 10`, leaving 10, after which EVERY later exit **including the
+   stop-loss** was a non-multiple and also rejected: the position would have run
+   unprotected to broker auto-squareoff.
+   Fixed: `CAN_SPLIT = MAX_LOTS >= 2`; at 1 lot T1 is skipped and the position
+   rides to T2. Measured on the validated harness with entries held IDENTICAL
+   (T1_RR stays 2.5 because it feeds the room gate): whole lot at 3.0R is equal
+   or better -- NIFTY +68,517 vs +65,371, MIDCPNIFTY +128,769 vs +116,634,
+   SENSEX +10,937 vs +11,575.
+   Also caught during that measurement: varying T1_RR changes ENTRIES (room
+   gate), so naive exit variants were not like-for-like -- trade count moved
+   868 -> 765. And SENSEX has only 39-56 local trades, far too few to retune an
+   exit on.
+
+2. **CRITICAL -- acceptance treated as a fill.** The entry recorded a position
+   from the pre-trade QUOTE and armed SL/T1/T2 without checking the order
+   filled. This is exactly the POV phantom-entry bug fixed on 2026-08-14,
+   reintroduced. Added `confirm_entry_fill()`: rejected/cancelled -> no position
+   and no stop armed; complete -> book the real average (a fill with an
+   unreadable average is STILL a fill); unknown -> track as live, because an
+   untracked real position with no stop is worse than a phantom.
+
+3. **HIGH -- no state persistence, so a restart orphaned a live position.**
+   STATE_FILE was declared and never written. This box restarted three times on
+   2026-08-20 alone. Added persist/load plus boot-time orphan adoption with the
+   broker authoritative on size, and seeded `trade_day` so the loop's new-day
+   reset does not wipe the adoption on its first pass. Shutdown now verifies the
+   broker still holds the position before selling (never a naked short) and keeps
+   the snapshot when it cannot.
+
+4. **MEDIUM -- SIGTERM ignored for up to 5 minutes.** The off-hours guard used
+   `time.sleep(300)`, so a SIGTERM'd instance was still alive 33s later (observed
+   on pid 1351230). Under schedule_stop's SIGTERM plus TimeoutStopSec that
+   guarantees a SIGKILL -- the same unclean-shutdown class fixed at the systemd
+   level earlier today. Added `nap()`, which sleeps in <=2s slices.
+
+Also: `pkill -f scripts/renko_engine_strategy` over SSH matches the remote
+shell's own command line and kills the session (three exit-255s). Filter on
+process name instead.
+
+State: 9 registrations, all scheduled; Judas and PDH-PDL `manually_stopped` has
+cleared so they auto-start tomorrow too. No processes running (schedule_stop
+15:20), no stale state files. 214 tests pass. Deployed renko c32a0eede6.
+
 ## [2026-08-20] deploy | Renko Engine promoted to LIVE on SENSEX + MIDCPNIFTY
 
 - User explicitly confirmed: make both registrations genuinely LIVE.

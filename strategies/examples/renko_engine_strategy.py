@@ -54,6 +54,7 @@ MAJORITY of forward months. One month in seven is what the backtest already
 gives and it is not enough. Every simulated round trip is appended to
 log/strategies/renko_shadow_<UNDERLYING>.csv for exactly that count.
 """
+import json
 import os
 import signal
 import sys
@@ -127,6 +128,12 @@ SHADOW_CSV = Path("log") / "strategies" / f"renko_shadow_{UNDERLYING}.csv"
 _shutdown = False
 
 
+
+# Set once the contract lot size is known (see main()). LOT_SIZE gates every
+# exit quantity to a whole multiple; CAN_SPLIT records whether the backtest's
+# half-book at T1 is even expressible at the configured size.
+LOT_SIZE = 0
+CAN_SPLIT = False
 def _sigterm(signum, _frame):
     """The platform stops strategies with SIGTERM at schedule_stop."""
     global _shutdown
@@ -136,6 +143,19 @@ def _sigterm(signum, _frame):
 
 signal.signal(signal.SIGTERM, _sigterm)
 signal.signal(signal.SIGINT, _sigterm)
+
+def nap(total):
+    """Sleep in short slices so SIGTERM is honoured promptly.
+
+    A plain time.sleep() defers shutdown by its full duration. Observed
+    2026-08-20: a SIGTERM'd instance sat in the 300s off-hours sleep and was
+    still alive 33s later, which under the platform's schedule_stop SIGTERM plus
+    TimeoutStopSec guarantees a SIGKILL -- the same unclean-shutdown class that
+    left orphaned app processes across restarts.
+    """
+    end = time.time() + float(total)
+    while not _shutdown and time.time() < end:
+        time.sleep(min(2.0, end - time.time()))
 
 
 # ------------------------------------------------------------------ helpers
@@ -217,6 +237,83 @@ def statutory_cost(entry_px, exit_px, qty):
     if entry_px is None or exit_px is None:
         return 0.0
     return (float(entry_px) + float(exit_px)) * float(qty) * OPT_COST_PCT / 100.0
+
+def confirm_entry_fill(order_id, context="", retries=6, delay=0.7):
+    """Did the ENTRY actually fill? Returns (state, avg_price).
+
+    'complete' -> broker confirms a fill; price may still be None if the average
+                  is unreadable, and a real position is NEVER discarded over a
+                  missing price.
+    'dead'     -> broker confirms rejected/cancelled. There is no position.
+    'unknown'  -> still pending after retries.
+
+    This exists because ACCEPTANCE IS NOT A FILL. placeorder returning success
+    only means the order was taken. POV logged `Trade entered ... Opt entry:
+    499.45` and armed a stop for an order the exchange had REJECTED
+    (2026-08-14), and the same defect was written into this file's first version.
+    """
+    if not order_id:
+        return "unknown", None
+    for attempt in range(retries):
+        try:
+            r = client.orderstatus(order_id=order_id, strategy=STRATEGY_NAME)
+            if isinstance(r, dict) and r.get("status") == "success":
+                d = r.get("data", {}) or {}
+                st = str(d.get("order_status", "")).strip().lower()
+                if st in ("rejected", "cancelled", "canceled"):
+                    return "dead", None
+                if st in ("complete", "completed", "filled"):
+                    for k in ("average_price", "averageprice", "avg_price", "price"):
+                        try:
+                            px = float(d.get(k) or 0)
+                        except (TypeError, ValueError):
+                            px = 0.0
+                        if px > 0:
+                            return "complete", px
+                    return "complete", None
+        except Exception as e:
+            log.debug("orderstatus %s %s: %s", order_id, context, e)
+        if attempt < retries - 1:
+            time.sleep(delay)
+    return "unknown", None
+
+
+def live_position_qty(symbol):
+    """Quantity the broker actually holds for `symbol`. None when unverifiable --
+    which is NOT the same as flat and must never be treated as flat."""
+    try:
+        pb = client.positionbook()
+        if not isinstance(pb, dict) or pb.get("status") != "success":
+            return None
+        for p in pb.get("data", []) or []:
+            if str(p.get("symbol", "")).upper() == str(symbol).upper():
+                return abs(int(p.get("quantity", 0) or 0))
+        return 0
+    except Exception as e:
+        log.debug("positionbook: %s", e)
+        return None
+
+
+def persist(pos):
+    """Snapshot the open position ({} when flat).
+
+    Without this, an app restart mid-trade orphans a REAL position: the strategy
+    forgets it and stops managing its stop. This box restarted three times on
+    2026-08-20 alone, so that is not hypothetical.
+    """
+    try:
+        STATE_FILE.write_text(json.dumps(pos or {}, default=str))
+    except Exception as e:
+        log.debug("persist failed: %s", e)
+
+
+def load_persisted():
+    try:
+        if STATE_FILE.exists():
+            return json.loads(STATE_FILE.read_text()) or {}
+    except Exception as e:
+        log.warning("load_persisted failed: %s", e)
+    return {}
 
 
 def fetch_15m():
@@ -350,8 +447,15 @@ def main():
                   "order rejected all session). Set QUANTITY to override.",
                   UNDERLYING)
         sys.exit(1)
+    global LOT_SIZE, CAN_SPLIT
+    LOT_SIZE = lot
     qty_total = lot * MAX_LOTS
-    log.info("lot=%d lots=%d qty=%d", lot, MAX_LOTS, qty_total)
+    # An option order must be a whole multiple of the lot size, so the
+    # backtest's "book half at T1" is only expressible from 2 lots up.
+    CAN_SPLIT = MAX_LOTS >= 2
+    log.info("lot=%d lots=%d qty=%d | T1 half-book %s",
+             lot, MAX_LOTS, qty_total,
+             "ON" if CAN_SPLIT else "OFF (1 lot -- rides to T2 3.0R)")
 
     entry_end, eod = hhmm(ENTRY_END), hhmm(EOD_EXIT)
     trade_day = None
@@ -359,8 +463,41 @@ def main():
     day = {}
     pos = None
     trades_today = 0
+    daily_pnl = 0.0
     last_bar_ts = None
     prev_close = prev_red_hi = prev_red_med = None
+
+    # ---- adopt a position left open by a restart ------------------------
+    # The platform restarted three times on 2026-08-20 alone. Without this, a
+    # restart mid-trade orphans a REAL position: the strategy forgets it and
+    # stops managing its stop, leaving it to broker auto-squareoff.
+    if not DRY_RUN:
+        saved = load_persisted()
+        if saved.get("symbol"):
+            held = live_position_qty(saved["symbol"])
+            if held is None:
+                log.warning("cannot verify %s at the broker -- adopting the "
+                            "snapshot and managing it rather than abandoning it",
+                            saved["symbol"])
+                pos = saved
+            elif held > 0:
+                log.warning("adopting orphan %s qty=%d (snapshot SL %.1f T1 %.1f "
+                            "T2 %.1f)", saved["symbol"], held,
+                            saved.get("sl", 0), saved.get("t1", 0), saved.get("t2", 0))
+                pos = dict(saved)
+                pos["qty"] = held          # broker is authoritative on size
+            else:
+                log.info("snapshot %s is flat at the broker -- clearing",
+                         saved["symbol"])
+                persist({})
+        if pos is not None:
+            # Seed trade_day so the loop's new-day reset does not immediately
+            # wipe the position we just adopted (trade_day starts as None, which
+            # never equals today, so the reset fires on the very first pass).
+            trade_day = date.today()
+            if str(pos.get("day")) != str(date.today()):
+                log.warning("adopted position is from %s, not today -- it will be "
+                            "closed at the EOD square-off", pos.get("day"))
 
     while not _shutdown:
         now = datetime.now()
@@ -375,7 +512,7 @@ def main():
         # through to the hard square-off below, or this guard would itself
         # become the overnight-carry bug it is unrelated to.
         if pos is None and (not (555 <= mins <= 935) or now.weekday() >= 5):
-            time.sleep(300)
+            nap(300)
             continue
         if trade_day != date.today():
             trade_day = date.today()
@@ -383,6 +520,7 @@ def main():
             renko = Renko()
             pos = None
             trades_today = 0
+            daily_pnl = 0.0
             last_bar_ts = None
             prev_close = prev_red_hi = prev_red_med = None
             log.info("--- new session %s ---", trade_day)
@@ -403,7 +541,8 @@ def main():
             except Exception as e:
                 log.debug("eod spot fetch: %s", e)
             exit_prem = fetch_option_ltp(pos["symbol"], spot=spot_now)
-            q_out = int(pos["qty"])
+            # whole lots only -- a part-lot SELL is rejected outright
+            q_out = max(1, int(pos["qty"]) // LOT_SIZE) * LOT_SIZE if LOT_SIZE else int(pos["qty"])
             gross = ((exit_prem - pos["entry_prem"]) * q_out) if exit_prem else 0.0
             cost = statutory_cost(pos["entry_prem"], exit_prem, q_out)
             log.info("%s EOD | prem %.2f -> %.2f | qty %d | NET %+.0f",
@@ -427,17 +566,17 @@ def main():
 
         df = fetch_15m()
         if df.empty or len(df) < 2:
-            time.sleep(POLL_SECS)
+            nap(POLL_SECS)
             continue
         today_bars = df[[ts.date() == trade_day for ts in df.index]]
         if today_bars.empty:
-            time.sleep(POLL_SECS)
+            nap(POLL_SECS)
             continue
 
         # act once per completed bar
         bar_ts = today_bars.index[-1]
         if bar_ts == last_bar_ts:
-            time.sleep(POLL_SECS)
+            nap(POLL_SECS)
             continue
         last_bar_ts = bar_ts
 
@@ -445,7 +584,7 @@ def main():
             day = prior_day_levels(df)
             if not day:
                 log.warning("no prior-day levels yet; waiting")
-                time.sleep(POLL_SECS)
+                nap(POLL_SECS)
                 continue
             first = today_bars.iloc[0]
             rng = float(first["high"]) - float(first["low"])
@@ -496,17 +635,43 @@ def main():
             if hit is None and mins >= eod:
                 hit = "EOD"
 
-            if hit:
+            # T1 books HALF in the backtest. That is impossible at 1 lot: an
+            # option order must be a whole multiple of the lot size, so
+            # int(20 * 0.5) = 10 on SENSEX is REJECTED ("Quantity must be in
+            # multiples of lot size 20", the 2026-08-12 failure). Worse, the old
+            # code then did `pos["qty"] -= q`, leaving 10 -- after which EVERY
+            # later exit including the STOP was also a non-multiple and rejected,
+            # so the position ran unprotected to broker auto-squareoff.
+            #
+            # Measured on the validated harness with entries held IDENTICAL
+            # (T1_RR stays 2.5 because it feeds the room gate): taking the whole
+            # lot at 3.0R instead of splitting is equal or better --
+            # NIFTY +68,517 vs +65,371, MIDCPNIFTY +128,769 vs +116,634,
+            # SENSEX +10,937 vs +11,575. So a single-lot book simply rides to T2.
+            if hit == "T1" and not CAN_SPLIT:
+                log.info("T1 %.1f reached but 1 lot cannot be halved -- riding to "
+                         "T2 %.1f (measured equal-or-better)", pos["t1"], pos["t2"])
+                hit = None
+
+        if pos is not None and hit:
                 exit_prem = fetch_option_ltp(pos["symbol"], spot=c)
-                part = 0.5 if hit == "T1" else (0.5 if pos["t1_done"] else 1.0)
-                q = int(pos["qty"] * part)
+                if hit == "T1" and CAN_SPLIT:
+                    lots_out = max(1, (pos["qty"] // LOT_SIZE) // 2)
+                else:
+                    lots_out = pos["qty"] // LOT_SIZE
+                q = lots_out * LOT_SIZE
+                if q <= 0:
+                    log.error("exit qty resolved to 0 for %s (held %s, lot %s) -- "
+                              "not sending a zero order", pos["symbol"], pos["qty"], LOT_SIZE)
+                    q = pos["qty"]
                 gross = ((exit_prem - pos["entry_prem"]) * q) if exit_prem else 0.0
                 cost = statutory_cost(pos["entry_prem"], exit_prem, q)
                 net = gross - cost
-                log.info("%s %s | spot %.1f | prem %.2f -> %.2f | qty %d | "
+                log.info("%s %s | spot %.1f | prem %.2f -> %.2f | qty %d (%d lot) | "
                          "gross %+.0f cost %.0f NET %+.0f",
                          "[SHADOW]" if DRY_RUN else "EXIT", hit, c,
-                         pos["entry_prem"], exit_prem or 0.0, q, gross, cost, net)
+                         pos["entry_prem"], exit_prem or 0.0, q, q // LOT_SIZE,
+                         gross, cost, net)
                 append_shadow({"date": trade_day, "underlying": UNDERLYING,
                                "side": pos["side"], "symbol": pos["symbol"],
                                "qty": q, "entry_spot": round(pos["entry_spot"], 2),
@@ -519,11 +684,14 @@ def main():
                     client.placeorder(strategy=STRATEGY_NAME, symbol=pos["symbol"],
                                       action="SELL", exchange=OPT_EXCHANGE,
                                       price_type="MARKET", product=PRODUCT, quantity=q)
-                if hit == "T1":
+                daily_pnl += net
+                if hit == "T1" and CAN_SPLIT:
                     pos["t1_done"] = True
                     pos["qty"] -= q
+                    persist(pos)
                 else:
                     pos = None
+                    persist({})
                     continue
 
         # ---------------- red bar bookkeeping ----------------
@@ -557,12 +725,12 @@ def main():
             log.info("Regime | spot %.1f | renko %.1f-%.1f | red %s | trig %s/%s | trades %d/%d",
                      c, r_floor, r_ceil, "ok" if day["red_ok"] else "-",
                      int(long_trig), int(short_trig), trades_today, MAX_TRADES_DAY)
-            time.sleep(POLL_SECS)
+            nap(POLL_SECS)
             continue
 
         # zone blocks: never inside the X buffer band, never inside CPR
         if day["x_44"] <= c <= day["x_56"] or day["cpr_lo"] <= c <= day["cpr_hi"]:
-            time.sleep(POLL_SECS)
+            nap(POLL_SECS)
             continue
 
         prev_bar = today_bars.iloc[-2]
@@ -580,7 +748,7 @@ def main():
             if risk > 0 and (c - tgt) >= MIN_ROOM_R * risk:
                 side = "short"
         if side is None:
-            time.sleep(POLL_SECS)
+            nap(POLL_SECS)
             continue
 
         exp = get_nearest_expiry()
@@ -588,40 +756,85 @@ def main():
         symbol = get_option_symbol(exp, opt_type) if exp else None
         if not symbol:
             log.warning("could not resolve %s option symbol; skipping signal", opt_type)
-            time.sleep(POLL_SECS)
+            nap(POLL_SECS)
             continue
         entry_prem = fetch_option_ltp(symbol, spot=c)
         if entry_prem is None:
             log.warning("no entry premium for %s; skipping signal", symbol)
-            time.sleep(POLL_SECS)
+            nap(POLL_SECS)
             continue
 
         sgn = 1.0 if side == "long" else -1.0
-        pos = {"side": side, "symbol": symbol, "qty": qty_total,
-               "entry_spot": c, "entry_prem": entry_prem, "sl": sl,
-               "t1": c + sgn * risk * T1_RR, "t2": c + sgn * risk * T2_RR,
-               "t1_done": False}
-        day["red_used"] = True
-        trades_today += 1
+        t1 = c + sgn * risk * T1_RR
+        t2 = c + sgn * risk * T2_RR
         log.info("%s %s %s | spot %.1f | SL %.1f T1 %.1f T2 %.1f | prem %.2f qty %d",
                  "[SHADOW] would BUY" if DRY_RUN else "BUY", opt_type, symbol,
-                 c, sl, pos["t1"], pos["t2"], entry_prem, qty_total)
-        if not DRY_RUN:
-            client.placeorder(strategy=STRATEGY_NAME, symbol=symbol, action="BUY",
-                              exchange=OPT_EXCHANGE, price_type="MARKET",
-                              product=PRODUCT, quantity=qty_total)
-        time.sleep(POLL_SECS)
+                 c, sl, t1, t2, entry_prem, qty_total)
 
-    # SIGTERM: a shadow instance holds nothing; a live one must not be left open.
+        fill_prem = entry_prem
+        if not DRY_RUN:
+            resp = client.placeorder(strategy=STRATEGY_NAME, symbol=symbol,
+                                     action="BUY", exchange=OPT_EXCHANGE,
+                                     price_type="MARKET", product=PRODUCT,
+                                     quantity=qty_total)
+            oid = resp.get("orderid") if isinstance(resp, dict) else None
+            log.info("entry order response: %s", resp)
+            # ACCEPTANCE IS NOT A FILL. Recording a position off the pre-trade
+            # quote is how POV armed a stop for an order the exchange had
+            # REJECTED (2026-08-14). Confirm before arming anything.
+            state, avg = confirm_entry_fill(oid, context=f"entry {symbol}")
+            if state == "dead":
+                log.warning("ENTRY NOT FILLED (%s rejected/cancelled) -- no position "
+                            "recorded, no stop armed.", oid)
+                day["red_used"] = True      # the level is spent either way
+                nap(POLL_SECS)
+                continue
+            if avg is not None:
+                fill_prem = avg
+                log.info("entry filled @ %.2f (quote was %.2f)", avg, entry_prem)
+            elif state == "unknown":
+                # Treat as LIVE deliberately: an unconfirmed order may still fill,
+                # and an untracked real position with no stop is far worse than a
+                # phantom one. The EOD square-off will settle it either way.
+                log.warning("entry %s unconfirmed -- tracking as live on the "
+                            "pre-trade quote %.2f", oid, entry_prem)
+
+        pos = {"side": side, "symbol": symbol, "qty": qty_total,
+               "entry_spot": c, "entry_prem": fill_prem, "sl": sl,
+               "t1": t1, "t2": t2, "t1_done": False,
+               "entry_orderid": (oid if not DRY_RUN else None),
+               "day": str(trade_day)}
+        persist(pos)
+        day["red_used"] = True
+        trades_today += 1
+        nap(POLL_SECS)
+
+    # SIGTERM. A shadow instance holds nothing. A live one must not be left open,
+    # but it must also not fire a naked SELL for something the broker no longer
+    # holds -- so verify first, exactly as Judas does, and keep the snapshot so a
+    # restart can adopt whatever survives.
     if pos is not None and not DRY_RUN:
-        log.warning("shutdown with an open position on %s -- closing", pos["symbol"])
-        try:
-            client.placeorder(strategy=STRATEGY_NAME, symbol=pos["symbol"],
-                              action="SELL", exchange=OPT_EXCHANGE,
-                              price_type="MARKET", product=PRODUCT,
-                              quantity=pos["qty"])
-        except Exception as e:
-            log.error("shutdown close failed: %s", e)
+        held = live_position_qty(pos["symbol"])
+        if held is None:
+            log.error("shutdown: cannot verify %s at the broker -- NOT sending a "
+                      "close, to avoid a naked short. Snapshot kept for adoption.",
+                      pos["symbol"])
+        elif held <= 0:
+            log.info("shutdown: broker reports %s flat -- nothing to close",
+                     pos["symbol"])
+            persist({})
+        else:
+            q_out = max(1, held // LOT_SIZE) * LOT_SIZE if LOT_SIZE else held
+            log.warning("shutdown with %s open (%d) -- closing %d", pos["symbol"],
+                        held, q_out)
+            try:
+                client.placeorder(strategy=STRATEGY_NAME, symbol=pos["symbol"],
+                                  action="SELL", exchange=OPT_EXCHANGE,
+                                  price_type="MARKET", product=PRODUCT,
+                                  quantity=q_out)
+                persist({})
+            except Exception as e:
+                log.error("shutdown close failed: %s -- snapshot kept", e)
     log.info("Shutdown complete.")
     return 0
 

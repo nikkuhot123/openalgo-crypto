@@ -35,6 +35,33 @@ An append-only record of wiki updates, backtests, and VPS operations.
   `Already traded today (2026-08-19) - standing down`, zero orders placed.
 - 31 new tests, 171 pass. Deployed judas 418e4461 (md5 verified both dirs).
 
+## [2026-08-19] gate | Renko PRO on REAL option premiums -- rejected
+
+- Ran the exit-tuned config on Volrix real ATM premiums, 2026-02-20..2026-08-19,
+  15m, Rs 2L, slippage 0.25% (measured live) + transaction costs.
+- NIFTY weekly: n=160 win 29.4% **PF 0.80 net -Rs 48,533** maxDD -88,502.
+  Raw (no slip/cost) already -Rs 38,600 -- the gross book loses.
+- NIFTY skip DTE-0: -Rs 31,037, maxDD -62,305, **PF still 0.80**. Expiry-day
+  theta is ~1/3 of the damage, not the cause.
+- BANKNIFTY monthly: PF 0.80, -Rs 44,870.
+- SENSEX weekly: **PF 1.10, +Rs 18,483**, Sharpe 0.74 -- the only positive, but
+  net/maxDD = 0.36 (25% DD to earn 9%); at 0.5% slip it is 0.21. Not deployable.
+- Delta model was badly optimistic: index points said NIFTY +Rs 65k over 3y with
+  entry beating the strong null at z=2.53. Example of the gap:
+  NIFTY02MAR2624600PE bought 50.20, exited 9.20 (-82%) on expiry day.
+- **Index question answered, and my section-6b ranking corrected**: BANKNIFTY,
+  FINNIFTY and MIDCPNIFTY have NO weekly options (chain on 2026-03-04 shows
+  BANKNIFTY nearest = monthly 2026-03-30). MIDCPNIFTY, ranked "best" on index
+  points, cannot run this strategy at all. Only NIFTY and SENSEX can; of those
+  SENSEX wins, agreeing with the scale-free hurdle ranking (5.55x vs 2.73x).
+- Two of my own port bugs recorded: (1) I misread zero trades -- the Volrix
+  trades payload is double-nested; (2) managing exits on 1-min spot in
+  minTrigger (more precise than the 15m offline engine) produced ZERO exits,
+  carrying positions to run end and blocking entries -- 1 entry per 10 sessions.
+  Fixed by managing on the 15m bar in onCandleClose, which is also faithful.
+- Six price-pattern methods now tested, six rejected. POV (OI/positioning, not
+  price geometry) remains the only positive-expectancy live strategy.
+
 ## [2026-08-19] correction | Renko PRO -- the entry was fine, the exit was not
 
 - Reverses the same-day "no edge" call. Two defects, both flagged by the user:

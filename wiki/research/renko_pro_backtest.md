@@ -286,3 +286,110 @@ and holding the shipped exit fixed while sweeping the entry can only ever produc
 a verdict on the pair -- not on the half being swept.**
 
 *Scripts: `renko_exit_sweep.py`, `renko_robustness.py`, `renko_engine_backtest.py`*
+
+---
+
+## 7. Volrix: Real Option Premiums Kill It On NIFTY (2026-08-19)
+
+Section 6 ended with a hard gate: everything up to that point was index points
+translated through a delta model (DELTA 0.358, premium 0.45% of index). This
+section runs the exit-tuned config on **real ATM weekly option premiums** via
+Volrix, 2026-02-20 to 2026-08-19 (6 months, the plan's data window), 15m,
+intraday, Rs 2,00,000 capital.
+
+### The port
+
+`backtesting/renko_engine/volrix_renko.py` -- entry logic identical to the
+offline port; exits are the swept winner (stop at prior candle, book half at
+2.5R, remainder at 3.0R, max 2/day). Levels are SPOT levels, so legs carry NO
+premium stop and exits fire on spot touches; the 50%-at-T1 book is two 1-lot legs.
+
+**Two bugs found in my own port, both worth recording:**
+
+1. First reading of the results said "zero trades" on all three symbols. That was
+   a **parsing error on my side** -- the Volrix trades payload is double-nested
+   (`data.data.trades`), so `len()` read an empty list.
+2. The real defect: I managed exits in `minTrigger()` against 1-minute spot via
+   `getCurrentData()`. That is *more precise* than the offline engine, which
+   resolves SL/T1/T2 on the **15-minute bar** -- and it produced ZERO exits.
+   Positions were carried to the end of the run, which left `pos_side` set and
+   blocked every subsequent entry: **one entry in ten sessions instead of ~13.**
+   Moving management into `onCandleClose()` on the same 15m bar fixed it and is
+   also the faithful choice. Trying to improve on the thing under test broke it.
+
+### Results -- real premiums, 0.25% slippage (measured live) + transaction costs
+
+| Variant | n | Win% | PF | Net Rs | Max DD | Sharpe | net/DD |
+|---|---|---|---|---|---|---|---|
+| **NIFTY** weekly | 160 | 29.4 | **0.80** | **-48,533** | -88,502 | -1.85 | — |
+| NIFTY, skip DTE-0 | 114 | 33.3 | **0.80** | -31,037 | -62,305 | -1.65 | — |
+| **BANKNIFTY** monthly | 138 | 32.6 | **0.80** | -44,870 | -79,833 | -1.66 | — |
+| **SENSEX** weekly | 152 | 34.2 | **1.10** | **+18,483** | -50,831 | +0.74 | 0.36 |
+| SENSEX, skip DTE-0 | 124 | 35.5 | 1.10 | +7,006 | -33,622 | +0.42 | 0.21 |
+
+Raw (no slippage, no costs) NIFTY is already **-Rs 38,600 at PF 0.80** -- this is
+not a friction artifact, the gross book loses.
+
+### What the delta model got wrong
+
+Index points said NIFTY was the second-best symbol: +Rs 65,371 over three years,
+OOS positive, entry beating the strong null at z=2.53. Real premiums say
+**-Rs 48,533 in six months at PF 0.80.**
+
+The gap is option decay the delta model cannot express. A worked example from the
+trade log: `NIFTY02MAR2624600PE` bought at **50.20** on expiry day, exited at
+**9.20**. A constant-delta translation prices that move as a modest adverse
+excursion; in reality the premium lost 82%.
+
+**Expiry-day theta is a third of the damage, not the cause.** Skipping DTE-0
+improves NIFTY from -48,533 to -31,037 and cuts drawdown by 30%, but **PF stays
+0.80**. The entry/exit pair simply does not clear real premium decay.
+
+### Answering "which index?"
+
+The index-point comparison in section 6b ranked MIDCPNIFTY first and NIFTY
+second. **That comparison was partly invalid, and the reason matters:** it
+assumed a weekly ATM option existed on all five indices. Checked against the
+actual chain on 2026-03-04:
+
+| Index | Nearest expiry type | Weekly options? |
+|---|---|---|
+| NIFTY | weekly (2026-03-10) | yes |
+| SENSEX | weekly (2026-03-05) | yes |
+| BANKNIFTY | **monthly (2026-03-30)** | **no** |
+| FINNIFTY / MIDCPNIFTY | not supported on Volrix | no weeklies |
+
+BANKNIFTY, FINNIFTY and MIDCPNIFTY weeklies no longer exist. So the original
+zero-trade BANKNIFTY run was correct behaviour: the strategy asked for a weekly
+and nothing resolved. **MIDCPNIFTY, the "best" index on index points, cannot run
+this strategy at all** -- an intraday ATM-buying system on a monthly option is a
+different instrument (lower gamma, higher premium, more capital per lot).
+
+Of the two indices that can actually be traded this way:
+
+- **SENSEX is the only positive** -- PF 1.10, +Rs 18,483, Sharpe 0.74.
+- **NIFTY loses** -- PF 0.80.
+
+And that at least agrees with the scale-free index-point ranking, where SENSEX
+led on per-trade edge against its own friction hurdle (5.55x, vs NIFTY 2.73x).
+
+### Verdict -- final
+
+**Fails the real-premium gate. Do not deploy.**
+
+NIFTY and BANKNIFTY both land at **PF 0.80**. SENSEX is positive but its risk
+profile is not deployable: **+Rs 18,483 against a Rs 50,831 drawdown is
+net/maxDD = 0.36** -- a 25% drawdown of capital to earn 9%, on a 6-month, 152-trade
+sample. At 0.5% slippage it degrades to 0.21.
+
+Note the clustering: three of the five variants sit at **PF 0.80**, and the best
+reaches 1.10. That matches the variance-risk-premium finding
+(`wiki/research/variance_risk_premium.md`), where six unrelated strategies all
+landed between PF 0.70 and 1.00. The binding constraint is transaction friction
+and premium decay on **bought** options, not signal quality.
+
+The one live strategy with positive expectancy remains POV (+Rs 108/trade, 62%
+win), and it is still the only one that trades **OI/positioning data rather than
+price geometry**. That is now six price-pattern methods tested and six rejected.
+
+*Scripts: `volrix_renko.py`; Volrix reports linked in `wiki/log.md`.*

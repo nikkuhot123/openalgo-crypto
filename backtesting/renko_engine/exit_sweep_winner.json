@@ -1,0 +1,18 @@
+{
+  "tf": 15,
+  "cfg": {
+    "SL_TYPE": "prev_candle",
+    "SL_ATR_MULT": 1.5,
+    "TARGET_MODE": "fixed_rr",
+    "T2_ATR_MULT": 1.5,
+    "T2_RR": 2.0,
+    "T1_ENABLE": true,
+    "T1_RR": 2.5,
+    "TRAIL_MODE": "none",
+    "MAX_TRADES_DAY": 2,
+    "COOLDOWN_BARS": 0
+  },
+  "is_rs": 48135.24988349975,
+  "is_n": 524,
+  "is_avg": 5.7191793893129566
+}

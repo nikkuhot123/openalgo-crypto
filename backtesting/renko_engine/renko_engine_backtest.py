@@ -87,6 +87,27 @@ FILTER_EMA = True
 TRADE_AFTERNOON = True
 QTY = 2                      # Pine default_qty_value
 
+# ---- exit engine, sweepable (the Pine's "Trade Management" group) ----------
+# The original port hardcoded the two the Pine ships with -- SL at the previous
+# candle and T2 at the Renko structure. The Pine's OWN ranking says that target
+# is the worst of the six it offers (T2 fill 5.8%, expectancy -0.41R) and ATR
+# the best (23.9%, -0.17R), and the 2026-08-19 sweep confirmed the symptom:
+# only 34 of 996 T2s ever filled, yet they carried 97% of net points. So the
+# exits are swept here rather than assumed.
+#
+# Defaults reproduce the previously published runs EXACTLY (regression-checked
+# at 435/746/1407 trades on 30m/15m/5m); nothing below changes a shipped number.
+SL_TYPE = "prev_candle"        # prev_candle | red_bar_opposite | fixed | atr
+SL_ATR_MULT = 1.5
+TARGET_MODE = "renko"          # renko | atr | fixed_rr | next_level | next_level_capped | eod
+T2_ATR_MULT = 1.5
+T2_RR = 4.0
+T2_CAP_R = 4.0
+T1_ENABLE = True               # Pine books 50% at T1
+TRAIL_MODE = "none"            # none | breakeven_1r | atr | ema
+TRAIL_ATR_MULT = 1.5
+ATR_LEN = 14
+
 # ---- measured option translation (backtesting/haema_signal/redbar_*) -------
 DELTA = 0.358
 OPT_COST_PCT = 0.12
@@ -190,6 +211,10 @@ class Trade:
     sl: float
     t1: float
     t2: float
+    # Frozen copy of the ENTRY stop. `sl` is mutated by TRAIL_MODE, so R has to
+    # be measured against this or a trailed stop silently redefines 1R and the
+    # breakeven ratchet arms against a moving target.
+    sl_orig: float = np.nan
     exit_ts: pd.Timestamp = None
     exit: float = np.nan
     reason: str = ""
@@ -216,6 +241,13 @@ def run(df, symbol, entry_override=None):
     pct = PCT_INDEX if is_index else PCT_STOCK
     ema_f = df["close"].ewm(span=EMA_FAST, adjust=False).mean().values
     ema_s = df["close"].ewm(span=EMA_SLOW, adjust=False).mean().values
+
+    # Wilder ATR (RMA), matching Pine's ta.atr -- ewm(alpha=1/len) is RMA.
+    _pc = df["close"].shift(1)
+    _tr = pd.concat([df["high"] - df["low"],
+                     (df["high"] - _pc).abs(),
+                     (df["low"] - _pc).abs()], axis=1).max(axis=1)
+    atr = _tr.ewm(alpha=1.0 / ATR_LEN, adjust=False).mean().values
 
     o, h, l, c = (df[k].values for k in ("open", "high", "low", "close"))
     ts, days, mins = df.index, df["day"].values, df["mins"].values
@@ -266,20 +298,41 @@ def run(df, symbol, entry_override=None):
 
         # ---------------- manage an open position (from the bar AFTER entry) --
         if pos is not None:
+            sgn_p = 1.0 if pos.side == "long" else -1.0
+
+            # ---- trailing stop, applied BEFORE the hit tests so a trail can
+            # only ever be checked on a later bar than the one that set it ----
+            if TRAIL_MODE != "none":
+                new_sl = pos.sl
+                if TRAIL_MODE == "breakeven_1r":
+                    # Measured on Judas (2026-08-06, 25 live round trips): moving
+                    # to entry once +1R is reached lifted mean outcome from
+                    # +0.189R to +0.332R. Same idea, tested here rather than assumed.
+                    r = abs(pos.entry - pos.sl_orig)
+                    if r > 0 and sgn_p * (c[i] - pos.entry) >= r:
+                        new_sl = pos.entry
+                elif TRAIL_MODE == "atr":
+                    new_sl = c[i] - sgn_p * atr[i] * TRAIL_ATR_MULT
+                elif TRAIL_MODE == "ema":
+                    new_sl = ema_s[i]
+                # a trail may only ever tighten
+                if sgn_p * (new_sl - pos.sl) > 0:
+                    pos.sl = new_sl
+
             hit = None
             if pos.side == "long":
                 if l[i] <= pos.sl:
                     hit, px = "SL", pos.sl                       # stop first, always
-                elif h[i] >= pos.t1 and not pos.legs:
+                elif h[i] >= pos.t1 and T1_ENABLE and not pos.legs:
                     pos.legs.append(("T1", pos.t1))
-                if hit is None and pos.legs and h[i] >= pos.t2:
+                if hit is None and (pos.legs or not T1_ENABLE) and h[i] >= pos.t2:
                     hit, px = "T2", pos.t2
             else:
                 if h[i] >= pos.sl:
                     hit, px = "SL", pos.sl
-                elif l[i] <= pos.t1 and not pos.legs:
+                elif l[i] <= pos.t1 and T1_ENABLE and not pos.legs:
                     pos.legs.append(("T1", pos.t1))
-                if hit is None and pos.legs and l[i] <= pos.t2:
+                if hit is None and (pos.legs or not T1_ENABLE) and l[i] <= pos.t2:
                     hit, px = "T2", pos.t2
             if hit is None and is_last_of_day:
                 hit, px = "EOD", c[i]
@@ -373,20 +426,49 @@ def run(df, symbol, entry_override=None):
         if pos is None and not blocked and (long_sig or short_sig):
             side = "long" if long_sig else "short"
             entry = c[i]
-            raw_sl = sl_l if side == "long" else sl_s
-            if side == "long" and (np.isnan(raw_sl) or raw_sl >= entry):
-                raw_sl = entry - SL_POINTS
-            if side == "short" and (np.isnan(raw_sl) or raw_sl <= entry):
-                raw_sl = entry + SL_POINTS
+            sgn = 1.0 if side == "long" else -1.0
+
+            # ---- stop ------------------------------------------------------
+            if SL_TYPE == "prev_candle":
+                raw_sl = sl_l if side == "long" else sl_s
+            elif SL_TYPE == "red_bar_opposite":
+                raw_sl = day.red_low if side == "long" else day.red_high
+            elif SL_TYPE == "atr":
+                raw_sl = entry - sgn * atr[i] * SL_ATR_MULT
+            else:  # fixed
+                raw_sl = entry - sgn * SL_POINTS
+            # a stop on the wrong side of entry is not a stop
+            if np.isnan(raw_sl) or sgn * (entry - raw_sl) <= 0:
+                raw_sl = entry - sgn * SL_POINTS
             risk = abs(entry - raw_sl)
-            t1 = entry + risk * T1_RR if side == "long" else entry - risk * T1_RR
+            t1 = entry + sgn * risk * T1_RR
+
+            # ---- target ----------------------------------------------------
             struct = r_ceil if side == "long" else r_floor
-            if side == "long" and struct < t1:
-                struct += brick
-            if side == "short" and struct > t1:
-                struct -= brick
+            if sgn * (struct - t1) < 0:          # never inside T1
+                struct += sgn * brick
+            if TARGET_MODE == "renko":
+                t2 = struct
+            elif TARGET_MODE == "atr":
+                t2 = entry + sgn * atr[i] * T2_ATR_MULT
+            elif TARGET_MODE == "fixed_rr":
+                t2 = entry + sgn * risk * T2_RR
+            elif TARGET_MODE in ("next_level", "next_level_capped"):
+                cands = [x for x in (day.cpp, cpr_lo, cpr_hi, g_far, day.inst_high,
+                                     day.inst_low, day.x_high, day.x_low, day.x_44,
+                                     day.x_56, day.aft_44, day.aft_56, r_floor, r_ceil)
+                         if not np.isnan(x) and sgn * (x - t1) > 0]
+                nl = (min(cands) if side == "long" else max(cands)) if cands else entry + sgn * risk * 3.0
+                if TARGET_MODE == "next_level_capped":
+                    cap = entry + sgn * risk * T2_CAP_R
+                    nl = min(nl, cap) if side == "long" else max(nl, cap)
+                t2 = nl
+            else:  # eod -- no target at all, ride the session
+                t2 = entry + sgn * 1e9
+            if sgn * (t2 - t1) <= 0:             # keep T2 strictly beyond T1
+                t2 = t1 + sgn * risk * 0.5
             pos = Trade(day=days[i], entry_ts=ts[i], side=side, entry=entry,
-                        sl=raw_sl, t1=t1, t2=struct)
+                        sl=raw_sl, t1=t1, t2=t2, sl_orig=raw_sl)
             day.trades += 1
 
         prev_close, prev_red_high, prev_red_med = c[i], cur_red_high, cur_red_med

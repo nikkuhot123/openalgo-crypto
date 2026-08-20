@@ -35,6 +35,34 @@ An append-only record of wiki updates, backtests, and VPS operations.
   `Already traded today (2026-08-19) - standing down`, zero orders placed.
 - 31 new tests, 171 pass. Deployed judas 418e4461 (md5 verified both dirs).
 
+## [2026-08-19] correction | Renko PRO -- the entry was fine, the exit was not
+
+- Reverses the same-day "no edge" call. Two defects, both flagged by the user:
+  the port hardcoded the Pine's shipped exits (stop = prev candle, T2 = Renko --
+  the Pine's own worst target at 5.8% fill), and the null randomised entry
+  TIMING only while inheriting the strategy's day, direction and EMA side.
+- Symptom I had misread: 34 of 996 T2s filled yet carried 97% of net points.
+  That is an unreachable target, not a bad entry.
+- Swept the EXIT surface with entries frozen at engine defaults: 4 SL types x
+  7 target modes x T1 x 4 trail modes x max-trades/day x cooldown = 12,096 runs.
+- Trade count priced in per user request: selection on net RUPEES after friction
+  (Rs 43.72/round trip = 1.87 pts). Points ranking gives 58.6% of configs
+  positive; rupees gives 30.9%. Friction flips a quarter of the grid.
+- Winner 15m: SL prev candle, T1 2.5R books 50%, T2 resolves to 3.0R, no trail,
+  max 2 trades/day. Top 12 cluster on the same geometry.
+- G1 OOS +Rs 17,236 PASS | G2 transfer 4/4 PASS | G3b STRONG null (random day +
+  direction + timing) real +Rs 65,371 vs null mean -Rs 13,631, z=+2.53, 1/200
+  beat it, PASS | G4 friction PASS | G5 top-5% FAIL.
+- G5 is the wrong test for a 39.7%-win 2.5R book (skew +1.11): trimming the top
+  5% of any right-skewed payoff looks fatal. Fair replacements: bootstrap 95.9%
+  of 5,000 resamples profitable with 5th pct +Rs 2,959; 9/13 quarters positive;
+  equal-trimmed real -2.90 vs null -6.05 pts/trade, z=+1.80 (better, not
+  significant).
+- Revised verdict: thin real borderline edge. Forward-test 1 lot, do not scale.
+  Worst quarter (2026Q2, -Rs 12,269) is also the most recent.
+- REQUIRED before deployment: real option premiums on Volrix. Everything here is
+  delta-translated index points, which is exactly where Red Bar and Stochastic died.
+
 ## [2026-08-19] research | Renko PRO parameter sweep -- pre-registered protocol
 
 - Swept 1,728 configs (576 params x 5/15/30m) on NIFTY in-sample only, with the

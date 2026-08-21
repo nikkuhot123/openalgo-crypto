@@ -1012,6 +1012,38 @@ def run_strategy():
         _active_trade = active_trade
         state = "IN_TRADE"
         acquire_symbol_lock(orphan["symbol"], STRATEGY_NAME)
+        # Re-establish the resting backstop on the ADOPTED position.
+        #
+        # Without this the protection exists only on the happy path: the
+        # restored-context branch carries a `disaster_oid` that may long since
+        # have been cancelled or filled, and the unknown-orphan branch builds a
+        # fresh dict with no oid at all -- so an adopted position would carry no
+        # backstop while the code believed otherwise. POV already does exactly
+        # this check for its own SL, and this is the same requirement.
+        _d_oid = active_trade.get("disaster_oid")
+        _d_live = False
+        if _d_oid:
+            try:
+                _st = client.orderstatus(order_id=_d_oid, strategy=STRATEGY_NAME)
+                _os = str(((_st.get("data") or {}).get("order_status") or "")).lower()
+                _d_live = (_st.get("status") == "success"
+                           and _os in ("open", "trigger pending", "pending"))
+            except Exception as _derr:
+                log.debug("disaster stop status check failed: %s", _derr)
+            log.info("adopted disaster stop %s is %s", _d_oid,
+                     "still resting" if _d_live else "NOT live -- re-arming")
+        if not _d_live:
+            # Price the backstop off whatever entry reference we have. An adopted
+            # unknown orphan has only the broker's average, which is the right
+            # reference anyway.
+            _ref = (active_trade.get("entry_fill_price")
+                    or active_trade.get("entry_opt_price")
+                    or orphan.get("entry_price"))
+            active_trade["disaster_oid"] = place_disaster_stop(
+                orphan["symbol"], opt_exchange, _ref, orphan["qty"])
+            if not active_trade["disaster_oid"]:
+                log.warning("adopted %s has NO resting backstop -- the in-process "
+                            "spot stop is its only protection", orphan["symbol"])
         trade_date = date.today()  # seed so the new-day reset does NOT wipe the adopted IN_TRADE state
         persist_trade(active_trade)
     else:

@@ -609,3 +609,33 @@ def test_locks_released_on_every_exit_path():
     assert src.count("release_direction_lock(") >= 5
     rej = src[src.index("ENTRY NOT FILLED"):]
     assert "release_symbol_lock(symbol)" in rej[:400]
+
+
+# ============================================== recovery path (review 2)
+
+def test_adoption_reacquires_both_locks():
+    """Our previous pid is dead, so the old lock is stale and any sibling can
+    take it -- meaning POV could open the OPPOSITE side on this underlying while
+    we still hold a live position."""
+    src = (ROOT / "strategies" / "examples" / "renko_engine_strategy.py").read_text(encoding="utf-8")
+    seg = src[src.index("adopt a position left open by a restart"):]
+    seg = seg[:seg.index("while not _shutdown")]
+    assert "acquire_direction_lock(" in seg
+    assert "acquire_symbol_lock(" in seg
+    assert "managing to exit only" in seg
+
+
+def test_daily_pnl_is_actually_reported():
+    """It was accumulated in two places and never read -- dead state that looked
+    like accounting."""
+    src = (ROOT / "strategies" / "examples" / "renko_engine_strategy.py").read_text(encoding="utf-8")
+    assert "SESSION %s closed" in src
+    seg = src[src.index("SESSION %s closed"):src.index("SESSION %s closed") + 400]
+    assert "daily_pnl" in seg and "daily_loss_rs" in seg
+
+
+def test_session_summary_only_when_there_were_trades():
+    src = (ROOT / "strategies" / "examples" / "renko_engine_strategy.py").read_text(encoding="utf-8")
+    seg = src[src.index("Close the books on the session"):]
+    seg = seg[:seg.index("trade_day = date.today()")]
+    assert "trade_day is not None and trades_today" in seg

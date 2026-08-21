@@ -35,6 +35,44 @@ An append-only record of wiki updates, backtests, and VPS operations.
   `Already traded today (2026-08-19) - standing down`, zero orders placed.
 - 31 new tests, 171 pass. Deployed judas 418e4461 (md5 verified both dirs).
 
+## [2026-08-20] review | all 3 strategies: protection missing on the RECOVERY path
+
+Reviewed the session's changes across Judas, POV and Renko. Three defects, all
+the same shape: the protection I added exists on the happy path and is absent on
+the restart/recovery path.
+
+1. **Judas -- an adopted position had no resting backstop.** The restored-context
+   branch carried a `disaster_oid` that may long since have been cancelled or
+   filled, and the unknown-orphan branch built a fresh dict with NO oid at all --
+   so after a restart the position ran with only its in-process spot stop while
+   the code believed a backstop was resting. Adoption now checks `orderstatus`
+   for "open / trigger pending / pending" and re-arms when it is not live,
+   pricing off entry_fill_price -> entry_opt_price -> the broker's own average
+   for an unknown orphan. Warns explicitly when no backstop can be armed.
+   (POV already did this for its SL; this is the same requirement.)
+
+2. **Renko -- adoption never re-acquired the locks.** Our previous pid is dead,
+   so `_pid_alive` marks the old lock stale and any sibling may take it. POV
+   could therefore open the OPPOSITE direction on the same underlying while
+   renko still held a live position -- precisely the paid straddle the direction
+   lock exists to prevent. Adoption now re-claims both contract and direction
+   locks and logs "managing to exit only" if either is held elsewhere.
+
+3. **Renko -- `daily_pnl` was dead state.** Accumulated in two places, never
+   read: accounting that looked like accounting. Now emits one
+   `SESSION <date> closed | trades N | realised Rs X | losses Rs Y | streak Z`
+   line on rollover, so it is auditable against the shadow CSV and the broker's
+   realised P&L. Only logged when the session actually traded.
+
+Also fixed a test that had become ambiguous: `test_oid_is_persisted...` anchored
+on the first `place_disaster_stop` call site, and there are now two (entry and
+adoption). It asserts both arming sites persist the oid, since a restart cannot
+cancel a resting order it does not know about.
+
+256 strategy tests + 7 CI-safe tests pass. Deployed judas de13468ed6,
+renko 5566db865c, pov e086ebacba3 -- md5 verified across scripts/ and examples/,
+all three compile on the VPS.
+
 ## [2026-08-20] audit | POV: stated R:R is not actual R:R (logged, not corrected)
 
 - Asked whether POV shares Judas's stop problems. It does NOT share the one that

@@ -181,13 +181,17 @@ def test_armed_from_the_actual_fill_not_the_quote():
     assert "persist_trade(active_trade)" in seg      # oid must survive a restart
 
 
-def test_oid_is_persisted_so_a_restart_can_cancel_it():
-    # anchor on the CALL SITE, not the def -- searching from the definition finds
-    # the function body and proves nothing about the caller
+def test_oid_is_persisted_at_every_arming_site():
+    """There are two arming sites -- fresh entry and restart adoption -- and the
+    oid must survive a restart from BOTH, or a later restart cannot cancel a
+    resting order it does not know about."""
     call = 'active_trade["disaster_oid"] = place_disaster_stop('
-    assert call in SRC
-    seg = SRC[SRC.index(call):]
-    assert "persist_trade(active_trade)" in seg[:400]
+    sites = [i for i in range(len(SRC)) if SRC.startswith(call, i)]
+    assert len(sites) == 2, f"expected entry + adoption arming sites, found {len(sites)}"
+    for i in sites:
+        seg = SRC[i:i + 900]
+        assert "persist_trade(active_trade)" in seg, \
+            f"arming site at {i} does not persist the oid"
 
 
 def test_real_stop_is_untouched():
@@ -200,3 +204,33 @@ def test_real_stop_is_untouched():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ============================================== recovery path (review 2)
+# The pattern found reviewing all three strategies: protection present on the
+# happy path, absent on the recovery path.
+
+def test_adoption_verifies_or_rearms_the_backstop():
+    """The restored-context branch carries a disaster_oid that may long since
+    have been cancelled or filled, and the unknown-orphan branch builds a fresh
+    dict with no oid at all -- so an adopted position would carry no backstop
+    while the code believed otherwise."""
+    seg = SRC[SRC.index("Adopt orphan position on boot"):]
+    seg = seg[:seg.index("trade_date = date.today()")]
+    assert "orderstatus(order_id=_d_oid" in seg, "must check whether it still rests"
+    assert "trigger pending" in seg
+    assert "place_disaster_stop(" in seg, "must re-arm when it is not live"
+
+
+def test_adoption_warns_when_it_cannot_arm_a_backstop():
+    seg = SRC[SRC.index("Adopt orphan position on boot"):]
+    seg = seg[:seg.index("trade_date = date.today()")]
+    assert "NO resting backstop" in seg
+
+
+def test_adoption_prices_the_backstop_off_a_real_reference():
+    """An adopted unknown orphan has only the broker's average price -- which is
+    the correct reference, not a guess."""
+    seg = SRC[SRC.index("Adopt orphan position on boot"):]
+    seg = seg[:seg.index("trade_date = date.today()")]
+    assert 'orphan.get("entry_price")' in seg

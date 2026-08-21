@@ -641,6 +641,19 @@ def main():
             # wipe the position we just adopted (trade_day starts as None, which
             # never equals today, so the reset fires on the very first pass).
             trade_day = date.today()
+            # Re-claim the locks for the adopted position. Our previous pid is
+            # dead, so `_pid_alive` marks the old lock stale and any sibling can
+            # take it -- meaning POV could open the OPPOSITE side on this
+            # underlying while we still hold a live position, which is the exact
+            # paid-straddle the direction lock exists to prevent.
+            _side = "CE" if pos.get("side") == "long" else "PE"
+            if not acquire_direction_lock(_side):
+                log.error("adopted %s but another strategy holds the opposite "
+                          "direction on %s -- managing to exit only",
+                          pos.get("symbol"), UNDERLYING)
+            if not acquire_symbol_lock(pos["symbol"]):
+                log.error("adopted %s but its contract lock is held elsewhere -- "
+                          "managing to exit only", pos["symbol"])
             if str(pos.get("day")) != str(date.today()):
                 log.warning("adopted position is from %s, not today -- it will be "
                             "closed at the EOD square-off", pos.get("day"))
@@ -661,6 +674,15 @@ def main():
             nap(300)
             continue
         if trade_day != date.today():
+            # Close the books on the session that just ended. daily_pnl was
+            # being accumulated in two places and never read -- dead state that
+            # looked like accounting. One line makes it auditable against the
+            # shadow CSV and the broker's own realised P&L.
+            if trade_day is not None and trades_today:
+                log.info("SESSION %s closed | trades %d | realised Rs %+.0f | "
+                         "losses Rs %.0f | streak %d%s", trade_day, trades_today,
+                         daily_pnl, daily_loss_rs, consecutive_losses,
+                         " | HALTED" if halted else "")
             trade_day = date.today()
             day = {}
             renko = Renko()

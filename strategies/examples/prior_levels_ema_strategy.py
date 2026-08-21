@@ -176,6 +176,10 @@ STATE_FILE = STATE_DIR / f"prior_levels_ema_{UNDERLYING.upper()}.json"
 
 
 # ------------------------------------------------------------ locks + state
+def _strategy_slug(name):
+    return re.sub(r'[^A-Za-z0-9]+', '_', str(name)).strip('_')
+
+
 def _pid_alive(pid):
     if not pid or pid <= 0:
         return False
@@ -188,6 +192,14 @@ def _pid_alive(pid):
 
 
 def _lock_is_stale(ts_str, pid):
+    """Stale if past TTL or owner process died. A live owner keeps the lock."""
+    if pid and _pid_alive(pid):
+        try:
+            age = (datetime.now() - datetime.fromisoformat(str(ts_str))).total_seconds()
+        except (ValueError, TypeError):
+            age = None
+        if age is not None and age < 86400:
+            return False  # live owner within 24h is valid (covers overnight carry)
     try:
         when = datetime.fromisoformat(str(ts_str))
         if (datetime.now() - when).total_seconds() > 24 * 3600:
@@ -197,26 +209,76 @@ def _lock_is_stale(ts_str, pid):
     return not _pid_alive(pid)
 
 
+def _read_lock(path):
+    """(owner, iso_ts, pid) from a lock file, in EITHER convention."""
+    try:
+        raw = path.read_text().strip()
+    except Exception:
+        return None, "", 0
+    if raw.startswith("{"):
+        try:
+            d = json.loads(raw)
+            return (str(d.get("strategy") or ""), str(d.get("ts") or ""),
+                    int(d.get("pid") or 0))
+        except Exception:
+            return None, "", 0
+    parts = raw.split("|")
+    ts = parts[1] if len(parts) > 1 else ""
+    pid = int(parts[2]) if len(parts) > 2 and parts[2].strip().isdigit() else 0
+    return (parts[0] if parts else ""), ts, pid
+
+
+def acquire_instance_lock(underlying, strategy_name):
+    """Ensure only ONE instance of this strategy runs on an underlying."""
+    if DRY_RUN:
+        return True
+    lock_file = LOCKS_DIR / f"{underlying}.lock"
+    try:
+        if lock_file.exists():
+            owner, ts, pid = _read_lock(lock_file)
+            if owner == strategy_name and _pid_alive(pid):
+                return True
+            if not _lock_is_stale(ts, pid):
+                log.warning("instance lock held by %s pid %s (%s)", owner, pid, underlying)
+                return False
+        lock_file.write_text(f"{strategy_name}|{datetime.now().isoformat()}|{os.getpid()}")
+        return True
+    except Exception as e:
+        log.error("acquire_instance_lock failed: %s", e)
+        return False
+
+
+def release_instance_lock(underlying, strategy_name):
+    if DRY_RUN:
+        return
+    lock_file = LOCKS_DIR / f"{underlying}.lock"
+    try:
+        if lock_file.exists():
+            owner, ts, pid = _read_lock(lock_file)
+            if owner == strategy_name and (not pid or pid == os.getpid()):
+                lock_file.unlink()
+    except Exception as e:
+        log.error("release_instance_lock failed: %s", e)
+
+
 def acquire_symbol_lock(symbol, strategy_name):
-    """Claim one CONTRACT. True if acquired, already ours, or the holder is stale."""
+    """Claim one OPTION CONTRACT. True if acquired, already ours, or holder is stale."""
     if DRY_RUN:
         return True
     lock_file = LOCKS_DIR / f"{symbol}.lock"
     try:
         if lock_file.exists():
-            holder = json.loads(lock_file.read_text())
-            if holder.get("strategy") == strategy_name and _pid_alive(holder.get("pid")):
-                return True
-            if not _lock_is_stale(holder.get("ts"), holder.get("pid")):
-                log.warning(
-                    "lock held by %s pid %s (%s)", holder.get("strategy"), holder.get("pid"), symbol
-                )
+            owner, ts, pid = _read_lock(lock_file)
+            if owner is None:
+                log.warning("unreadable contract lock on %s -- standing aside", symbol)
                 return False
-        lock_file.write_text(
-            json.dumps(
-                {"strategy": strategy_name, "pid": os.getpid(), "ts": datetime.now().isoformat()}
-            )
-        )
+            if owner == strategy_name:
+                return True
+            if not _lock_is_stale(ts, pid):
+                log.warning("contract lock held by %s pid %s (%s)", owner, pid, symbol)
+                return False
+            log.warning("stale contract lock on %s (owner '%s') -- reclaiming", symbol, owner)
+        lock_file.write_text(f"{strategy_name}|{datetime.now().isoformat()}|{os.getpid()}")
         return True
     except Exception as e:
         log.error("acquire_symbol_lock failed: %s", e)
@@ -224,59 +286,71 @@ def acquire_symbol_lock(symbol, strategy_name):
 
 
 def release_symbol_lock(symbol, strategy_name):
-    if DRY_RUN:
+    if DRY_RUN or not symbol:
         return
     lock_file = LOCKS_DIR / f"{symbol}.lock"
     try:
         if lock_file.exists():
-            holder = json.loads(lock_file.read_text())
-            if holder.get("strategy") == strategy_name and holder.get("pid") == os.getpid():
+            owner, ts, pid = _read_lock(lock_file)
+            if owner == strategy_name and (not pid or pid == os.getpid()):
                 lock_file.unlink()
     except Exception as e:
         log.error("release_symbol_lock failed: %s", e)
 
 
 def acquire_direction_lock(underlying, side, strategy_name):
-    """Claim a direction; False when another strategy holds the opposite side."""
+    """Claim a DIRECTION (CE/PE) on an underlying. False if another strategy is
+    already positioned the opposite way."""
     if DRY_RUN:
         return True
     und = str(underlying).upper()
-    oppo = "PE" if side == "CE" else "CE"
+    me = _strategy_slug(strategy_name)
+    want = str(side).upper()
     try:
-        f = LOCKS_DIR / f"{und}_{oppo}.dir"
-        if f.exists():
-            holder = json.loads(f.read_text())
-            if (
-                not _lock_is_stale(holder.get("ts"), holder.get("pid"))
-                and holder.get("strategy") != strategy_name
-            ):
+        for f in LOCKS_DIR.glob(f"{und}.*.dir"):
+            parts = f.name.split(".")
+            if len(parts) < 4:
+                continue
+            owner, held = parts[1], parts[2].upper()
+            if owner == me:
+                continue  # never block on ourselves
+            try:
+                body = f.read_text().split("|")
+                ts = body[0] if body else ""
+                pid = int(body[1]) if len(body) > 1 and body[1].strip().isdigit() else 0
+            except Exception:
+                ts, pid = "", 0
+            if _lock_is_stale(ts, pid):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+                continue
+            if held != want:
+                log.info("DIRECTION CONFLICT on %s: '%s' already holds %s, we want %s -- standing aside",
+                         und, owner, held, want)
                 return False
-        f = LOCKS_DIR / f"{und}_{side}.dir"
-        f.write_text(
-            json.dumps(
-                {"strategy": strategy_name, "pid": os.getpid(), "ts": datetime.now().isoformat()}
-            )
-        )
-        return True
     except Exception as e:
-        log.error("acquire_direction_lock failed: %s", e)
-        return False
+        log.debug("direction lock scan failed: %s", e)
+    try:
+        (LOCKS_DIR / f"{und}.{me}.{want}.dir").write_text(
+            f"{datetime.now().isoformat()}|{os.getpid()}")
+    except Exception:
+        pass
+    return True
 
 
 def release_direction_lock(underlying, strategy_name, side=None):
     if DRY_RUN:
         return
     und = str(underlying).upper()
-    sides = ("CE", "PE") if side is None else (side,)
-    for tag in sides:
-        f = LOCKS_DIR / f"{und}_{tag}.dir"
-        try:
-            if f.exists():
-                holder = json.loads(f.read_text())
-                if holder.get("strategy") == strategy_name and holder.get("pid") == os.getpid():
-                    f.unlink()
-        except Exception:
-            pass
+    me = _strategy_slug(strategy_name)
+    pat = f"{und}.{me}.*.dir" if side is None else f"{und}.{me}.{str(side).upper()}.dir"
+    try:
+        for f in LOCKS_DIR.glob(pat):
+            f.unlink()
+    except Exception:
+        pass
 
 
 def persist_state(trade, day):
@@ -866,6 +940,10 @@ def _graceful_shutdown(signum, frame):
             "shutdown",
         )
         log.info("shutdown square-off: %s qty=%s fill=%s", outcome, qty, fill)
+        if outcome == "sold":
+            release_symbol_lock(symbol, STRATEGY_NAME)
+            release_direction_lock(UNDERLYING, STRATEGY_NAME, (_active_trade or {}).get("side"))
+    release_instance_lock(UNDERLYING, STRATEGY_NAME)
     sys.exit(0)
 
 
@@ -908,6 +986,11 @@ def _enter_position(side, reason, levels, df_1m, intraday=False):
         sym = get_option_symbol(UNDERLYING, _opt_exchange, expiry, STRIKE_OFFSET, side)
         if not sym:
             log.warning("no option symbol")
+            release_direction_lock(UNDERLYING, STRATEGY_NAME, side)
+            return None
+        if not acquire_symbol_lock(sym, STRATEGY_NAME):
+            log.warning("contract lock busy for %s", sym)
+            release_direction_lock(UNDERLYING, STRATEGY_NAME, side)
             return None
         prem = fetch_option_ltp(sym, _opt_exchange)
         if prem is None:
@@ -966,6 +1049,8 @@ def _enter_position(side, reason, levels, df_1m, intraday=False):
         )
         if not oid:
             log.error("entry rejected: %s", resp)
+            release_symbol_lock(sym, STRATEGY_NAME)
+            release_direction_lock(UNDERLYING, STRATEGY_NAME, side)
             return None
         # the order is live from here: count it against the day before anything
         # else can fail, so a crash cannot buy a second lot on the same session
@@ -1025,6 +1110,7 @@ def _exit_position(reason):
     if outcome == "sold":
         _active_trade = {}
         persist_state({}, _day_state)
+        release_symbol_lock(sym, STRATEGY_NAME)
         release_direction_lock(UNDERLYING, STRATEGY_NAME, trade.get("side"))
         log.info("Phase: FLAT reason=%s qty=%s fill=%s", reason, qty, sell)
     else:
@@ -1054,8 +1140,8 @@ def _stop_state(trade, spot):
 def run_strategy():
     global _active_trade, _day_state, _opt_exchange, QUANTITY, LOT_SIZE
     _opt_exchange = _option_exchange(UNDERLYING)
-    if not acquire_symbol_lock(UNDERLYING, STRATEGY_NAME):
-        log.error("lock held by another instance; exiting")
+    if not acquire_instance_lock(UNDERLYING, STRATEGY_NAME):
+        log.error("instance lock held by another process; exiting")
         sys.exit(1)
     _active_trade, _day_state = load_state()
     log.info(

@@ -156,17 +156,96 @@ SKIP_EXPIRY_DAY_UNDERLYINGS = {
 LOCKS_DIR = Path("log") / "strategies" / "locks"
 LOCKS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Locks must never wedge. Judas had NO staleness check at all: a leaked lock --
+# and release only runs on the normal exit paths, so a crash or an unusual branch
+# leaks one -- silently blocked every future entry on that contract, forever.
+# POV found 9 orphaned .lock files sitting in this directory, some on
+# already-expired contracts, which is what prompted its own TTL.
+LOCK_TTL_MIN = float(os.getenv('LOCK_TTL_MIN', '360'))   # one session
+
+
+def _pid_alive(pid):
+    """True if the process still exists. Unknown -> assume alive, never steal."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return True
+
+
+def _lock_is_stale(ts_str, pid):
+    """Stale if written on an earlier session, past its TTL, or its owner died."""
+    if pid and _pid_alive(pid):
+        try:
+            age = (datetime.now() - datetime.fromisoformat(str(ts_str))).total_seconds()
+        except (ValueError, TypeError):
+            age = None
+        if age is not None and age < 86400:
+            return False        # live owner, under a day old -- a real claim
+    try:
+        when = datetime.fromisoformat(str(ts_str))
+    except (ValueError, TypeError):
+        return True                                  # unparseable -> reclaim
+    if when.date() != date.today():
+        return True                                  # previous session
+    if (datetime.now() - when).total_seconds() / 60.0 > LOCK_TTL_MIN:
+        return True
+    if pid and not _pid_alive(pid):
+        return True                                  # owner process gone
+    return False
+
+
+def _read_lock(path):
+    """(owner, iso_ts, pid) from a lock file, in EITHER convention.
+
+    Two formats coexist in this directory:
+      pipe  "owner|iso|pid"                      -- POV, Judas, Renko
+      JSON  {"strategy":..,"ts":..,"pid":..}     -- PDH-PDL EMA
+
+    Judas's old reader took `split("|", 1)[0]` and compared it to its own name,
+    so it never stole a foreign lock -- but it also never expired one.
+    """
+    try:
+        raw = path.read_text().strip()
+    except Exception:
+        return None, "", 0
+    if raw.startswith("{"):
+        try:
+            d = json.loads(raw)
+            return (str(d.get("strategy") or ""), str(d.get("ts") or ""),
+                    int(d.get("pid") or 0))
+        except Exception:
+            return None, "", 0
+    parts = raw.split("|")
+    ts = parts[1] if len(parts) > 1 else ""
+    pid = int(parts[2]) if len(parts) > 2 and parts[2].strip().isdigit() else 0
+    return (parts[0] if parts else ""), ts, pid
+
+
 def acquire_symbol_lock(symbol, strategy_name):
-    """Try to claim a lock on a symbol. Returns True if acquired (or already ours)."""
+    """Claim one CONTRACT. True if acquired, already ours, or the holder's is stale."""
     lock_file = LOCKS_DIR / f"{symbol}.lock"
     if lock_file.exists():
-        try:
-            owner = lock_file.read_text().split("|", 1)[0]
-            return owner == strategy_name
-        except Exception:
+        owner, ts, pid = _read_lock(lock_file)
+        if owner is None:
+            log.warning(f"Unreadable contract lock on {symbol} — standing aside")
             return False
+        if owner == strategy_name:
+            return True
+        if not _lock_is_stale(ts, pid):
+            log.info(f"CONTRACT LOCKED: {symbol} held by '{owner}' — standing aside")
+            return False
+        log.warning(f"Stale contract lock on {symbol} (owner '{owner}') — reclaiming")
     try:
-        lock_file.write_text(f"{strategy_name}|{datetime.now().isoformat()}")
+        # pid included so siblings can tell a live holder from a dead one
+        lock_file.write_text(
+            f"{strategy_name}|{datetime.now().isoformat()}|{os.getpid()}")
         return True
     except Exception:
         return False

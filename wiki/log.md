@@ -1,3 +1,34 @@
+## [2026-08-20] fix(locks): unify lock format, namespace & overnight staleness across all 4 strategies
+
+Discovered that the cross-strategy lock system had three fundamental fissures:
+
+1. **Format/Staleness Divergence**:
+   - POV, Judas, and Renko wrote pipe-delimited `owner|ts|pid`.
+   - PDH-PDL wrote JSON `{"strategy":..., "ts":..., "pid":...}`.
+   - POV/Renko's parser split on `|` -> produced empty `ts` on JSON -> marked it STALE and reclaimed PDH's live locks.
+   - Judas had NO staleness check at all -> leaked locks wedged contracts forever.
+
+2. **Namespace & Granularity Mismatch**:
+   - POV/Renko/Judas locked the **option contract** (`{symbol}.lock`) and claimed direction as `{und}.{slug}.{side}.dir`.
+   - PDH locked the **underlying** (`{und}.lock` as an undocumented instance singleton) without locking the option contract, and wrote direction as `{und}_{side}.dir` (invisible to `{und}.*.dir` scans).
+   - This meant PDH could hold NIFTY PE overnight while POV/Renko opened NIFTY CE next morning -- creating a delta-neutral straddle paying double premium and double spread.
+
+3. **Overnight Carry Erasure**:
+   - POV/Renko/Judas date-based staleness expired locks across midnight.
+   - For an intraday strategy, this clears crashed leftovers. For PDH carrying overnight, it caused siblings to treat its active position as stale at 09:15.
+   - Added a live-pid grace check: if the owner PID is alive and age < 24h, the claim is honored across session rollover.
+
+**Changes applied**:
+- Added `_read_lock()` helper in all 4 strategies handling both pipe and JSON formats defensively.
+- Added staleness check + PID recording to Judas so leaked locks expire.
+- Updated PDH-PDL to:
+  - Acquire contract-level lock on the purchased option symbol (`sym`) on entry, release on exit/shutdown.
+  - Write direction locks as `{und}.{slug}.{side}.dir` matching the shared namespace.
+  - Separate its instance singleton lock (`acquire_instance_lock`).
+- Added live-pid 24h grace to staleness checks across all strategies.
+- Added `test/test_lock_interop.py` with 35 tests covering all cross-strategy locking & direction exclusion matrices. All 291 strategy tests + 7 CI tests pass.
+- Deployed and verified on VPS across `scripts/` and `examples/`.
+
 # Chronological Log
 
 An append-only record of wiki updates, backtests, and VPS operations.

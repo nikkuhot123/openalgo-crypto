@@ -195,6 +195,13 @@ def _lock_is_stale(ts_str, pid):
 
     Without this a leaked lock blocks valid entries forever -- 9 orphaned .lock
     files were found on 2026-07-29, some on already-expired contracts."""
+    if pid and _pid_alive(pid):
+        try:
+            age = (datetime.now() - datetime.fromisoformat(str(ts_str))).total_seconds()
+        except (ValueError, TypeError):
+            age = None
+        if age is not None and age < 86400:
+            return False        # live owner, under a day old -- a real claim
     try:
         when = datetime.fromisoformat(str(ts_str))
     except (ValueError, TypeError):
@@ -212,26 +219,52 @@ def _strategy_slug(name):
     return re.sub(r'[^A-Za-z0-9]+', '_', str(name)).strip('_')
 
 
+def _read_lock(path):
+    """(owner, iso_ts, pid) from a lock file, in EITHER convention.
+
+    Two formats coexist in this directory:
+      pipe  "owner|iso|pid"                      -- POV, Judas, Renko
+      JSON  {"strategy":..,"ts":..,"pid":..}     -- PDH-PDL EMA
+
+    Parsing only the pipe form made a JSON lock look like owner='{"strategy"...'
+    with ts='' -- and _lock_is_stale() treats an unparseable timestamp as STALE,
+    so this strategy would silently RECLAIM PDH's LIVE locks.
+    """
+    try:
+        raw = path.read_text().strip()
+    except Exception:
+        return None, "", 0
+    if raw.startswith("{"):
+        try:
+            d = json.loads(raw)
+            return (str(d.get("strategy") or ""), str(d.get("ts") or ""),
+                    int(d.get("pid") or 0))
+        except Exception:
+            return None, "", 0
+    parts = raw.split("|")
+    ts = parts[1] if len(parts) > 1 else ""
+    pid = int(parts[2]) if len(parts) > 2 and parts[2].strip().isdigit() else 0
+    return (parts[0] if parts else ""), ts, pid
+
+
 def acquire_symbol_lock(symbol):
     """Claim one CONTRACT so two strategies cannot hold the same option."""
     if DRY_RUN:
         return True                     # a shadow must never block a live sibling
     f = LOCKS_DIR / f"{symbol}.lock"
     if f.exists():
-        try:
-            parts = f.read_text().split("|")
-            if parts[0] == STRATEGY_NAME:
-                return True
-            ts = parts[1] if len(parts) > 1 else ""
-            pid = int(parts[2]) if len(parts) > 2 and parts[2].strip().isdigit() else 0
-            if not _lock_is_stale(ts, pid):
-                log.info("CONTRACT LOCKED: %s held by '%s' -- standing aside",
-                         symbol, parts[0])
-                return False
-            log.warning("stale contract lock on %s (owner '%s') -- reclaiming",
-                        symbol, parts[0])
-        except Exception:
+        owner, ts, pid = _read_lock(f)
+        if owner is None:
+            log.warning("unreadable contract lock on %s -- standing aside", symbol)
             return False
+        if owner == STRATEGY_NAME:
+            return True
+        if not _lock_is_stale(ts, pid):
+            log.info("CONTRACT LOCKED: %s held by '%s' -- standing aside",
+                     symbol, owner)
+            return False
+        log.warning("stale contract lock on %s (owner '%s') -- reclaiming",
+                    symbol, owner)
     try:
         f.write_text(f"{STRATEGY_NAME}|{datetime.now().isoformat()}|{os.getpid()}")
         return True

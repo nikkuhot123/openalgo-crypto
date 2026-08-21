@@ -329,7 +329,10 @@ def test_exit_sites_write_the_marker_not_a_bare_clear():
     src = (ROOT / "strategies" / "examples" / "judas_swing_strategy.py").read_text(encoding="utf-8")
     # both DONE-after-a-trade sites
     assert src.count("persist_done(today)") == 2
-    ext = src.split("EXTERNAL CLOSE: %s no longer held", 1)[1][:600]
+    # window widened 2026-08-20: the disaster-stop cancel block now sits
+    # between this log line and persist_done(today). The assertion is about
+    # presence, not proximity.
+    ext = src.split("EXTERNAL CLOSE: %s no longer held", 1)[1][:1400]
     assert "persist_done(today)" in ext and "persist_trade({})" not in ext
     nor = src.split("# Judas is one-trade-per-day — after any exit", 1)[1][:400]
     assert "persist_done(today)" in nor and "persist_trade({})" not in nor

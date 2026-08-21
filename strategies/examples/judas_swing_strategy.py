@@ -85,6 +85,30 @@ RR = float(os.getenv('RR', '2.0'))  # reward:risk target multiple (both indices:
 # better on 16/25 trades. Only 4/25 trades ever reach the 2R target, which is
 # why protecting the median 0.60R excursion matters more than chasing it.
 BE_ARM_R = float(os.getenv('BE_ARM_R', '1.0'))
+
+# ---- resting DISASTER stop at the broker -----------------------------------
+# Judas's real stop is a SPOT level held in-process, checked every ~5s. A crash
+# or SIGKILL between polls leaves the position unprotected -- POV's 2026-07-02
+# incident is the realised cost of that (3 SENSEX PE legs, 3+ hours, -75-80%).
+#
+# A resting broker order cannot watch spot, only premium, and the measured
+# spot->premium mapping is far too unstable to translate the real stop into one:
+# realised |dPrem/dSpot| ranges 0.019-0.856 across 8 live contracts (a 46x
+# spread, one with R^2 = 0.00), mis-placing a translated stop by a median 14.3%
+# of premium. See wiki/research/judas_broker_stop.md.
+#
+# So this is NOT the strategy's stop. It is a wide backstop that only fires when
+# nothing else can. Measured over 1,338 live (spot, premium) samples, the worst
+# adverse premium excursion on any normally-managed trade was -48.6% and the
+# median -14.7%; a level at -40% would have pre-empted the real stop on 2 of 8
+# contracts, -50% clears the worst by only 1.4pp, and -60% clears it by 11.4pp.
+# Hence -60%: on this evidence it never fires in normal operation, so its
+# expected cost is ~zero, and it converts an 80-100% tail into a 60% one.
+DISASTER_STOP_PCT = float(os.getenv('DISASTER_STOP_PCT', '60'))
+# Stop-LIMIT, never SL-M: SL-M is rejected outright for options (measured 33/33
+# on POV) and the API used to report that as success with orderid=null, silently
+# leaving positions with no stop at all.
+SL_LIMIT_BUFFER_PCT = float(os.getenv('SL_LIMIT_BUFFER_PCT', '5'))
 # Circuit breaker config
 LOSS_STREAK_LIMIT = int(os.getenv('LOSS_STREAK_LIMIT', '3'))
 DAILY_LOSS_LIMIT_RS = float(os.getenv('DAILY_LOSS_LIMIT_RS', '10000'))
@@ -546,6 +570,69 @@ def statutory_cost(entry_px, exit_px, qty):
     return turnover * OPT_COST_PCT / 100.0
 
 
+def safe_cancel_order(order_id, context=""):
+    """Cancel an order, treating 'already terminal' as success.
+
+    Brokers error when cancelling an order that already filled or was rejected,
+    but that IS the desired end state -- it is no longer active. Mapping those to
+    a clean no-op is what lets callers audit-log honestly.
+    """
+    if not order_id:
+        return True, "no order id"
+    try:
+        resp = client.cancelorder(order_id=order_id, strategy=STRATEGY_NAME)
+    except Exception as e:
+        return False, f"cancelorder threw: {e}"
+    if not isinstance(resp, dict):
+        return True, f"non-dict response (assumed ok): {resp}"
+    if resp.get("status") == "success":
+        return True, "cancelled"
+    msg = str(resp.get("message", "")).lower()
+    if any(w in msg for w in ("complete", "cancel", "reject", "not found", "traded")):
+        return True, f"already terminal: {resp.get('message')}"
+    return False, str(resp.get("message") or resp)
+
+
+def place_disaster_stop(opt_symbol, opt_exchange, entry_premium, qty):
+    """Rest a WIDE stop-LIMIT at the broker as a crash backstop.
+
+    This is deliberately NOT the strategy's stop -- see DISASTER_STOP_PCT. It
+    exists only for the case where this process is gone and the in-process spot
+    stop cannot run. Returns the order id, or None.
+    """
+    if DISASTER_STOP_PCT <= 0 or not entry_premium or entry_premium <= 0:
+        return None
+    # Guard on the RAW value, before tick rounding. A 0.10 entry premium gives a
+    # raw trigger of 0.04, which rounds UP to exactly 0.05 and would slip past a
+    # post-rounding check -- arming a meaningless "sell at almost zero" stop that
+    # can never protect anything.
+    raw = float(entry_premium) * (1.0 - DISASTER_STOP_PCT / 100.0)
+    if raw < 0.10:
+        log.info("disaster stop skipped: entry premium %.2f too small for a "
+                 "%.0f%% trigger (raw %.3f)", entry_premium, DISASTER_STOP_PCT, raw)
+        return None
+    trg = round(round(raw / 0.05) * 0.05, 2)
+    lim = max(0.05, round(round(trg * (1.0 - SL_LIMIT_BUFFER_PCT / 100.0)
+                                / 0.05) * 0.05, 2))
+    try:
+        resp = client.placeorder(
+            strategy=STRATEGY_NAME, symbol=opt_symbol, action="SELL",
+            exchange=opt_exchange, price_type="SL", trigger_price=trg,
+            price=lim, product=PRODUCT, quantity=qty)
+    except Exception as e:
+        log.error("disaster stop placement threw: %s", e)
+        return None
+    oid = resp.get("orderid") if isinstance(resp, dict) else None
+    if isinstance(resp, dict) and resp.get("status") == "success" and oid:
+        log.info("DISASTER STOP armed on %s: trigger %.2f limit %.2f (-%.0f%% of "
+                 "entry %.2f) order %s -- backstop only, the real stop is spot %s",
+                 opt_symbol, trg, lim, DISASTER_STOP_PCT, entry_premium, oid, "in-process")
+        return oid
+    # An unarmed backstop must be loud: silence here is how a position ends up
+    # with no protection at all while the log looks healthy.
+    log.warning("DISASTER STOP NOT ARMED on %s: %s", opt_symbol, resp)
+    return None
+
 def fetch_fill_price(order_id, max_retries=4, retry_delay=1.0):
     """Average TRADED price for an order, so P&L rests on real fills.
 
@@ -769,14 +856,25 @@ def _graceful_shutdown(signum, frame):
                 log.info("Shutdown complete. Exiting.")
                 sys.exit(0)
 
+            _d_oid = _active_trade.get("disaster_oid")
             if broker_qty is None:
                 # UNKNOWN (positionbook non-success, e.g. app restarting -> 502).
                 # Do NOT assume flat; keep lock + state so restart adoption re-arms it.
+                # Deliberately LEAVE the resting backstop in place: this is exactly
+                # the case it exists for -- we are exiting without knowing whether a
+                # position survives us.
                 log.error(f"Shutdown: cannot verify {symbol} position — leaving untouched for restart adoption")
+                if _d_oid:
+                    log.warning("Shutdown: LEAVING disaster stop %s armed — position "
+                                "state unknown and this is its whole purpose", _d_oid)
                 log.info("Shutdown complete. Exiting.")
                 sys.exit(0)
             if broker_qty <= 0:
                 log.info(f"Shutdown: broker reports {symbol} qty={broker_qty} — already flat, no SELL")
+                # Flat, so a live resting SELL would be a naked short.
+                if _d_oid:
+                    _ok, _m = safe_cancel_order(_d_oid, f"shutdown flat {symbol}")
+                    (log.info if _ok else log.error)("disaster stop cancel: %s", _m)
                 release_symbol_lock(symbol, STRATEGY_NAME)
             else:
                 close_qty = min(broker_qty, _active_trade.get("qty", QUANTITY))
@@ -792,9 +890,15 @@ def _graceful_shutdown(signum, frame):
                         quantity=close_qty
                     )
                     log.info(f"Shutdown exit response: {resp}")
+                    # Position closed -> the backstop must go, or it fires naked.
+                    if _d_oid:
+                        _ok, _m = safe_cancel_order(_d_oid, f"shutdown close {symbol}")
+                        (log.info if _ok else log.error)("disaster stop cancel: %s", _m)
                     release_symbol_lock(symbol, STRATEGY_NAME)
                 except Exception as e:
                     log.error(f"Failed to close position on shutdown: {e}")
+                    if _d_oid:
+                        log.warning("close failed — LEAVING disaster stop %s armed", _d_oid)
     else:
         log.info("No active position — nothing to close.")
 
@@ -1014,6 +1118,14 @@ def run_strategy():
                             "Reconcile manually from the broker orderbook.", symbol, _detail)
                     log.info("EXTERNAL CLOSE: %s no longer held (%s) — releasing and standing down.",
                              symbol, _detail)
+                    # An orphaned resting SELL is a NAKED SHORT once the position
+                    # is gone. This is the same class of failure that produced
+                    # POV's RECONCILE work, so it is cancelled on every exit path.
+                    _ok, _m = safe_cancel_order(active_trade.get("disaster_oid"),
+                                                f"external close {symbol}")
+                    if active_trade.get("disaster_oid"):
+                        (log.info if _ok else log.error)(
+                            "disaster stop cancel on external close: %s", _m)
                     release_symbol_lock(symbol, STRATEGY_NAME)
                     state = "DONE"
                     active_trade = {}
@@ -1127,6 +1239,13 @@ def run_strategy():
                     else:
                         log.warning(f"{exit_reason}: broker flat on {symbol} — no long to close; skipping SELL to avoid naked short")
 
+                    # Cancel the resting backstop BEFORE releasing the symbol.
+                    # Left alive after the position closes it is a naked short.
+                    if active_trade.get("disaster_oid"):
+                        _ok, _m = safe_cancel_order(active_trade["disaster_oid"],
+                                                    f"exit {symbol}")
+                        (log.info if _ok else log.error)(
+                            "disaster stop cancel on %s: %s", exit_reason, _m)
                     release_symbol_lock(symbol, STRATEGY_NAME)
 
                     # Judas is one-trade-per-day — after any exit, done for the day
@@ -1301,6 +1420,14 @@ def run_strategy():
                     _active_trade = active_trade
                     persist_trade(active_trade)
                     last_entry_candle_fp = sig["candle_fp"]
+                    # Rest the wide backstop at the broker. Uses the ACTUAL fill
+                    # when we have it, so the -60% level is measured from what we
+                    # really paid rather than from a pre-trade quote.
+                    _prem_ref = (active_trade.get("entry_fill_price")
+                                 or active_trade.get("entry_opt_price"))
+                    active_trade["disaster_oid"] = place_disaster_stop(
+                        opt_symbol, opt_exchange, _prem_ref, entry_qty)
+                    persist_trade(active_trade)
                     log.info(f"Entered Trade! Spot Entry: {entry_spot:.2f} | SL: {sl_spot:.2f} | Target: {target_spot:.2f} | Opt entry: {entry_opt_price}")
                     # Tape context at entry -- diagnostic only, never a gate.
                     # Judas trades off SPOT structure and never looks at the

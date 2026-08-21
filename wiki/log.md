@@ -35,6 +35,30 @@ An append-only record of wiki updates, backtests, and VPS operations.
   `Already traded today (2026-08-19) - standing down`, zero orders placed.
 - 31 new tests, 171 pass. Deployed judas 418e4461 (md5 verified both dirs).
 
+## [2026-08-20] ship | Judas resting disaster stop at -60%
+
+- Implemented the recommendation from the broker-stop study. The spot stop and
+  the break-even ratchet are UNCHANGED -- this is a backstop, not a replacement.
+- DISASTER_STOP_PCT=60 (of the actual entry FILL, not the quote),
+  SL_LIMIT_BUFFER_PCT=5. stop-LIMIT never SL-M (rejected 33/33 for options, and
+  the API reported it as success with orderid=null). Order id persisted so a
+  restart can cancel it.
+- Cancelled on every exit path: normal exit, external close, shutdown-flat,
+  shutdown-close. An orphaned resting SELL is a naked short.
+- Deliberately LEFT ARMED when the positionbook is unverifiable at shutdown, and
+  when the shutdown close fails -- those are the cases it exists for.
+- Unarmed backstop now logs at WARNING. Silence was the original failure mode.
+- Edge case caught by tests: a 0.10 entry premium gives a raw trigger of 0.04
+  which TICK-ROUNDS UP to exactly 0.05, slipping past a post-rounding `< 0.05`
+  guard and arming a meaningless "sell at almost zero" stop. Guard now runs on
+  the raw pre-rounded value and requires >= 0.10.
+- Also fixed a pre-existing test whose 600-char slice window no longer reached
+  persist_done(today) after the cancel block was inserted; widened to 1400 since
+  the assertion is about presence, not proximity.
+- 17 new tests, 240 pass. Deployed judas 4a03a7c2e6 (md5 verified both dirs,
+  compiles on VPS). Effective at tomorrow's 09:45 start. No resting orders
+  currently open; judas not running (schedule 09:45-15:20).
+
 ## [2026-08-20] study | resting broker stop for Judas -- translated NO, disaster stop YES
 
 - Question: should Judas rest its stop at the broker like POV does? A resting

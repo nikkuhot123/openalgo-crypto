@@ -125,3 +125,39 @@ Three conditions before shipping it:
 - **n = 8 contracts / 10 entries is a small sample.** The -60% level is chosen
   with margin precisely because of that, and should be re-checked once the give-
   back study reaches its 15-trade target.
+
+
+---
+
+## Implemented (2026-08-20)
+
+Shipped as recommended: the spot stop and the break-even ratchet are **untouched**;
+a wide backstop now rests at the broker.
+
+```
+DISASTER_STOP_PCT   = 60     # -60% of the ACTUAL entry fill
+SL_LIMIT_BUFFER_PCT = 5      # stop-LIMIT; limit sits 5% below trigger
+```
+
+- Armed from `entry_fill_price` where available, so the level is measured from
+  what was really paid rather than a pre-trade quote. The order id is persisted,
+  so a restart can still cancel it.
+- **stop-LIMIT, never SL-M** -- SL-M is rejected outright for options (33/33 on
+  POV) and the API reported that as success with `orderid=null`, silently leaving
+  positions unprotected. An unarmed backstop now logs `DISASTER STOP NOT ARMED`
+  at WARNING; silence was the failure mode.
+- **Cancelled on every exit path** -- normal exit, external close, shutdown-flat,
+  shutdown-close. An orphaned resting SELL is a naked short once the position is
+  gone, which is the same class of bug that produced POV's RECONCILE work.
+- **Deliberately LEFT ARMED in two cases**: when the positionbook cannot be
+  verified at shutdown, and when the shutdown close itself fails. Those are
+  precisely the situations it exists for -- exiting without knowing whether a
+  position survives us.
+
+An edge case caught by the tests, worth recording: a 0.10 entry premium gives a
+raw trigger of 0.04, which **tick-rounds up to exactly 0.05** and slipped past a
+post-rounding `< 0.05` guard, arming a meaningless "sell at almost zero" stop.
+The guard now runs on the raw pre-rounded value and requires >= 0.10.
+
+17 dedicated tests (`test/test_judas_disaster_stop.py`), 240 in the suite.
+Deployed judas `4a03a7c2e6`. Takes effect at the 09:45 scheduled start.

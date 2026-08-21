@@ -1406,6 +1406,48 @@ def run_strategy():
                             persist_positions(positions)
                             sync_direction_locks(positions, STRATEGY_NAME, UNDERLYING)
                             log.info(f"Trade entered: {symbol} | SL: {res['sl']} | T1: {res['t1']} | T2: {res['t2']} | T3: {res['t3']} | Opt entry: {entry_opt_price}")
+                            # REALISED geometry, not the intended geometry.
+                            # sl/t1/t2/t3 are computed from the SIGNAL CANDLE
+                            # CLOSE, but the position fills elsewhere, and the
+                            # stop is never re-derived from the fill. Measured
+                            # over the first 6 live entries, fills deviated from
+                            # the signal close by -15.8% to +4.1%, so T1 -- which
+                            # the code believes is always 1.5R -- actually landed
+                            # anywhere from 0.72R to 6.36R, and on 2 of 6 trades
+                            # T1 paid LESS than the stop risked.
+                            #
+                            # This is the same class as Judas's MIN_EFFECTIVE_RR
+                            # bug (stated R:R != actual R:R), reached via fill
+                            # slippage rather than stop flooring. Judas is immune
+                            # because its geometry is in SPOT, which an option
+                            # fill cannot move.
+                            #
+                            # Logged, deliberately NOT corrected: POV is the only
+                            # positive-expectancy strategy here (+Rs 108/trade)
+                            # and it earned that WITH this geometry, so silently
+                            # moving its targets is an untested change. This line
+                            # collects the evidence to decide on.
+                            try:
+                                _rk = float(entry_opt_price) - float(res["sl"])
+                                if _rk > 0:
+                                    _r1 = (float(res["t1"]) - float(entry_opt_price)) / _rk
+                                    _slpct = 100.0 * _rk / float(entry_opt_price)
+                                    log.info("GEOMETRY %s fill=%.2f sl=%.2f risk=%.2f "
+                                             "(%.1f%% of premium) T1=%.2f -> %.2fR actual "
+                                             "(intended 1.50R)", symbol, entry_opt_price,
+                                             res["sl"], _rk, _slpct, res["t1"], _r1)
+                                    if _r1 < 1.0:
+                                        log.warning("GEOMETRY INVERTED on %s: T1 pays "
+                                                    "%.2fR against 1.00R of risk -- the "
+                                                    "first target returns less than the "
+                                                    "stop risks", symbol, _r1)
+                                else:
+                                    log.warning("GEOMETRY %s: stop is at or above the "
+                                                "fill (fill %.2f, sl %.2f) -- risk is "
+                                                "not measurable", symbol,
+                                                entry_opt_price, res["sl"])
+                            except Exception as _gerr:
+                                log.debug("geometry log failed: %s", _gerr)
                             # Tape context at entry -- diagnostic only, never a
                             # gate. The OI x price quadrant from openmtops'
                             # narrative.py: it is the read POV's own edge lives

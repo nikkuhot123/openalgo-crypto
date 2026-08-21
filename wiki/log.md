@@ -35,6 +35,36 @@ An append-only record of wiki updates, backtests, and VPS operations.
   `Already traded today (2026-08-19) - standing down`, zero orders placed.
 - 31 new tests, 171 pass. Deployed judas 418e4461 (md5 verified both dirs).
 
+## [2026-08-20] audit | POV: stated R:R is not actual R:R (logged, not corrected)
+
+- Asked whether POV shares Judas's stop problems. It does NOT share the one that
+  prompted the question, and it has a different one.
+- **Not wrong**: POV's `sl = round(lo, 2)` is the OPTION candle's own low, i.e.
+  already a premium level, so it rests natively with no spot->premium translation.
+  Verified live: 6 SL orders armed, all triggers 0.05-tick aligned, 0 rejections,
+  0 UNPROTECTED events. It also already re-arms the stop on restart adoption and
+  logs UNPROTECTED at ERROR on failure. That machinery is sound.
+- **Wrong**: sl/t1/t2/t3 are computed from the SIGNAL CANDLE CLOSE and never
+  re-derived from the fill. Recovering the signal close from t1=e+1.5(e-sl) over
+  the first 6 live entries: fills deviated -15.8% to +4.1%, so T1 -- believed to
+  be 1.50R always -- actually landed between **0.72R and 6.36R**, and on **2 of 6
+  trades T1 paid LESS than the stop risked**.
+- Same class as Judas's MIN_EFFECTIVE_RR bug (stated R:R != actual R:R) but via
+  fill slippage rather than stop flooring. Judas is structurally immune to this
+  variant because its geometry is in SPOT, which an option fill cannot move.
+- Also: 2 of 6 entries stopped only ~2.5% from premium, against a measured ~0.41%
+  spread -- about six spreads of room.
+- NOT corrected. POV is the only positive-expectancy strategy (+Rs 108/trade, 62%
+  win) and earned that WITH this geometry; moving its targets is an untested
+  change to the one thing that works. Same reasoning as the POV ratchet question:
+  instrument first.
+- Added GEOMETRY / GEOMETRY INVERTED logging at entry, plus a guard so a stop at
+  or above the fill warns instead of dividing by zero. Wrapped so a diagnostic
+  can never affect the position just opened.
+- Decision point: at ~15 GEOMETRY lines, compare outcomes for inverted (<1R) vs
+  normal geometry, then decide whether to re-derive from the fill.
+- 10 new tests, 250 pass. Deployed pov e086ebacba3d (md5 verified, compiles).
+
 ## [2026-08-20] ship | Judas resting disaster stop at -60%
 
 - Implemented the recommendation from the broker-stop study. The spot stop and

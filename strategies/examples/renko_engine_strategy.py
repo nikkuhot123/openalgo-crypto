@@ -616,13 +616,36 @@ def main():
                     "verification. This was opt-in.")
     log.info("=" * 62)
 
+    # The exchange master contract is not queryable the instant this starts.
+    # 2026-08-24: the 09:16 schedule start raced the flattrade master download,
+    # which finished at 09:20:50 -- optionchain and optionsymbol both answered
+    # HTTP 500 at 09:16:02, so `fetch_lot_size` returned nothing and the old
+    # code called sys.exit(1) HERE. Both instances were dead for the whole
+    # session over a 4m48s timing race.
+    #
+    # Standing down rather than guessing a size is still right (2026-08-12: a
+    # hardcoded guess got every order rejected all session). Dying is not: the
+    # size is not needed until the first entry, so wait for it and keep the
+    # deadline anchored to the ENTRY WINDOW, never to process start.
     lot = QUANTITY or fetch_lot_size()
     if not lot or lot <= 0:
-        log.error("lot size unavailable for %s -- standing down rather than "
-                  "guessing a size (2026-08-12: a hardcoded guess got every "
-                  "order rejected all session). Set QUANTITY to override.",
-                  UNDERLYING)
-        sys.exit(1)
+        while not _shutdown:
+            now = datetime.now()
+            if now.hour * 60 + now.minute >= hhmm(ENTRY_END):
+                log.error("lot size still unavailable for %s at the entry cutoff "
+                          "(%s) -- nothing left to arm today. Set QUANTITY to "
+                          "override.", UNDERLYING, ENTRY_END)
+                sys.exit(1)
+            log.info("lot size not published yet for %s (master contract still "
+                     "downloading?) -- retrying in 10s", UNDERLYING)
+            nap(10)
+            lot = QUANTITY or fetch_lot_size()
+            if lot and lot > 0:
+                break
+        if _shutdown:
+            log.info("shutdown while waiting for lot size")
+            sys.exit(0)
+        log.info("lot size resolved after waiting: %s", lot)
     global LOT_SIZE, CAN_SPLIT
     LOT_SIZE = lot
     qty_total = lot * MAX_LOTS

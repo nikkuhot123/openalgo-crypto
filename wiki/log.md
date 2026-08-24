@@ -1,3 +1,45 @@
+## [2026-08-24] fix(startup): the master-contract race killed 4 live instances
+
+Renko was not armed today because both instances were DEAD from 09:16:02, and
+PDH-PDL died at 09:20:09. One shared cause.
+
+The flattrade master contract finished downloading at **09:20:50**. Anything
+that queried the exchange master before that got HTTP 500 from BOTH
+`optionchain` and `optionsymbol`, so lot-size detection returned nothing:
+
+| instance | start | outcome |
+|---|---|---|
+| Renko SENSEX / MIDCPNIFTY | 09:16:00 | 500 at 09:16:02 -> `sys.exit(1)`, NO retry |
+| PDH-PDL NIFTY / SENSEX | 09:10:00 | retried 600s from start, gave up 09:20:09 -- **41s early** |
+| POV, Judas, collector | 09:20-09:45 | started after the master was ready, unaffected |
+
+Standing down rather than guessing a size stays correct: on 2026-08-12 a
+hardcoded guess produced 51 rejected orders across both books. The defect was
+the DEADLINE -- anchored to process start instead of to the moment the size is
+actually needed.
+
+Fixes:
+- Renko: the fatal exit is replaced by a retry loop whose deadline is the entry
+  cutoff (`ENTRY_END`), sleeping in `nap(10)` slices so SIGTERM still lands. It
+  would have waited 4m48s today and resolved.
+- PDH-PDL: dropped the fixed `LOT_SIZE_WAIT_SECS` budget. In overnight mode the
+  size is not needed until `ENTRY_TIME` (15:05), so the deadline is now that
+  moment; intraday uses `EXIT_TIME`. The failure log names the deadline it
+  missed, so a recurrence is not silent.
+- Neither strategy can invent a size; `QUANTITY` remains the only override.
+
+Also corrected `test_no_hardcoded_lot_fallback_in_source`, which pinned the
+phrase "standing down rather than" and so reported a correct change as a
+regression. It now asserts the invariant: no numeric literal in the resolution
+path, override still documented.
+
+Verified lot sizes resolve now: SENSEX 20, MIDCPNIFTY 120, NIFTY 65.
+9 new tests in test/test_lot_size_wait.py; 300 pass. Deployed, md5-matched,
+compiles on the VPS.
+
+All four remain `is_scheduled=True` with no `manually_stopped` flag, so they
+auto-start tomorrow at 09:10/09:16 with the fix in place.
+
 ## [2026-08-20] fix(locks): unify lock format, namespace & overnight staleness across all 4 strategies
 
 Discovered that the cross-strategy lock system had three fundamental fissures:

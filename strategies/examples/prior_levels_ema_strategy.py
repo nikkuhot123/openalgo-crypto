@@ -1173,17 +1173,28 @@ def run_strategy():
     # restart loop -- 7 restarts on 2026-08-07 before one happened to stick
     # after the market opened. Wait for the master rather than dying; SIGTERM
     # still breaks out immediately.
-    _waited = 0
-    while LOT_SIZE <= 0 and not _shutdown_requested and _waited < LOT_SIZE_WAIT_SECS:
-        log.info("lot size not published yet; retrying in 10s (%ss/%ss)", _waited, LOT_SIZE_WAIT_SECS)
+    #
+    # 2026-08-24: a FIXED 600s window from process start was still wrong. It
+    # expired at 09:20:09 and the flattrade master finished downloading at
+    # 09:20:50 -- both instances died 41 SECONDS early and lost the whole
+    # session. In overnight mode the size is not needed until ENTRY_TIME
+    # (15:05), so anchor the deadline to the moment the size is actually
+    # REQUIRED, never to process start.
+    _deadline = datetime.combine(date.today(), ENTRY_TIME if MODE == "overnight"
+                                 else EXIT_TIME)
+    while LOT_SIZE <= 0 and not _shutdown_requested:
+        if datetime.now() >= _deadline:
+            break
+        log.info("lot size not published yet; retrying in 10s (deadline %s)",
+                 _deadline.strftime("%H:%M"))
         time.sleep(10)
-        _waited += 10
         LOT_SIZE = fetch_lot_size(UNDERLYING, _opt_exchange) or 0
     if LOT_SIZE <= 0:
         if _shutdown_requested:
             log.info("shutdown while waiting for lot size")
             sys.exit(0)
-        log.error("lot size unavailable after %ss; set QUANTITY", _waited)
+        log.error("lot size unavailable by %s (the point it is needed); "
+                  "set QUANTITY to override", _deadline.strftime("%H:%M"))
         sys.exit(1)
     log.info(
         "sizing: lot=%s mode=%s max_lots=%s risk=%.2f%% (auto sizing uses the entry premium)",

@@ -238,8 +238,15 @@ def test_no_hardcoded_lot_fallback_in_source():
     src = (ROOT / "strategies" / "examples" / "renko_engine_strategy.py").read_text(encoding="utf-8")
     assert "= 75" not in src
     assert "lot = 75" not in src
-    # standing down must be the documented behaviour
-    assert "standing down rather than" in src
+    # Refusing to guess must remain the behaviour, but assert the INVARIANT
+    # rather than a phrase: the wording moved on 2026-08-24 when the fatal exit
+    # was replaced with a wait anchored to the entry cutoff, and pinning prose
+    # made a correct change look like a regression.
+    blk = src[src.index("lot = QUANTITY or fetch_lot_size()"):][:1800]
+    assert "QUANTITY" in blk, "the override escape hatch must stay documented"
+    # no invented size anywhere in the resolution path
+    import re as _re
+    assert not _re.search(r"lot\s*=\s*\d+", blk), "hardcoded lot size"
 
 
 def test_option_ltp_rejects_a_spot_leak():

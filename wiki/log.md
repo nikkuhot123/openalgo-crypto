@@ -1,3 +1,58 @@
+## [2026-08-25] upgrade: fork synced to upstream openalgo 2.0.2.1
+
+Upstream was 543 commits ahead (2.0.1.5 -> 2.0.2.1); we were 133 commits ahead
+with our own work. Merged on a branch, resolved, tested, deployed pre-market.
+
+Conflict surface was far smaller than the commit count suggested -- only 7 files
+were touched by BOTH sides, and `blueprints/python_strategy.py`,
+`broker/flattrade/api/data.py`, `sandbox/execution_engine.py`,
+`sandbox/position_manager.py` and `database/latency_db.py` all auto-merged.
+
+47 conflicts resolved:
+- 36 `frontend/dist/*` build artifacts -> took upstream's build, so the SPA
+  matches 2.0.2.1 without needing npm on the VPS.
+- 7 `.claude/skills/*/SKILL.md` -> kept ours (local customisations).
+- `.gitignore` -> union; nothing was mutually exclusive (our research/venv
+  ignores plus upstream's `workspace/**` and env hardening).
+- `blueprints/react_app.py` -> union import. Both symbols are genuinely used:
+  our `make_response` at the index no-cache header, upstream's `abort(404)`.
+- `broker/shoonya/api/data.py` -> kept upstream's new `_encode_jdata` (the
+  literal-`&`-in-symbol fix) and `EOD_INDEX_SYMBOLS`, then re-applied our
+  `timeout` parameter; all three `timeout=5.0` GetQuotes call sites verified.
+- `frontend/src/api/python-strategy.ts` -> all three type imports kept.
+
+Two regressions caught before they shipped:
+1. `git archive` carries `strategies/scripts/` (8 tracked files) whose copies
+   are STALE. Extracting it would have reverted POV, Judas, HA-EMA and
+   overnight-drift on the VPS to pre-fix versions -- silently undoing the
+   disaster stop, the geometry audit and the OI thresholds. Excluded the
+   directory and re-deployed the 7 live scripts from `examples/`, md5-matched.
+2. `uv sync` PRUNED gunicorn and eventlet. Upstream does not list them in
+   pyproject at all -- `install/install.sh:778` installs them separately -- but
+   the systemd unit execs `.venv/bin/gunicorn` directly, so the service failed
+   with status 127 in a restart loop. Reinstalled at upstream's own pins
+   (`gunicorn>=25.0,<26`, eventlet): 25.3.0 / 0.41.2.
+
+Deployed by 12MB `git archive` (a full bundle was 173MB of dist history) with
+`.env`, `db/` and `strategy_configs.json` confirmed absent from the archive
+before extracting. 23/23 migrations succeeded via `upgrade/migrate_all.py`.
+
+Verified after: version 2.0.2.1, service active, HTTP 200, ONE gunicorn master
+(1734581 == systemd MainPID, no orphan), 9 registrations intact with
+`is_scheduled=True` and zero `manually_stopped`, our `strategy_trades` archive
+intact at 97 rows, analyze_mode still 0 (live). 300 strategy tests + 13 CI-safe
+tests pass on the merged tree; whole core compiles.
+
+Note for future upgrades: `Restored N scheduled strategies` is now
+`logger.debug`, so it no longer appears at `--log-level info`. Absence is not a
+failure -- the real signal is that `init_python_strategy()` (app.py:812) logged
+no error.
+
+Outstanding and NOT caused by the upgrade: the Flattrade session token has
+expired (`Session Expired : Invalid Session Key`), so `funds` returns `{}` and
+`quotes` 500s. A broker re-login is required before 09:10 or every scheduled
+strategy will start without a usable session.
+
 ## [2026-08-24] fix(startup): the master-contract race killed 4 live instances
 
 Renko was not armed today because both instances were DEAD from 09:16:02, and

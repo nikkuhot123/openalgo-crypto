@@ -36,10 +36,11 @@ Example Usage (OLD METHOD - Legacy):
 import importlib
 import re
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from database.auth_db import get_auth_token_broker
 from database.symbol import SymToken, db_session
+from services.flow_node_contracts import parse_underlying_symbol
 from services.quotes_service import get_quotes
 from utils.constants import CRYPTO_EXCHANGES
 from utils.logging import get_logger
@@ -75,33 +76,97 @@ def clear_strikes_cache():
     logger.info("Strikes cache cleared")
 
 
-def parse_underlying_symbol(underlying: str) -> tuple[str, str | None]:
-    """
-    Parse underlying symbol to extract base symbol and expiry date if present.
+#: Exchanges whose options have no tradable spot instrument. The underlying
+#: reference for pricing is the near-month future instead: MCX lists
+#: CRUDEOIL19AUG26FUT but no plain CRUDEOIL, so asking for a spot quote there
+#: returns nothing and the whole chain comes back empty.
+NO_SPOT_EXCHANGES = frozenset({"MCX", "CDS", "BCD", "NCDEX", "NCO"})
+
+
+def find_near_month_futures(base_symbol: str, exchange: str) -> dict[str, Any] | None:
+    """Nearest non-expired FUT contract for a base symbol on an exchange.
+
+    The ATM-pricing source for option chains on exchanges with no spot: the
+    caller asks for ``CRUDEOIL`` and gets ``CRUDEOIL19AUG26FUT``, whichever
+    expiry is soonest and has not rolled off.
+
+    The base must match exactly. MCX lists several products that share a
+    prefix but are entirely different contracts - GOLD, GOLDM, GOLDGUINEA,
+    GOLDPETAL and GOLDTEN all exist, in 10g, 100g, 8g, 1g and 10g sizes, so
+    their prices differ by orders of magnitude. A plain ``LIKE 'GOLD%FUT'``
+    would happily return GOLDPETAL and price the entire chain against a number
+    roughly a tenth of the right one. The regex below anchors on the base
+    followed immediately by the DDMMMYY expiry block, so GOLD matches only
+    GOLD{DDMMMYY}FUT.
 
     Args:
-        underlying: Symbol like "NIFTY" or "NIFTY28OCT25FUT" or "RELIANCE31JAN25FUT"
+        base_symbol: Product base, e.g. "CRUDEOIL", "GOLD".
+        exchange: Exchange to search, e.g. "MCX".
 
     Returns:
-        Tuple of (base_symbol, expiry_date)
-        e.g., ("NIFTY", "28OCT25") or ("NIFTY", None)
+        ``{"symbol", "exchange", "expiry"}`` for the nearest contract, or None
+        when the product has no unexpired future.
     """
-    # Pattern to match: SYMBOL + DDMMMYY + optional FUT
-    # Examples: NIFTY28OCT25FUT, BANKNIFTY31JAN25FUT, RELIANCE28MAR24FUT
-    pattern = r"^([A-Z]+)(\d{2}[A-Z]{3}\d{2})(?:FUT)?$"
+    base = (base_symbol or "").upper()
+    exch = (exchange or "").upper()
+    if not base or not exch:
+        return None
 
-    match = re.match(pattern, underlying.upper())
-    if match:
-        base_symbol = match.group(1)
-        expiry_date = match.group(2)
-        logger.info(
-            f"Parsed underlying '{underlying}' -> base: '{base_symbol}', expiry: '{expiry_date}'"
+    try:
+        rows = (
+            SymToken.query.filter(
+                SymToken.symbol.like(f"{base}%FUT"),
+                SymToken.exchange == exch,
+                SymToken.instrumenttype == "FUT",
+                SymToken.expiry.isnot(None),
+                SymToken.expiry != "",
+            )
+            .all()
         )
-        return base_symbol, expiry_date
+    except Exception:
+        logger.exception(f"Error looking up near-month futures for {base} on {exch}")
+        return None
 
-    # If no pattern match, treat the entire string as base symbol
-    logger.info(f"Underlying '{underlying}' has no embedded expiry, using as-is")
-    return underlying.upper(), None
+    if not rows:
+        return None
+
+    exact = re.compile(rf"^{re.escape(base)}\d{{2}}[A-Z]{{3}}\d{{2}}FUT$")
+    today = datetime.now().date()
+
+    candidates = []
+    for row in rows:
+        if not exact.match(row.symbol or ""):
+            continue  # GOLDM / GOLDPETAL / CRUDEOILM etc
+        try:
+            expiry = datetime.strptime(row.expiry, "%d-%b-%y").date()
+        except (ValueError, TypeError):
+            continue
+        if expiry >= today:
+            candidates.append((expiry, row))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda pair: pair[0])
+    expiry, row = candidates[0]
+    return {"symbol": row.symbol, "exchange": row.exchange, "expiry": row.expiry}
+
+
+def resolve_underlying_quote(base_symbol: str, exchange: str) -> tuple[str, str] | None:
+    """The (symbol, exchange) to quote for a chain's underlying reference.
+
+    Returns None when an exchange that needs a future has none available, so
+    the caller can say why rather than fetching a quote for a symbol that does
+    not exist.
+    """
+    exch = (exchange or "").upper()
+    if exch not in NO_SPOT_EXCHANGES:
+        return (base_symbol, exch)
+
+    fut = find_near_month_futures(base_symbol, exch)
+    if fut is None:
+        return None
+    return (fut["symbol"], fut["exchange"])
 
 
 def get_atm_strike(ltp: float, strike_int: int) -> float:
@@ -506,8 +571,8 @@ def get_option_exchange(underlying_exchange: str) -> str:
     Logic:
         NSE / NSE_INDEX -> NFO
         BSE / BSE_INDEX -> BFO
-        MCX -> MCX (commodities have options on same exchange)
-        CDS -> CDS (currency options on same exchange)
+        MCX / NCO / NCDEX -> same exchange (commodities)
+        CDS / BCD -> same exchange (currency options)
     """
     underlying_exchange = underlying_exchange.upper()
 
@@ -519,6 +584,11 @@ def get_option_exchange(underlying_exchange: str) -> str:
         return "MCX"
     elif underlying_exchange == "CDS":
         return "CDS"
+    elif underlying_exchange in ("NCO", "BCD", "NCDEX"):
+        # NSE commodities, BSE currency and NCDEX also list their options on
+        # the same exchange. Falling through to the NFO default sent the strike
+        # lookup to the wrong segment, so the chain came back empty. See #1748.
+        return underlying_exchange
     elif underlying_exchange in CRYPTO_EXCHANGES:
         return underlying_exchange
     else:

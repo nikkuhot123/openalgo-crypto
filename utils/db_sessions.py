@@ -44,6 +44,17 @@ SCOPED_SESSION_MODULES = [
     ("database.strategy_book_db", "db_session"),
     ("database.oauth_db", "db_session"),
     ("database.whatsapp_db", "db_session"),
+    # 2026-08-25: this one was missing, and it took the site down. It binds to
+    # db/openalgo.db with NullPool, so every checkout is a fresh connection --
+    # 2 descriptors (db + -wal). Absent from this list, teardown_appcontext
+    # skipped it, so EVERY strategy-metrics request leaked 2 FDs permanently.
+    # At ~470 requests the worker hit the 1024 default ceiling: 633 leaked
+    # handles here + 294 sockets = 944. Then "unable to open database file" on
+    # every DB access, 2888 greenlets blocked forever holding their FDs, and
+    # the eventlet hub stopped accepting connections while systemd still
+    # reported the unit active. See test_scoped_sessions_registered.py -- the
+    # registry is now asserted against the filesystem so this cannot recur.
+    ("database.strategy_trades_db", "db_session"),
 ]
 
 

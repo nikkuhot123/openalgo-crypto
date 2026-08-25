@@ -1,3 +1,57 @@
+## [2026-08-25] fix(fd-leak): one unregistered scoped_session took the site down
+
+openalgo.inikhilesh.com was unreachable while systemd still reported the unit
+`active`. Nothing had crashed -- the worker had suffocated.
+
+Evidence at the point of failure (worker pid 1760472, up 4h45m):
+
+| symptom | value |
+|---|---|
+| fds on `db/openalgo.db` | 337 |
+| fds on `db/openalgo.db-wal` | 296 |
+| sockets | 294 |
+| **total fds** | **944** |
+| `LimitNOFILE` (systemd default, unset in unit) | **1024** |
+| greenlets (`threading.active_count()`) | 2888 |
+| listen queue, unaccepted | 73 |
+
+Causal chain: `database/strategy_trades_db.py` defines a `scoped_session` but was
+never added to `SCOPED_SESSION_MODULES`, and `teardown_appcontext` delegates to
+exactly that list -- so the session was never released on ANY path, including
+requests. It binds `sqlite:///db/openalgo.db` with `NullPool`, so each checkout
+opens a fresh connection: 2 descriptors (db + `-wal`) leaked per strategy-metrics
+request. Past the 1024 ceiling every DB open failed with
+`(sqlite3.OperationalError) unable to open database file`; requests could no
+longer complete, greenlets blocked forever holding their descriptors, and the
+eventlet hub stopped accepting. I wrote that module during the P&L history
+repair and never registered it.
+
+The greenlet curve is what corrected my first hypothesis: it rose to 3143 by
+18:12, then PLATEAUED and slowly declined to 2888. Not an accumulating leak -- a
+fixed population of permanently blocked greenlets. And traffic was only 6
+req/min, so there was no request burst; the limiter saturating at 100/100 was a
+consequence, not the cause.
+
+Fixes:
+- registered `database.strategy_trades_db.db_session` (25 sessions defined, 24
+  were registered)
+- `LimitNOFILE=65536` in the unit. 1024 is indefensible for an app with a
+  per-module engine, WAL files and sockets. Hardening, not the fix.
+- `test/test_scoped_sessions_registered.py`: derives the expected set from the
+  filesystem rather than restating the list, because a reviewer cannot spot an
+  omission from 25 entries by reading it. Parametrised so a failure names the
+  module. Mutation-checked: removing the fix fails 3 tests.
+
+Verified on the VPS: 30 query+remove cycles leave 0 descriptors, while the
+pre-fix teardown path still leaks. Site returns HTTP 200 in 0.13s; fresh worker
+steady at 38 fds. 201 strategy tests + 13 CI tests pass.
+
+Still open, recorded not fixed: `db/health.db` has reached 1.38 GB (metrics
+written every 10s with a 50-thread JSON blob per row) and `db/logs.db` 295 MB.
+Disk is at 60%. The health monitor correctly alerted `File descriptor count
+critical: 944` for hours and nothing consumed the alert -- the signal existed,
+the escalation did not.
+
 ## [2026-08-25] incident: rate-limit storm starved the API; two positions closed by hand
 
 15:00-15:16. Flattrade rejected everything with "Order Recieved 133..136 in a

@@ -121,6 +121,12 @@ DRY_RUN = (os.getenv('DRY_RUN', 'true').lower() == 'true'
 # tested one's numbers. MIS also makes the broker enforce it independently of
 # this code. There is no NRML path here on purpose.
 PRODUCT = "MIS"
+# Wide premium backstop that RESTS at the exchange, so an API outage cannot
+# leave a position unprotected (2026-08-25). Deliberately far from the primary
+# in-process spot stop: worst measured adverse premium excursion was -48.6%.
+DISASTER_STOP_PCT = float(os.getenv('DISASTER_STOP_PCT', '60'))
+# Stop-LIMIT needs the limit below the trigger or it may not fill in a gap.
+SL_LIMIT_BUFFER_PCT = float(os.getenv('SL_LIMIT_BUFFER_PCT', '5'))
 STATE_DIR = Path("log") / "strategies" / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = STATE_DIR / f"renko_engine_{UNDERLYING}{'_shadow' if DRY_RUN else ''}.json"
@@ -413,6 +419,80 @@ def statutory_cost(entry_px, exit_px, qty):
     if entry_px is None or exit_px is None:
         return 0.0
     return (float(entry_px) + float(exit_px)) * float(qty) * OPT_COST_PCT / 100.0
+
+
+def safe_cancel_order(order_id, context=""):
+    """Cancel an order, treating 'already terminal' as success.
+
+    Brokers error when cancelling an order that already filled or was rejected,
+    but that IS the desired end state: it is no longer live. Mapping those to a
+    clean no-op is what lets callers audit-log honestly.
+    """
+    if not order_id:
+        return True, "no order"
+    try:
+        resp = client.cancelorder(order_id=order_id, strategy=STRATEGY_NAME)
+    except Exception as e:
+        log.error("cancel %s threw: %s", order_id, e)
+        return False, str(e)
+    if not isinstance(resp, dict):
+        return True, "non-dict response (assumed ok)"
+    if resp.get("status") == "success":
+        return True, "cancelled"
+    msg = str(resp.get("message", "")).lower()
+    if any(t in msg for t in ("complet", "reject", "cancel", "not open", "no longer")):
+        return True, f"already terminal: {resp.get('message')}"
+    log.warning("cancel %s failed %s: %s", order_id, context, resp)
+    return False, str(resp.get("message"))
+
+
+def place_disaster_stop(symbol, entry_prem, qty):
+    """Rest a WIDE stop-LIMIT at the broker as a crash backstop.
+
+    2026-08-25: this strategy carried two live MIS positions while the API was
+    starved by a Flattrade rate-limit storm. Its stop is a SPOT level checked
+    in-process every poll, so with no API there was NO protection at all and no
+    way to exit -- the positions had to be closed by hand from the broker
+    terminal. POV and Judas both survive that because their protection RESTS at
+    the exchange, where it needs nothing from this process.
+
+    The spot stop stays primary. This is deliberately far away so it never
+    pre-empts it: translating a spot stop into a premium is unreliable (measured
+    median 14.3% mis-placement, which is why Judas rejected it), whereas a wide
+    premium floor is measurable -- the worst adverse premium excursion observed
+    across 8 contracts was -48.6%, so -60% cannot fire in normal operation.
+
+    price_type MUST be "SL", never "SL-M": SL-M was rejected 33/33 times for
+    options and the API reported those rejections as success with orderid=null,
+    silently leaving positions unprotected.
+    """
+    if DISASTER_STOP_PCT <= 0 or not entry_prem or entry_prem <= 0:
+        return None
+    raw = float(entry_prem) * (1.0 - DISASTER_STOP_PCT / 100.0)
+    if raw < 0.10:
+        log.info("disaster stop skipped: entry premium %.2f too small for a "
+                 "%.0f%% trigger (raw %.3f)", entry_prem, DISASTER_STOP_PCT, raw)
+        return None
+    trg = round(round(raw / 0.05) * 0.05, 2)
+    lim = max(0.05, round(round((trg * (1.0 - SL_LIMIT_BUFFER_PCT / 100.0)) / 0.05) * 0.05, 2))
+    try:
+        resp = client.placeorder(strategy=STRATEGY_NAME, symbol=symbol, action="SELL",
+                                 exchange=OPT_EXCHANGE, price_type="SL",
+                                 trigger_price=trg, price=lim,
+                                 product=PRODUCT, quantity=qty)
+    except Exception as e:
+        log.error("DISASTER STOP NOT ARMED on %s: %s", symbol, e)
+        return None
+    oid = resp.get("orderid") if isinstance(resp, dict) else None
+    if isinstance(resp, dict) and resp.get("status") == "success" and oid:
+        log.info("disaster stop armed on %s: trigger %.2f limit %.2f qty %d -- order %s",
+                 symbol, trg, lim, qty, oid)
+        return oid
+    # Silence here is how a position ends up with no protection while the log
+    # still looks healthy. Say it loudly.
+    log.warning("DISASTER STOP NOT ARMED on %s: %s", symbol, resp)
+    return None
+
 
 def confirm_entry_fill(order_id, context="", retries=6, delay=0.7):
     """Did the ENTRY actually fill? Returns (state, avg_price).
@@ -786,6 +866,10 @@ def main():
                            "reason": "EOD", "gross": round(gross, 2),
                            "cost": round(cost, 2), "net": round(gross - cost, 2)})
             if not DRY_RUN:
+                if pos and pos.get("disaster_oid"):
+                    _ok, _m = safe_cancel_order(pos["disaster_oid"], "before exit")
+                    (log.info if _ok else log.error)("disaster stop cancel: %s", _m)
+                    pos["disaster_oid"] = None
                 client.placeorder(strategy=STRATEGY_NAME, symbol=pos["symbol"],
                                   action="SELL", exchange=OPT_EXCHANGE,
                                   price_type="MARKET", product=PRODUCT,
@@ -917,6 +1001,10 @@ def main():
                                "reason": hit, "gross": round(gross, 2),
                                "cost": round(cost, 2), "net": round(net, 2)})
                 if not DRY_RUN:
+                    if pos and pos.get("disaster_oid"):
+                        _ok, _m = safe_cancel_order(pos["disaster_oid"], "before exit")
+                        (log.info if _ok else log.error)("disaster stop cancel: %s", _m)
+                        pos["disaster_oid"] = None
                     client.placeorder(strategy=STRATEGY_NAME, symbol=pos["symbol"],
                                       action="SELL", exchange=OPT_EXCHANGE,
                                       price_type="MARKET", product=PRODUCT, quantity=q)
@@ -1078,10 +1166,16 @@ def main():
                 log.warning("entry %s unconfirmed -- tracking as live on the "
                             "pre-trade quote %.2f", oid, entry_prem)
 
+        # Rest the crash backstop BEFORE recording the position, so the snapshot
+        # always carries the order id we must cancel on the way out. Armed even
+        # for an 'unknown' entry: if that order did fill, this is the only
+        # protection that survives this process dying.
+        d_oid = None if DRY_RUN else place_disaster_stop(symbol, fill_prem, qty_total)
         pos = {"side": side, "symbol": symbol, "qty": qty_total,
                "entry_spot": c, "entry_prem": fill_prem, "sl": sl,
                "t1": t1, "t2": t2, "t1_done": False,
                "entry_orderid": (oid if not DRY_RUN else None),
+               "disaster_oid": d_oid,
                "day": str(trade_day)}
         persist(pos)
         day["red_used"] = True
@@ -1107,6 +1201,10 @@ def main():
             log.warning("shutdown with %s open (%d) -- closing %d", pos["symbol"],
                         held, q_out)
             try:
+                if pos and pos.get("disaster_oid"):
+                    _ok, _m = safe_cancel_order(pos["disaster_oid"], "before exit")
+                    (log.info if _ok else log.error)("disaster stop cancel: %s", _m)
+                    pos["disaster_oid"] = None
                 client.placeorder(strategy=STRATEGY_NAME, symbol=pos["symbol"],
                                   action="SELL", exchange=OPT_EXCHANGE,
                                   price_type="MARKET", product=PRODUCT,

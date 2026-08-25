@@ -1,3 +1,91 @@
+## [2026-08-25] incident: rate-limit storm starved the API; two positions closed by hand
+
+15:00-15:16. Flattrade rejected everything with "Order Recieved 133..136 in a
+current minute exceeds Limit 120 for user". Renko held two live MIS positions
+(SENSEX27AUG2677400CE x20, MIDCPNIFTY25AUG2614875CE x120) and could not exit:
+its EOD square-off, the UI, and my own API calls all timed out. The user closed
+both from the broker terminal. Realised for the day stayed positive.
+
+### Root cause, measured not guessed
+**The shipped limiter was configured ABOVE the broker's ceiling.**
+`broker/flattrade/api/data.py` documented itself as "capped at 38/sec and
+190/min" against a real Flattrade cap of **120/min** -- it permitted a 58%
+breach of the limit it existed to enforce. Worse, its state is a per-PROCESS
+deque while the quota is per ACCOUNT: the gunicorn worker and the
+websocket_proxy subprocess each carried a full budget.
+
+Compounding it, all three code paths that reach Flattrade retried rate-limit
+errors with exponential backoff -- spending more of an already-exhausted window.
+344 rate-limit errors in 16 minutes, and each retry's `time.sleep` parked a
+greenlet inside the SINGLE eventlet worker until it stopped answering new
+callers. That is why the dashboard, the UI exit and my scripted exit all hung
+while the app was internally still processing (favicon served in 4ms).
+
+Measured, so the fix is sized rather than hopeful:
+- strategy-side calls: 23-75/min (peak 75), each fanning out to >=1 broker call
+- `optionsymbol` re-fetches the underlying LTP internally on every call
+- history responses log at `logger.debug`, so ~100 calls/min were INVISIBLE at
+  `--log-level info` -- which is why my first count looked innocent
+- `ws_proxy_stats.json`: 0 connections, 0 symbols -- nothing streams, everything polls
+
+### Fixed
+- `FLATTRADE_MAX_PER_MINUTE` 190 -> sourced from one constant, now 100 (headroom
+  under 120, since the limiter cannot see calls made from a phone or the
+  broker's own terminal).
+- New `utils/broker_ratelimit.py`: cross-process token bucket in a flock'd file,
+  because the quota is per account and the callers are in different processes.
+  Fixed window, matching how the broker itself counts ("N in a current minute").
+- All THREE Flattrade paths now charge that one bucket before the request is
+  sent (generic, sync quote fan-out, async quote fan-out).
+- Rate-limit retries deleted. On a breach the window is burned instead: the
+  broker's count disagrees with ours because it sees callers we cannot, so the
+  only safe move is to stop spending until it rolls.
+- No `os.fsync` in the acquire path: I wrote one, then removed it. It is an
+  unpatched blocking syscall under eventlet and would park the only worker on
+  disk I/O on every broker call -- reintroducing the starvation being fixed.
+- Log lines converted to f-strings; this project's logger wrapper does not
+  interpolate %-args, so the emitted line was literally "%d/%d used this minute".
+
+### Renko now survives an API outage
+It placed **zero** protective orders -- its stop is a spot level checked
+in-process, so a starved API left the position with no protection and no exit.
+POV and Judas both survive that because their protection RESTS at the exchange.
+Renko now arms a wide premium backstop at entry (`DISASTER_STOP_PCT` 60,
+`price_type="SL"` never SL-M, which was rejected 33/33 for options), persists
+the order id, and cancels it before every one of its three SELL paths -- a
+resting stop reserves the position quantity, which is exactly why the UI "Close
+Position" button failed on 2026-08-24. Armed even for an `unknown` fill: the
+14:49 entry returned "Request timed out" and was tracked as live, so if it did
+fill, this is the only protection that survives the process dying.
+Translating the spot stop into a premium was rejected: measured median 14.3%
+mis-placement. -60% cannot pre-empt it (worst observed excursion -48.6%).
+
+### Headroom freed
+- `greeks_collector` (running `cas_window_logger.py`) REMOVED. Its CAS question
+  is answered and recorded; the greeks/bid-ask capture that replaced it produced
+  40,768 rows over 14 sessions that NOTHING reads -- no backtest, test, service
+  or notebook references `log/strategies/greeks`. It cost a measured 11-13
+  calls/min all session. Data archived to `~/openalgo_backups/greeks_archive`.
+- PDH-PDL EMA x2 DESCHEDULED (not deleted) pending capital: they carry overnight
+  NRML margin. API cost was already ~0 intraday (the overnight tick returns
+  before ENTRY_TIME without any HTTP call).
+- Peak strategy load therefore drops from ~75 to ~62 calls/min against a 100
+  cap.
+
+### Also found and fixed
+Killing a strategy externally never clears its `is_running` flag, so the boot
+path relaunched POV, Judas and renko at **15:57** -- 37 minutes after their
+15:20 stop -- and they instantly burned the whole budget. Flags cleared; state
+verified clean across a restart.
+
+Note for operators: `pkill -f "/opt/openalgo/strategies/scripts/"` over SSH
+matches the remote shell's OWN command line and kills the session. Filter on the
+process name or resolve pids first.
+
+32 new tests (11 renko backstop, 11 limiter behaviour incl. cross-process and
+window-roll, plus wiring assertions). 321 pass. `/` recovered from timeout to
+21ms.
+
 ## [2026-08-25] upgrade: fork synced to upstream openalgo 2.0.2.1
 
 Upstream was 543 commits ahead (2.0.1.5 -> 2.0.2.1); we were 133 commits ahead

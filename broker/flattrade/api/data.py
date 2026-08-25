@@ -13,6 +13,7 @@ import pandas as pd
 
 from database.token_db import get_br_symbol, get_oa_symbol, get_token
 from utils.httpx_client import get_httpx_client
+from utils import broker_ratelimit as _rl
 from utils.logging import get_logger
 
 # Auto-detect eventlet environment (Docker/standalone uses gunicorn+eventlet)
@@ -44,7 +45,18 @@ logger = get_logger(__name__)
 # however the broker measures theirs. Accounts provisioned below the documented
 # limits are still covered by the retry-with-backoff in get_api_response.
 FLATTRADE_MAX_PER_SECOND = 38
-FLATTRADE_MAX_PER_MINUTE = 190
+# Flattrade's real ceiling is 120 requests/minute per USER. This was 190 -- 58%
+# OVER the broker's limit -- so the limiter permitted the very breach it existed
+# to prevent. On 2026-08-25 we reached 133-136/min, the broker rejected
+# everything for 16 minutes, and two live MIS positions could not be exited.
+#
+# It is also per-PROCESS state (a deque), while the quota is per ACCOUNT: the
+# gunicorn worker and the websocket_proxy subprocess each got a full budget, so
+# the effective allowance was double whatever this says.
+#
+# Sourced from the same value as the cross-process bucket in
+# utils/broker_ratelimit so the two can never disagree and double-wait.
+FLATTRADE_MAX_PER_MINUTE = _rl.DEFAULT_LIMIT
 
 _rate_limit_lock = threading.Lock()
 _reserved_call_times: deque = deque()
@@ -141,6 +153,14 @@ def get_api_response(endpoint, auth, method="POST", payload=None, retry_count=0)
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     url = f"https://piconnect.flattrade.in{endpoint}"
 
+    # Throttle BEFORE spending the quota. Flattrade counts 120 requests per
+    # minute per USER, and on 2026-08-25 we reached 133-136 -- after which it
+    # rejected everything, including the quotes needed to manage two open
+    # positions. See utils/broker_ratelimit for why this is proactive.
+    if not _rl.acquire("flattrade"):
+        return {"stat": "Not_Ok",
+                "emsg": "Local rate limit: no capacity this minute (call not sent)"}
+
     response = client.request(method, url, content=payload_str, headers=headers)
     data = response.text
 
@@ -154,15 +174,13 @@ def get_api_response(endpoint, auth, method="POST", payload=None, retry_count=0)
         logger.info(f"Response data: {data}")
         raise
 
-    # Retry on rate-limit error with exponential backoff
-    if _is_rate_limit_error(parsed) and retry_count < MAX_RETRIES:
-        retry_delay = RETRY_DELAY * (2**retry_count)
-        logger.warning(
-            f"Flattrade rate limit hit ({parsed.get('emsg')}). "
-            f"Retrying in {retry_delay}s (attempt {retry_count + 1}/{MAX_RETRIES})"
-        )
-        time.sleep(retry_delay)
-        return get_api_response(endpoint, auth, method, payload, retry_count + 1)
+    # A breach means the broker's count disagrees with ours -- it can see callers
+    # this host cannot. Retrying inside the same exhausted window is what
+    # produced 344 errors in 16 minutes while starving the only worker, so burn
+    # the window instead and let the caller decide.
+    if _is_rate_limit_error(parsed):
+        _rl.penalise("flattrade")
+        logger.warning(f"Flattrade rate limit breach: {parsed.get('emsg')}")
 
     return parsed
 
@@ -299,6 +317,11 @@ class BrokerData:
         try:
             # Serialize through the shared rate limiter
             _apply_rate_limit()
+            # This path calls httpx directly, bypassing get_api_response, so it
+            # must charge the SAME per-account bucket or the quota is spent twice.
+            if not _rl.acquire("flattrade"):
+                return {"symbol": symbol, "exchange": exchange,
+                        "error": "Local rate limit: no capacity this minute"}
 
             data = {"uid": api_key, "actid": api_key, "exch": api_exchange, "token": token}
 
@@ -311,16 +334,15 @@ class BrokerData:
             response = http_response.json()
 
             if response.get("stat") != "Ok":
-                # Retry on rate-limit error
-                if _is_rate_limit_error(response) and retry_count < MAX_RETRIES:
-                    retry_delay = RETRY_DELAY * (2**retry_count)
+                # Do NOT retry into an exhausted per-minute window. Each retry is
+                # another rejected request, and this runs inside a
+                # ThreadPoolExecutor fan-out, so N legs retrying multiplies the
+                # breach. Burn the window and report instead.
+                if _is_rate_limit_error(response):
+                    _rl.penalise("flattrade")
                     logger.warning(
-                        f"Flattrade rate limit hit for {symbol}@{exchange}. "
-                        f"Retrying in {retry_delay}s (attempt {retry_count + 1}/{MAX_RETRIES})"
-                    )
-                    time.sleep(retry_delay)
-                    return self._fetch_single_quote_sync(
-                        symbol, exchange, api_exchange, token, api_key, retry_count + 1
+                        f"Flattrade rate limit breach on {symbol}@{exchange}: "
+                        f"{response.get('emsg')}"
                     )
                 return {
                     "symbol": symbol,
@@ -368,6 +390,11 @@ class BrokerData:
         try:
             # Serialize through the shared rate limiter (async-safe sleep)
             await _apply_rate_limit_async()
+            # Same per-account bucket as the sync and generic paths -- three code
+            # paths reach Flattrade and all three must charge one budget.
+            if not _rl.acquire("flattrade"):
+                return {"symbol": symbol, "exchange": exchange,
+                        "error": "Local rate limit: no capacity this minute"}
 
             data = {"uid": api_key, "actid": api_key, "exch": api_exchange, "token": token}
 
@@ -380,16 +407,13 @@ class BrokerData:
             response = http_response.json()
 
             if response.get("stat") != "Ok":
-                # Retry on rate-limit error
-                if _is_rate_limit_error(response) and retry_count < MAX_RETRIES:
-                    retry_delay = RETRY_DELAY * (2**retry_count)
+                # No retry into an exhausted window: this is the async fan-out, so
+                # every leg would retry at once and multiply the breach.
+                if _is_rate_limit_error(response):
+                    _rl.penalise("flattrade")
                     logger.warning(
-                        f"Flattrade rate limit hit for {symbol}@{exchange}. "
-                        f"Retrying in {retry_delay}s (attempt {retry_count + 1}/{MAX_RETRIES})"
-                    )
-                    await asyncio.sleep(retry_delay)
-                    return await self._fetch_single_quote_async(
-                        client, symbol, exchange, api_exchange, token, api_key, retry_count + 1
+                        f"Flattrade rate limit breach on {symbol}@{exchange}: "
+                        f"{response.get('emsg')}"
                     )
                 logger.warning(
                     f"Error fetching quote for {symbol}@{exchange}: {response.get('emsg', 'Unknown error')}"

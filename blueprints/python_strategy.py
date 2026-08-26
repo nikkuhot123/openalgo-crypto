@@ -2721,7 +2721,11 @@ def api_get_log_files(strategy_id):
     except Exception as e:
         logger.exception(f"Error listing log files for {strategy_id}: {e}")
 
-    return jsonify({"logs": logs})
+    resp = jsonify({"logs": logs})
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, private"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @python_strategy_bp.route("/api/logs/<strategy_id>/<log_name>")
@@ -2764,10 +2768,16 @@ def api_get_log_content(strategy_id, log_name):
         return jsonify({"status": "error", "message": "Log file not found"}), 404
 
     try:
-        content = log_path.read_text(encoding="utf-8", errors="replace")
+        size_limit = 500000  # 500 KB
+        if log_path.stat().st_size > size_limit:
+            lines = tail_file(log_path, 500)
+            content = "\n".join(lines)
+        else:
+            content = log_path.read_text(encoding="utf-8", errors="replace")
+        
         stats = log_path.stat()
         line_count = content.count("\n") + 1 if content else 0
-        return jsonify(
+        resp = jsonify(
             {
                 "name": log_name,
                 "content": content,
@@ -2776,6 +2786,10 @@ def api_get_log_content(strategy_id, log_name):
                 "last_updated": datetime.fromtimestamp(stats.st_mtime, tz=IST).isoformat(),
             }
         )
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, private"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
     except Exception as e:
         logger.exception(f"Error reading log file: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500

@@ -2416,6 +2416,7 @@ def api_get_strategies():
                 "underlying": config.get("underlying", "NIFTY"),
                 "lot_mode": config.get("lot_mode", "manual"),
                 "risk_pct_per_trade": config.get("risk_pct_per_trade", 1.0),
+                "managed_by": config.get("managed_by"),
             }
         )
 
@@ -2516,6 +2517,7 @@ def api_get_strategy(strategy_id):
                 "underlying": config.get("underlying", "NIFTY"),
                 "lot_mode": config.get("lot_mode", "manual"),
                 "risk_pct_per_trade": config.get("risk_pct_per_trade", 1.0),
+                "managed_by": config.get("managed_by"),
             }
         }
     )
@@ -3033,27 +3035,31 @@ def api_save_max_lots(strategy_id):
     max_nifty = data.get("max_lots_nifty")
     max_sensex = data.get("max_lots_sensex")
 
+    is_crypto = STRATEGY_CONFIGS[strategy_id].get("exchange") == "CRYPTO"
+    max_limit = 100000 if is_crypto else 100
+
     if max_nifty is not None:
         try:
             val = int(max_nifty)
-            STRATEGY_CONFIGS[strategy_id]["max_lots_nifty"] = max(1, min(val, 100))
+            STRATEGY_CONFIGS[strategy_id]["max_lots_nifty"] = max(1, min(val, max_limit))
         except (ValueError, TypeError):
             return jsonify({"status": "error", "message": "Invalid max_lots_nifty value"}), 400
 
     if max_sensex is not None:
         try:
             val = int(max_sensex)
-            STRATEGY_CONFIGS[strategy_id]["max_lots_sensex"] = max(1, min(val, 100))
+            STRATEGY_CONFIGS[strategy_id]["max_lots_sensex"] = max(1, min(val, max_limit))
         except (ValueError, TypeError):
             return jsonify({"status": "error", "message": "Invalid max_lots_sensex value"}), 400
 
     # Save underlying selection
     underlying = data.get("underlying")
     if underlying is not None:
-        if underlying in ("NIFTY", "SENSEX"):
+        valid_underlyings = ("NIFTY", "SENSEX", "BTC", "ETH", "SOL", "BTCUSDFUT", "ETHUSDFUT", "SOLUSDFUT")
+        if underlying in valid_underlyings or (is_crypto and underlying.isalnum()):
             STRATEGY_CONFIGS[strategy_id]["underlying"] = underlying
         else:
-            return jsonify({"status": "error", "message": "Invalid underlying. Must be NIFTY or SENSEX."}), 400
+            return jsonify({"status": "error", "message": f"Invalid underlying {underlying}."}), 400
 
     # Save lot mode
     lot_mode = data.get("lot_mode")
@@ -3071,6 +3077,20 @@ def api_save_max_lots(strategy_id):
             STRATEGY_CONFIGS[strategy_id]["risk_pct_per_trade"] = max(0.1, min(val, 10.0))
         except (ValueError, TypeError):
             return jsonify({"status": "error", "message": "Invalid risk_pct_per_trade value"}), 400
+
+    # Check if this strategy is managed by systemd
+    managed_by = STRATEGY_CONFIGS[strategy_id].get("managed_by", "")
+    if managed_by.startswith("systemd:"):
+        service_name = managed_by.split(":", 1)[1]
+        # Restart the systemd service in a background thread to prevent API blocking
+        def restart_service():
+            try:
+                subprocess.run(["sudo", "systemctl", "restart", service_name], check=True)
+                logger.info(f"Systemd service {service_name} restarted successfully after settings change.")
+            except Exception as e:
+                logger.error(f"Failed to restart systemd service {service_name}: {e}")
+        
+        threading.Thread(target=restart_service).start()
 
     save_configs()
     return jsonify({

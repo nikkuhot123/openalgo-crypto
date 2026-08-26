@@ -20,9 +20,10 @@ export interface PythonStrategy {
   updated_at: string
   max_lots_nifty: number
   max_lots_sensex: number
-  underlying: 'NIFTY' | 'SENSEX'
+  underlying: string
   lot_mode: 'manual' | 'auto'
   risk_pct_per_trade: number
+  managed_by?: string
 }
 
 export interface PythonStrategyContent {

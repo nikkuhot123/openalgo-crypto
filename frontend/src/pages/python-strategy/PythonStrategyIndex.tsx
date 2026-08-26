@@ -551,10 +551,10 @@ export default function PythonStrategyIndex() {
                             ? 'bg-amber-500 text-white'
                             : 'bg-transparent text-amber-700 dark:text-amber-400 hover:bg-amber-500/20'
                         }`}
-                        disabled={strategy.status === 'running'}
+                        disabled={strategy.status === 'running' && !strategy.managed_by?.startsWith('systemd:')}
                         onClick={() => handleLotModeToggle(strategy, mode)}
                       >
-                        {mode === 'manual' ? 'Manual Lots' : 'Auto Lots'}
+                        {mode === 'manual' ? (strategy.exchange === 'CRYPTO' ? 'Manual Contracts' : 'Manual Lots') : (strategy.exchange === 'CRYPTO' ? 'Auto Contracts' : 'Auto Lots')}
                       </button>
                     ))}
                   </div>
@@ -562,17 +562,19 @@ export default function PythonStrategyIndex() {
                   <div className="grid grid-cols-2 gap-2">
                     <div>
                       <Label className="text-[10px] text-muted-foreground">
-                        {getSettings(strategy).lotMode === 'auto' ? 'Hard Cap (Lots)' : 'Max Lots'}
+                        {strategy.exchange === 'CRYPTO'
+                          ? (getSettings(strategy).lotMode === 'auto' ? 'Hard Cap (Contracts)' : 'Max Contracts')
+                          : (getSettings(strategy).lotMode === 'auto' ? 'Hard Cap (Lots)' : 'Max Lots')}
                       </Label>
                       <Input
                         type="number"
                         min={1}
-                        max={100}
+                        max={strategy.exchange === 'CRYPTO' ? 100000 : 100}
                         className="h-7 text-xs font-mono"
                         value={getSettings(strategy)[lotsFieldFor(strategy)]}
                         onChange={(e) => handleSettingsChange(strategy.id, lotsFieldFor(strategy), e.target.value)}
                         onBlur={() => handleSettingsSave(strategy)}
-                        disabled={strategy.status === 'running'}
+                        disabled={strategy.status === 'running' && !strategy.managed_by?.startsWith('systemd:')}
                       />
                     </div>
                     <div>
@@ -588,7 +590,7 @@ export default function PythonStrategyIndex() {
                         value={getSettings(strategy).riskPct}
                         onChange={(e) => handleSettingsChange(strategy.id, 'riskPct', e.target.value)}
                         onBlur={() => handleSettingsSave(strategy)}
-                        disabled={strategy.status === 'running' || getSettings(strategy).lotMode !== 'auto'}
+                        disabled={(strategy.status === 'running' && !strategy.managed_by?.startsWith('systemd:')) || getSettings(strategy).lotMode !== 'auto'}
                       />
                     </div>
                   </div>

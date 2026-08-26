@@ -595,11 +595,99 @@ class BrokerData:
                     f"[DeltaExchange] No candles returned for {br_symbol} @ {resolution}"
                 )
 
+            # Delta does not put open interest in the price candle: the price
+            # array is 6 elements, so `candle[6]` above always falls back to 0.
+            # OI is a separate series addressed by prefixing the symbol with
+            # "OI:" on the same endpoint. Options are the only instruments whose
+            # strategies gate on OI here, so only they pay the extra request.
+            if len(df) and self._is_option(br_symbol):
+                oi_map = self._fetch_oi_series(br_symbol, resolution, chunks)
+                if oi_map:
+                    # Open interest is a LEVEL, not a flow: a bar with no OI
+                    # sample means "unchanged", never "zero". Delta's OI series
+                    # also lags the price series by a bar or two at 1m, so
+                    # zero-filling put a 0 on the newest bar - which silently
+                    # broke the consumer, since a strategy computing a
+                    # percentage-of-current-OI threshold off 0 gets a no-op
+                    # gate. Forward-fill carries the last known level, then
+                    # back-fill covers a leading gap before the first sample.
+                    df["oi"] = (
+                        df["timestamp"].map(oi_map).ffill().bfill().fillna(0)
+                    )
+                    logger.info(
+                        f"[DeltaExchange] OI series merged for {br_symbol}: "
+                        f"{len(oi_map)} samples -> {int((df['oi'] != 0).sum())}/{len(df)} "
+                        f"bars carry a level (last={float(df['oi'].iloc[-1]):.3f})"
+                    )
+
             return df
 
         except Exception as e:
             logger.error(f"[DeltaExchange] get_history error for {symbol}: {e}")
             raise Exception(f"Error fetching historical data for {symbol}: {e}")
+
+    @staticmethod
+    def _is_option(br_symbol: str) -> bool:
+        """Delta option symbols are C-<ASSET>-<STRIKE>-<DDMMYY> / P-…"""
+        return br_symbol.startswith(("C-", "P-"))
+
+    def _fetch_oi_series(
+        self,
+        br_symbol: str,
+        resolution: str,
+        chunks: list,
+    ) -> dict:
+        """Open-interest candles for one contract, keyed by epoch timestamp.
+
+        Delta serves OI on /v2/history/candles under an "OI:" symbol prefix,
+        with the same OHLC shape as a price bar (close = OI at bar close).
+        Verified 2026-08-26: OI:C-BTC-88000-280826 @1h returned 71 bars
+        (open 223.109 -> close 235.122) while the price series for the same
+        contract carries no OI field at all.
+
+        Never raises: OI is an input to a signal, not to an order, so a failure
+        here must degrade to "no OI" rather than kill the history call.
+        """
+        oi_map: dict[int, float] = {}
+        for chunk_start, chunk_end in chunks:
+            try:
+                resp = _public_get(
+                    "/v2/history/candles",
+                    timeout=30.0,
+                    params={
+                        "symbol":     f"OI:{br_symbol}",
+                        "resolution": resolution,
+                        "start":      str(self._to_epoch(chunk_start, end_of_day=False)),
+                        "end":        str(self._to_epoch(chunk_end, end_of_day=True)),
+                    },
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"[DeltaExchange] OI series HTTP {resp.status_code} for "
+                        f"{br_symbol}: {resp.text[:120]}"
+                    )
+                    continue
+                payload = resp.json()
+                if not payload.get("success", False):
+                    logger.warning(
+                        f"[DeltaExchange] OI series error for {br_symbol}: "
+                        f"{payload.get('error', payload)}"
+                    )
+                    continue
+                for bar in payload.get("result", []) or []:
+                    if isinstance(bar, dict):
+                        ts = bar.get("time", bar.get("timestamp", bar.get("t")))
+                        val = bar.get("close", bar.get("c"))
+                    elif isinstance(bar, list) and len(bar) >= 5:
+                        ts, val = bar[0], bar[4]
+                    else:
+                        continue
+                    if ts is None or val is None:
+                        continue
+                    oi_map[int(ts)] = _f(val)
+            except Exception as e:
+                logger.warning(f"[DeltaExchange] OI series fetch failed for {br_symbol}: {e}")
+        return oi_map
 
     # ──────────────────────────────────────────────────────────────────────────    # get_option_chain
     # ─────────────────────────────────────────────────────────────────────────────

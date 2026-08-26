@@ -99,6 +99,40 @@ STRATEGIES_DIR = Path("strategies") / "scripts"
 LOGS_DIR = Path("log") / "strategies"  # Using existing log folder
 CONFIG_FILE = Path("strategies") / "strategy_configs.json"
 
+def get_systemd_log_path(strategy_id):
+    """Query systemd or verify if there is an active log file bound to a systemd service."""
+    config = STRATEGY_CONFIGS.get(strategy_id, {})
+    managed_by = config.get("managed_by", "")
+    if not managed_by or not managed_by.startswith("systemd:"):
+         return None
+    service_name = managed_by.split(":", 1)[1]
+    try:
+         out = subprocess.check_output(
+             ["systemctl", "show", "-p", "StandardOutput", "--value", service_name]
+         ).decode().strip()
+         if out.startswith("append:"):
+              path = Path(out.split(":", 1)[1].strip())
+              if path.exists():
+                   return path
+    except Exception:
+         pass
+    # Fallback: check if {strategy_id}.log exists flat in the logs directory
+    fallback_path = LOGS_DIR / f"{strategy_id}.log"
+    if fallback_path.exists():
+         return fallback_path
+    
+    # Second fallback: check if {service_name}.log exists
+    fallback_service_path = LOGS_DIR / f"{service_name}.log"
+    if fallback_service_path.exists():
+         return fallback_service_path
+
+    # Third fallback: check if we can guess based on symbol (e.g. judas_eth.log)
+    guess_name = strategy_id.replace("_crypto_", "_")
+    guess_path = LOGS_DIR / f"{guess_name}.log"
+    if guess_path.exists():
+         return guess_path
+
+    return None
 # Detect operating system
 OS_TYPE = platform.system().lower()  # 'windows', 'linux', 'darwin'
 IS_WINDOWS = OS_TYPE == "windows"
@@ -2107,8 +2141,20 @@ def view_logs(strategy_id):
     log_files = []
 
     # Get all log files for this strategy
+    systemd_log = get_systemd_log_path(strategy_id)
+    if systemd_log:
+        log_files.append(
+            {
+                "name": systemd_log.name,
+                "size": systemd_log.stat().st_size,
+                "modified": datetime.fromtimestamp(systemd_log.stat().st_mtime, tz=IST),
+            }
+        )
+
     try:
         for log_file in LOGS_DIR.glob(f"{strategy_id}_[0-9]*.log"):
+            if systemd_log and log_file.name == systemd_log.name:
+                continue
             log_files.append(
                 {
                     "name": log_file.name,
@@ -2167,12 +2213,21 @@ def clear_logs(strategy_id):
         cleared_count = 0
         total_size = 0
 
-        # Find all log files for this strategy
         log_files = list(LOGS_DIR.glob(f"{strategy_id}_[0-9]*.log"))
+        systemd_log = get_systemd_log_path(strategy_id)
 
-        if not log_files:
+        if not log_files and not systemd_log:
             return jsonify({"status": "error", "message": "No log files found to clear"}), 404
 
+        if systemd_log:
+            try:
+                total_size += systemd_log.stat().st_size
+                with open(systemd_log, "w"):
+                    pass
+                logger.info(f"Cleared systemd log file: {systemd_log.name}")
+                cleared_count += 1
+            except Exception as e:
+                logger.exception(f"Error clearing systemd log: {e}")
         # Calculate total size before clearing
         for log_file in log_files:
             try:
@@ -2637,12 +2692,24 @@ def api_get_log_files(strategy_id):
     if strategy_id not in STRATEGY_CONFIGS:
         return jsonify({"status": "error", "message": "Strategy not found"}), 404
 
-    # Logs are stored flat in LOGS_DIR with pattern: {strategy_id}_*.log
     logs = []
+    systemd_log = get_systemd_log_path(strategy_id)
+    if systemd_log:
+        stats = systemd_log.stat()
+        logs.append(
+            {
+                "name": systemd_log.name,
+                "size_kb": stats.st_size / 1024,
+                "last_modified": datetime.fromtimestamp(stats.st_mtime, tz=IST).isoformat(),
+            }
+        )
+
     try:
         for log_file in sorted(
             LOGS_DIR.glob(f"{strategy_id}_[0-9]*.log"), key=lambda x: x.stat().st_mtime, reverse=True
         ):
+            if systemd_log and log_file.name == systemd_log.name:
+                continue
             stats = log_file.stat()
             logs.append(
                 {
@@ -2672,14 +2739,15 @@ def api_get_log_content(strategy_id, log_name):
     if not log_name or ".." in log_name or "/" in log_name or "\\" in log_name:
         return jsonify({"status": "error", "message": "Invalid log file name"}), 400
 
-    # Verify the log file belongs to this strategy (must start with strategy_id)
-    if not log_name.startswith(f"{strategy_id}_"):
+    systemd_log = get_systemd_log_path(strategy_id)
+    is_valid_systemd = (systemd_log is not None and log_name == systemd_log.name)
+    if not is_valid_systemd and not log_name.startswith(f"{strategy_id}_"):
         return jsonify(
             {"status": "error", "message": "Log file does not belong to this strategy"}
         ), 403
 
     # Logs are stored flat in LOGS_DIR (not in subdirectories)
-    log_path = LOGS_DIR / log_name
+    log_path = Path(systemd_log) if is_valid_systemd else (LOGS_DIR / log_name)
 
     # Ensure the resolved path is still within LOGS_DIR (defense in depth)
     try:

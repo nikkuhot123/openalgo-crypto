@@ -898,12 +898,60 @@ def close_log_handle_safely(strategy_info):
 
 
 def cleanup_dead_processes():
-    """Clean up strategies with dead processes"""
+    """Clean up strategies with dead processes and dynamically adopt systemd processes"""
     with PROCESS_LOCK:  # Thread-safe operation
         dead_strategies = []
 
-        # Check RUNNING_STRATEGIES (in-memory)
+        # Step 1: Detect and adopt systemd strategies dynamically
+        for strategy_id, config in STRATEGY_CONFIGS.items():
+            managed_by = config.get("managed_by", "")
+            if managed_by and managed_by.startswith("systemd:"):
+                service_name = managed_by.split(":", 1)[1]
+                # Query systemd for active PID
+                try:
+                    pid_str = subprocess.check_output(
+                        ["systemctl", "show", "-p", "MainPID", "--value", service_name]
+                    ).decode().strip()
+                    pid = int(pid_str) if pid_str else 0
+                except Exception:
+                    pid = 0
+
+                if pid > 0 and psutil.pid_exists(pid):
+                    # Check if this PID is already tracked in RUNNING_STRATEGIES
+                    tracked = RUNNING_STRATEGIES.get(strategy_id)
+                    if not tracked or tracked.get("pid") != pid:
+                        try:
+                            process = psutil.Process(pid)
+                            RUNNING_STRATEGIES[strategy_id] = {
+                                "process": process,
+                                "pid": pid,
+                                "started_at": get_ist_time(),
+                                "log_file": None,
+                                "log_handle": None,
+                            }
+                            STRATEGY_CONFIGS[strategy_id]["is_running"] = True
+                            STRATEGY_CONFIGS[strategy_id]["pid"] = pid
+                            # Check log file path
+                            log_pattern = f"{strategy_id}_*_IST.log"
+                            log_files = list(LOGS_DIR.glob(log_pattern))
+                            if log_files:
+                                current_log = max(log_files, key=lambda f: f.stat().st_mtime)
+                                RUNNING_STRATEGIES[strategy_id]["log_file"] = str(current_log)
+                            logger.info(f"Dynamically adopted systemd strategy {strategy_id} (PID: {pid})")
+                        except Exception as e:
+                            logger.error(f"Failed to dynamically adopt systemd strategy {strategy_id} (PID: {pid}): {e}")
+                else:
+                    # No active process for this systemd service: mark as dead if we were tracking it
+                    if strategy_id in RUNNING_STRATEGIES:
+                        dead_strategies.append(strategy_id)
+
+        # Step 2: Check RUNNING_STRATEGIES (in-memory)
         for strategy_id, info in list(RUNNING_STRATEGIES.items()):
+            # If it is managed by systemd, we already evaluated it above
+            config = STRATEGY_CONFIGS.get(strategy_id, {})
+            if config.get("managed_by", "").startswith("systemd:"):
+                continue
+
             process = info["process"]
             is_dead = False
 
@@ -934,17 +982,27 @@ def cleanup_dead_processes():
                 close_log_handle_safely(info)
 
         for strategy_id in dead_strategies:
-            del RUNNING_STRATEGIES[strategy_id]
+            RUNNING_STRATEGIES.pop(strategy_id, None)
             if strategy_id in STRATEGY_CONFIGS:
                 STRATEGY_CONFIGS[strategy_id]["is_running"] = False
                 STRATEGY_CONFIGS[strategy_id]["pid"] = None
 
-        # Also check STRATEGY_CONFIGS for stale is_running flags
+        # Step 3: Check STRATEGY_CONFIGS for stale is_running flags
         # (e.g., after app restart, RUNNING_STRATEGIES is empty but config has is_running=True)
         configs_to_fix = []
         for strategy_id, config in STRATEGY_CONFIGS.items():
+            # Skip systemd-managed strategies (handled dynamically above)
+            if config.get("managed_by", "").startswith("systemd:"):
+                # Ensure STRATEGY_CONFIGS matches RUNNING_STRATEGIES state
+                is_running_mem = strategy_id in RUNNING_STRATEGIES
+                if config.get("is_running") != is_running_mem:
+                    STRATEGY_CONFIGS[strategy_id]["is_running"] = is_running_mem
+                    if not is_running_mem:
+                        STRATEGY_CONFIGS[strategy_id]["pid"] = None
+                    configs_to_fix.append(strategy_id)
+                continue
+
             if config.get("is_running") and strategy_id not in RUNNING_STRATEGIES:
-                # Config says running but not in memory - check if PID is alive
                 pid = config.get("pid")
                 if pid:
                     if not psutil.pid_exists(pid):
@@ -953,21 +1011,20 @@ def cleanup_dead_processes():
                             f"Cleaning up stale is_running flag for {strategy_id} (PID {pid} not found)"
                         )
                 else:
-                    # No PID stored, definitely not running
                     configs_to_fix.append(strategy_id)
                     logger.info(f"Cleaning up stale is_running flag for {strategy_id} (no PID)")
 
         for strategy_id in configs_to_fix:
-            STRATEGY_CONFIGS[strategy_id]["is_running"] = False
-            STRATEGY_CONFIGS[strategy_id]["pid"] = None
+            # Only change non-systemd strategies if not already set by code above
+            if not STRATEGY_CONFIGS[strategy_id].get("managed_by", "").startswith("systemd:"):
+                STRATEGY_CONFIGS[strategy_id]["is_running"] = False
+                STRATEGY_CONFIGS[strategy_id]["pid"] = None
 
-        if configs_to_fix:
+        if configs_to_fix or dead_strategies:
             save_configs()
 
         if dead_strategies:
-            save_configs()
             logger.info(f"Cleaned up {len(dead_strategies)} dead processes")
-
 
 DEFAULT_STRATEGY_EXCHANGE = "NSE"
 
@@ -2380,8 +2437,10 @@ def api_get_strategies():
     strategies = []
 
     for strategy_id, config in STRATEGY_CONFIGS.items():
-        # Determine status with detailed schedule info
-        if config.get("is_running"):
+        is_running = strategy_id in RUNNING_STRATEGIES or config.get("is_running", False)
+        pid_val = RUNNING_STRATEGIES[strategy_id].get("pid") if strategy_id in RUNNING_STRATEGIES else (config.get("process_id") or config.get("pid"))
+
+        if is_running:
             status = "running"
             status_message = "Running"
         elif config.get("error_message"):
@@ -2398,7 +2457,7 @@ def api_get_strategies():
                 "exchange": normalize_exchange(config.get("exchange")),
                 "status": status,
                 "status_message": status_message,
-                "is_running": config.get("is_running", False),
+                "is_running": is_running,
                 "is_scheduled": config.get("is_scheduled", False),
                 "manually_stopped": config.get("manually_stopped", False),
                 "schedule_start_time": config.get("schedule_start"),
@@ -2409,7 +2468,7 @@ def api_get_strategies():
                 "error_message": config.get("error_message"),
                 "paused_reason": config.get("paused_reason"),
                 "paused_message": config.get("paused_message"),
-                "process_id": config.get("process_id"),
+                "process_id": pid_val,
                 "created_at": config.get("created_at"),
                 "max_lots_nifty": config.get("max_lots_nifty", 1),
                 "max_lots_sensex": config.get("max_lots_sensex", 1),
@@ -2480,8 +2539,10 @@ def api_get_strategy(strategy_id):
 
     config = STRATEGY_CONFIGS[strategy_id]
 
-    # Determine status with detailed schedule info
-    if config.get("is_running"):
+    is_running = strategy_id in RUNNING_STRATEGIES or config.get("is_running", False)
+    pid_val = RUNNING_STRATEGIES[strategy_id].get("pid") if strategy_id in RUNNING_STRATEGIES else (config.get("process_id") or config.get("pid"))
+
+    if is_running:
         status = "running"
         status_message = "Running"
     elif config.get("error_message"):
@@ -2500,7 +2561,7 @@ def api_get_strategy(strategy_id):
                 "file_name": config.get("file_name", ""),
                 "exchange": normalize_exchange(config.get("exchange")),
                 "status": status,
-                "is_running": config.get("is_running", False),
+                "is_running": is_running,
                 "is_scheduled": config.get("is_scheduled", False),
                 "schedule_start_time": config.get("schedule_start"),
                 "schedule_stop_time": config.get("schedule_stop"),
@@ -2510,7 +2571,7 @@ def api_get_strategy(strategy_id):
                 "error_message": config.get("error_message"),
                 "paused_reason": config.get("paused_reason"),
                 "paused_message": config.get("paused_message"),
-                "process_id": config.get("process_id"),
+                "process_id": pid_val,
                 "created_at": config.get("created_at"),
                 "max_lots_nifty": config.get("max_lots_nifty", 1),
                 "max_lots_sensex": config.get("max_lots_sensex", 1),

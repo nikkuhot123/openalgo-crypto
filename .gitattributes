@@ -19,14 +19,34 @@
 # upstream's prebuilt output looked like the cheap way out; it silently shipped
 # a UI compiled from source that never contained this fork's features.
 #
-# `merge=ours` is the built-in driver: on a merge conflict, keep our version.
+# `merge=ours` needs a DRIVER TO BE CONFIGURED. It is NOT built-in -- git's
+# built-in low-level drivers are only text, binary and union. When git cannot
+# resolve a named driver it does not warn: it silently falls back to the 3-way
+# text merge and conflicts, which is exactly the situation that got resolved in
+# upstream's favour last time. Verified on git 2.53.0: without the config the
+# merge CONFLICTED (exit 1, conflict markers); with it, the merge was clean and
+# kept ours. `union` worked with no config, proving the fallback is
+# driver-resolution and not something environmental.
+#
+# Config cannot live in a commit, so it MUST be set in every clone:
+#
+#     git config merge.ours.driver true
 #
 # LIMITS, so nobody trusts this further than it goes:
 #   - It only applies when BOTH sides track the file. If dist is untracked here
 #     and tracked upstream, a merge ADDS upstream's files with no conflict, and
 #     this rule never fires. Re-run `git rm -r --cached frontend/dist` after any
 #     upstream sync that re-adds them.
+#   - Worse: if the path is untracked AND gitignored -- the shape the VPS was in
+#     -- git will SILENTLY OVERWRITE the local build with upstream's, exit 0, no
+#     conflict and no warning. Git's usual refusal to clobber untracked files
+#     does not apply to ignored paths.
 #   - It does not rebuild anything. After an upstream sync that changes
-#     package.json or frontend/src, the deploy MUST run `npm ci && npm run build`
-#     on the VPS. See wiki/log.md for the runbook entry.
+#     package.json or frontend/src, the deploy MUST run `npm ci && npm run build`.
+#     See wiki/log.md for the runbook entry.
+#   - It cannot detect a stale bundle that is already committed. That is what
+#     test_frontend_build_guards.py::test_referenced_bundle_contains_the_features
+#     is for: it resolves index.html -> entry chunk -> page chunk and asserts the
+#     SERVED artifact carries the UI, because a correct chunk sitting orphaned
+#     next to the served one is precisely how this bug hid.
 frontend/dist/** merge=ours

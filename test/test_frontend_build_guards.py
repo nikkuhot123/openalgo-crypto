@@ -22,6 +22,7 @@ These tests pin the two things that made it silent and the source features that
 must never quietly vanish from the TSX again.
 """
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -35,8 +36,7 @@ API_TS = FRONTEND / "src" / "api" / "python-strategy.ts"
 
 
 # ------------------------------------------------------- merge protection
-def test_gitattributes_protects_the_built_frontend():
-    """Without this, an upstream sync silently replaces our bundle again."""
+def test_gitattributes_declares_the_rule():
     assert GITATTRIBUTES.exists(), ".gitattributes is missing"
     text = GITATTRIBUTES.read_text(encoding="utf-8")
     rule = [
@@ -49,9 +49,46 @@ def test_gitattributes_protects_the_built_frontend():
     )
 
 
+def test_gitattributes_pattern_matches_nested_assets():
+    """`frontend/dist/**` must cover the hashed chunks, not just the top level."""
+    out = subprocess.run(
+        ["git", "check-attr", "merge", "--",
+         "frontend/dist/assets/index-DEADBEEF.js"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert "merge: ours" in out.stdout, (
+        f"pattern does not reach nested assets: {out.stdout.strip()!r}"
+    )
+
+
+def test_ours_merge_driver_is_actually_configured():
+    """The rule is INERT without this config.
+
+    `ours` is NOT a built-in driver -- git ships only text, binary and union.
+    An unresolvable driver does not warn; git silently falls back to the 3-way
+    text merge and conflicts, which is exactly how upstream's bundle won last
+    time. Config cannot be committed, so this asserts the clone is set up.
+    """
+    out = subprocess.run(
+        ["git", "config", "--get", "merge.ours.driver"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert out.stdout.strip(), (
+        "merge.ours.driver is not set, so `frontend/dist/** merge=ours` does "
+        "NOTHING. Run: git config merge.ours.driver true"
+    )
+
+
+def test_gitattributes_does_not_claim_the_driver_is_builtin():
+    """An earlier revision of this file asserted `ours` was built-in. It is not,
+    and believing that is what made the guard inert."""
+    text = GITATTRIBUTES.read_text(encoding="utf-8").lower()
+    assert "is the built-in driver" not in text, "false built-in claim is back"
+    assert "merge.ours.driver" in text, "the required config must be documented"
+
+
 def test_gitattributes_documents_the_limits():
-    """A guard that is trusted further than it works is worse than none: this
-    rule does nothing when dist is untracked here and tracked upstream."""
+    """A guard trusted further than it works is worse than none."""
     text = GITATTRIBUTES.read_text(encoding="utf-8").lower()
     assert "untracked" in text, "the merge=ours limitation must stay documented"
     assert "npm ci" in text or "npm run build" in text, (
@@ -127,6 +164,77 @@ def test_lockfile_is_committed_so_npm_ci_works():
     """`npm ci` is the only deterministic install; it requires the lockfile."""
     lock = FRONTEND / "package-lock.json"
     assert lock.stat().st_size > 1000, "package-lock.json looks truncated"
+
+
+# ------------------------------------------- the guard that would have caught it
+DIST = FRONTEND / "dist"
+DIST_INDEX = DIST / "index.html"
+
+# Strings that only exist in this fork's Python Strategies UI. Upstream's build
+# has none of them, which is what made the swap invisible.
+FORK_UI_MARKERS = (
+    "Manual Lots",
+    "Auto Lots",
+    "lot_mode",
+    "max_lots_nifty",
+    "risk_pct_per_trade",
+)
+
+
+def _referenced_page_chunk():
+    """Resolve index.html -> entry chunk -> PythonStrategyIndex chunk.
+
+    Deliberately follows the REFERENCE chain rather than scanning assets/. The
+    whole bug was a correct 40,749-byte chunk sitting orphaned on disk next to
+    the 24,582-byte one that was actually served, so "some file under assets/
+    contains the string" would have passed happily throughout the outage.
+    """
+    html = DIST_INDEX.read_text(encoding="utf-8", errors="ignore")
+    entries = re.findall(r"assets/index-[A-Za-z0-9_-]+\.js", html)
+    assert entries, "no entry chunk referenced by dist/index.html"
+    entry = DIST / entries[0]
+    assert entry.exists(), f"referenced entry missing from dist: {entries[0]}"
+    body = entry.read_text(encoding="utf-8", errors="ignore")
+    names = re.findall(r"PythonStrategyIndex-[A-Za-z0-9_-]+\.js", body)
+    assert names, "entry chunk does not reference a PythonStrategyIndex chunk"
+    chunk = DIST / "assets" / names[0]
+    assert chunk.exists(), f"referenced page chunk missing from dist: {names[0]}"
+    return chunk
+
+
+@pytest.mark.skipif(not DIST_INDEX.exists(), reason="no built frontend present")
+def test_referenced_bundle_contains_the_features():
+    """The regression, expressed as an assertion.
+
+    On 2026-08-26 the committed bundle was upstream's: the referenced chunk had
+    ZERO occurrences of `lot_mode`. Source was fully intact, so every
+    source-level test in this file passed green for the entire outage. This is
+    the only test here that can tell a good build from a broken one.
+    """
+    chunk = _referenced_page_chunk()
+    body = chunk.read_text(encoding="utf-8", errors="ignore")
+    missing = [m for m in FORK_UI_MARKERS if m not in body]
+    assert not missing, (
+        f"the SERVED bundle ({chunk.name}, {chunk.stat().st_size} B) is missing "
+        f"{missing} -- this is upstream's build, not ours. "
+        f"Run: cd frontend && npm ci && npm run build"
+    )
+
+
+@pytest.mark.skipif(not DIST_INDEX.exists(), reason="no built frontend present")
+def test_referenced_api_chunk_can_write_lot_settings():
+    """The UI is useless if the client cannot reach the endpoints. Guards the
+    same reference chain for the API chunk."""
+    html = DIST_INDEX.read_text(encoding="utf-8", errors="ignore")
+    entry = DIST / re.findall(r"assets/index-[A-Za-z0-9_-]+\.js", html)[0]
+    body = entry.read_text(encoding="utf-8", errors="ignore")
+    names = re.findall(r"python-strategy-[A-Za-z0-9_-]+\.js", body)
+    if not names:
+        pytest.skip("api client is inlined into another chunk in this build")
+    api = DIST / "assets" / names[0]
+    text = api.read_text(encoding="utf-8", errors="ignore")
+    for needle in ("max-lots", "/metrics", "/status"):
+        assert needle in text, f"served api chunk cannot call {needle}"
 
 
 if __name__ == "__main__":

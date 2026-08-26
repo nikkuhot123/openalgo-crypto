@@ -1,3 +1,34 @@
+## [2026-08-26] review-remediation: unbreak merge=ours, untrack dist, guard served artifacts
+
+Following independent code review of `4c74a935e` (which rebuilt the SPA on the
+VPS after it had lost lot-mode, metrics, and armed-trade gauges), two critical
+defects were uncovered and remediated:
+
+1. **`merge=ours` was inert**:
+   - `ours` is NOT a built-in git merge driver (built-ins are `text`, `binary`,
+     `union`). Without `merge.ours.driver` configured, git silently falls back to
+     the 3-way text merge and produces a conflict.
+   - Configured `git config merge.ours.driver true` locally and on the VPS.
+   - Corrected documentation in `.gitattributes`.
+   - Added `test_ours_merge_driver_is_actually_configured` to assert the clone is
+     properly configured.
+
+2. **Source-only tests passed despite broken build**:
+   - The initial guard tests only inspected `frontend/src/` files and would have
+     passed even if a completely stripped or stale bundle was served.
+   - Added `test_referenced_bundle_contains_the_features` and
+     `test_referenced_api_chunk_can_write_lot_settings` in
+     `test/test_frontend_build_guards.py`.
+   - Traces `dist/index.html` -> entry chunk -> page/API chunk and asserts
+     feature strings exist in the **referenced/served** bundle.
+   - Mutation-checked: pointing `index.html` to a stripped chunk fails the test.
+
+3. **Untracked `frontend/dist` from git**:
+   - Removed 257 tracked build files via `git rm -r --cached frontend/dist`.
+   - Eliminates merge conflict churn on future upstream syncs.
+   - Working tree files remain untouched on disk.
+
+Verified on VPS and local: 205 strategy/health/build guard tests pass.
 ## [2026-08-26] fix(frontend): the Python Strategies UI was serving upstream's bundle
 
 The page had lost its lot-mode toggle, per-strategy performance panel and

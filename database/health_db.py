@@ -155,10 +155,23 @@ class HealthMetric(HealthBase):
                 # Threads
                 thread_count=thread_metrics.get("count") if thread_metrics else None,
                 stuck_threads=thread_metrics.get("stuck_count") if thread_metrics else None,
-                thread_details=thread_metrics.get("threads") if thread_metrics else None,
+                # Detail blobs are kept only when something is actually wrong.
+                # Stored unconditionally they averaged 1,598 B (threads) + 608 B
+                # (processes) per row against ~400 B of real metrics -- 85% of
+                # the file -- written every 10s forever. db/health.db reached
+                # 1.38 GB that way. The scalar counts above still graph fine on
+                # healthy samples; the blobs exist to diagnose a failure, so
+                # they are written exactly when there is a failure to diagnose.
+                thread_details=(
+                    thread_metrics.get("threads")
+                    if thread_metrics and thread_metrics.get("status") != "pass"
+                    else None
+                ),
                 thread_status=thread_metrics.get("status") if thread_metrics else "unknown",
                 # Processes
-                process_details=process_metrics if process_metrics else None,
+                process_details=(
+                    process_metrics if process_metrics and overall_status != "pass" else None
+                ),
                 # Overall
                 overall_status=overall_status,
             )

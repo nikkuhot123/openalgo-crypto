@@ -1,3 +1,65 @@
+## [2026-08-26] fix(health): scheduled retention, alert escalation, and two 63-day-old orphans
+
+Follow-up to the FD-leak outage. Neither of these caused it; both are why it
+lasted hours instead of minutes.
+
+### 1. Retention was startup-only
+`purge_old_metrics` ran once from `init_health_monitoring` and never again;
+`purge_old_data_logs` and `purge_old_traffic_logs` have the same shape. A process
+that stays up for weeks purges exactly once. And DELETE moves pages to SQLite's
+free list without shrinking the file, so db/health.db reached 1.38 GB under a
+nominal 7-day retention.
+
+Now runs on a schedule (`HEALTH_MAINTENANCE_HOURS`, default 6) across all three
+rolling DBs. One-time reclaim on the VPS: health 1.3G -> 471M, logs 282M -> 38M,
+latency 64M -> 25M, about 1.2 GB back.
+
+VACUUM is keyed on `PRAGMA freelist_count`, NOT file size. After the reclaim
+health.db was still 471 MB of LIVE rows -- a size trigger would have VACUUMed
+every pass, blocking readers ~10s to recover nothing. It also refuses when the
+disk lacks room for the rewrite.
+
+### 2. Detail blobs were written on every healthy sample
+`thread_details` averaged 1,598 B and `process_details` 608 B against ~400 B of
+real metrics -- 85% of the file -- written every 10s forever. They exist to
+diagnose a failure, so they are now stored only when the corresponding status is
+not `pass`. Scalar counts are still recorded on every sample, so the graphs are
+unaffected.
+
+### 3. Alerts reached nobody
+The collector recorded `File descriptor count critical: 944` every ten seconds
+for four hours while the site was unreachable. The only consumer of HealthAlert
+is the health page, so the signal existed and the escalation did not. Critical
+metrics now push through the existing `send_broadcast_alert` path, with a
+per-metric cooldown (default 30 min) -- 240 repeats collapse to one message.
+
+### 4. Two orphaned app instances, running since 24 June
+Found while explaining why health.db had THREE writers at 18 rows/min when one
+collector should produce six:
+
+    pid 1428550  63 days  511 MB  python3 -c "... sandbox.squareoff_thread._scheduler ..."
+    pid 1429020  63 days  584 MB  python3 -c "... SquareOffManager().force_square_off_all_mis() ..."
+
+Debug one-liners from a June session. Both called `create_app()`, which starts
+the health collector, latency monitoring, broker keepalive and the sandbox
+scheduler -- so each printed its result and then hung forever holding an app
+context. Between them: 1.1 GB RSS, 14 handles on openalgo.db, and two thirds of
+every health row (on 63-day-old in-memory code, hence the un-gated blobs).
+
+The second one is the part that matters: a 63-day-old process holding a live
+`SquareOffManager` and the sandbox scheduler. Killed with the market closed and
+zero open positions. Memory used fell from 7.2 GB to 4.5 GB.
+
+Lesson worth keeping: `create_app()` is not safe to call from a throwaway
+one-liner. It starts daemon threads and a scheduler, so the process never exits.
+
+21 new tests, mutation-checked (removing the cooldown leaks 240 messages;
+removing the freelist gate VACUUMs a busy file; restoring unconditional blobs
+fails the size assertion). 208 strategy + 13 CI tests pass.
+
+The crypto instance was deliberately left untouched: read-only checks only, to
+confirm it writes its own db/health.db and shares nothing with the main one.
+
 ## [2026-08-25] fix(fd-leak): one unregistered scoped_session took the site down
 
 openalgo.inikhilesh.com was unreachable while systemd still reported the unit

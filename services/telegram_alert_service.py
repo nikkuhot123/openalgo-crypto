@@ -468,3 +468,20 @@ class TelegramAlertService:
 
 # Initialize global instance
 telegram_alert_service = TelegramAlertService()
+
+
+def send_health_alert(message: str) -> None:
+    """Push an infrastructure alert to every notification-enabled Telegram user.
+
+    Added 2026-08-25. HealthAlert rows were only ever read by the health page,
+    so the collector logged "File descriptor count critical: 944" every ten
+    seconds for four hours while the site was unreachable and nobody was told.
+    The monitor already applies a per-metric cooldown, so this does not throttle
+    again here.
+
+    Never raises: the caller is the metrics collector.
+    """
+    try:
+        telegram_alert_service.send_broadcast_alert(f"\u26a0\ufe0f {message}")
+    except Exception:
+        logger.exception("could not broadcast health alert")

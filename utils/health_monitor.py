@@ -38,6 +38,21 @@ HEALTH_MONITOR_ENABLED = os.getenv("HEALTH_MONITOR_ENABLED", "true").lower() == 
 HEALTH_SAMPLE_INTERVAL = int(os.getenv("HEALTH_SAMPLE_INTERVAL", "10"))  # seconds
 HEALTH_RETENTION_DAYS = int(os.getenv("HEALTH_RETENTION_DAYS", "7"))
 
+# How often the collector runs retention maintenance. Purging was startup-only,
+# so a process that stays up for weeks never purged again.
+HEALTH_MAINTENANCE_SECS = int(os.getenv("HEALTH_MAINTENANCE_HOURS", "6")) * 3600
+# VACUUM when at least this much is actually reclaimable. DELETE alone never
+# shrinks a SQLite file -- how db/health.db reached 1.38 GB under a nominal
+# 7-day retention -- but triggering on total size would VACUUM a file that is
+# large because it is BUSY, blocking readers to recover nothing.
+HEALTH_VACUUM_MIN_MB = int(os.getenv("HEALTH_VACUUM_MIN_MB", "64"))
+# A critical alert repeated every sample is 6 messages a minute. On 2026-08-25
+# "File descriptor count critical: 944" was logged for four hours and reached
+# nobody, because the only consumer of HealthAlert is the health page. Push it,
+# but once per cooldown per metric.
+HEALTH_ALERT_COOLDOWN_SECS = int(os.getenv("HEALTH_ALERT_COOLDOWN_MINUTES", "30")) * 60
+HEALTH_ALERT_PUSH = os.getenv("HEALTH_ALERT_PUSH", "true").lower() == "true"
+
 # File Descriptor / Handle Thresholds
 # Windows handles are NOT Unix FDs — a normal Flask app uses 500-2000+ handles.
 # Use platform-appropriate defaults unless overridden via env.
@@ -604,6 +619,16 @@ def collect_metrics():
                 }
             )
 
+        _escalate_failures(
+            {
+                "fd": fd_metrics,
+                "memory": memory_metrics,
+                "database": db_metrics,
+                "websocket": ws_metrics,
+                "threads": thread_metrics,
+            }
+        )
+
         return _cached_metrics.copy()
     except Exception as e:
         logger.exception(f"Error collecting metrics: {e}")
@@ -613,17 +638,160 @@ def collect_metrics():
         health_session.remove()
 
 
+_last_escalated: dict[str, float] = {}
+
+
+def _escalate_failures(metrics_by_name):
+    """Push critical metrics to a human, once per cooldown per metric.
+
+    HealthAlert rows are only read by the health page, so a failing box stays
+    silent unless somebody happens to look. On 2026-08-25 the collector recorded
+    ``File descriptor count critical: 944`` every ten seconds for four hours
+    while the site was unreachable, and no notification was ever sent.
+
+    Never raises: this runs inside the collector, and a broken notifier must not
+    stop metric collection.
+    """
+    if not HEALTH_ALERT_PUSH:
+        return
+    failing = [(n, m) for n, m in metrics_by_name.items() if (m or {}).get("status") == "fail"]
+    if not failing:
+        return
+    now = time.time()
+    due = [
+        (n, m)
+        for n, m in failing
+        if now - _last_escalated.get(n, 0.0) >= HEALTH_ALERT_COOLDOWN_SECS
+    ]
+    if not due:
+        return
+    lines = []
+    for name, m in due:
+        _last_escalated[name] = now
+        detail = m.get("count", m.get("rss_mb", m.get("value", "?")))
+        lines.append(f"{name}: {detail}")
+    try:
+        from services.telegram_alert_service import send_health_alert
+
+        send_health_alert("OpenAlgo health critical -- " + "; ".join(lines))
+    except Exception:
+        # Logged, not swallowed silently: a notifier that fails quietly is the
+        # same failure mode this function exists to remove.
+        logger.exception("could not push health escalation: %s", "; ".join(lines))
+
+
+def _run_retention_maintenance():
+    """Purge every rolling log DB, then reclaim the space.
+
+    Each of these had a purge helper that only ran at import/startup:
+    ``purge_old_metrics`` (health_monitor), ``purge_old_data_logs``
+    (latency_monitor) and ``purge_old_traffic_logs`` (traffic_logger). A process
+    that stays up for weeks purged exactly once.
+    """
+    for label, call in (
+        ("health", lambda: purge_old_metrics(days=HEALTH_RETENTION_DAYS)),
+        ("latency", _purge_latency),
+        ("traffic", _purge_traffic),
+    ):
+        try:
+            deleted = call()
+            if deleted:
+                logger.info("retention: purged %s rows from %s", deleted, label)
+        except Exception:
+            logger.exception("retention purge failed for %s", label)
+
+    for name in ("health.db", "latency.db", "logs.db"):
+        try:
+            _vacuum_if_oversized(name)
+        except Exception:
+            logger.exception("vacuum failed for %s", name)
+
+
+def _purge_latency():
+    from database.latency_db import purge_old_data_logs
+
+    return purge_old_data_logs(days=HEALTH_RETENTION_DAYS)
+
+
+def _purge_traffic():
+    from database.traffic_db import purge_old_traffic_logs
+
+    return purge_old_traffic_logs()
+
+
+def _vacuum_if_oversized(filename):
+    """VACUUM a SQLite file only when there is real space to reclaim.
+
+    Keyed on the free list, not the file size. DELETE moves pages to SQLite's
+    free list and never returns them to the filesystem -- that is exactly how
+    db/health.db reached 1.38 GB under a nominal 7-day retention. But sizing the
+    decision on total bytes is wrong too: after the reclaim that file was still
+    471 MB of LIVE rows, so a size trigger would VACUUM every pass and recover
+    nothing while blocking readers for ~10s each time.
+
+    VACUUM rewrites the whole file, so it is skipped unless the disk has
+    comfortable room for a copy.
+    """
+    import shutil
+    import sqlite3
+
+    path = os.path.join("db", filename)
+    if not os.path.exists(path):
+        return
+    size_mb = os.path.getsize(path) / (1024 * 1024)
+
+    conn = sqlite3.connect(path, timeout=30)
+    try:
+        conn.isolation_level = None  # VACUUM cannot run inside a transaction
+        page = conn.execute("PRAGMA page_size").fetchone()[0]
+        free = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        reclaimable_mb = (page * free) / (1024 * 1024)
+        if reclaimable_mb < HEALTH_VACUUM_MIN_MB:
+            return
+
+        free_mb = shutil.disk_usage(os.path.dirname(path) or ".").free / (1024 * 1024)
+        if free_mb < size_mb * 2.5:
+            logger.warning(
+                "%s has %.0f MB reclaimable but only %.0f MB free for a %.0f MB "
+                "rewrite -- skipping VACUUM rather than risking a full disk",
+                filename, reclaimable_mb, free_mb, size_mb,
+            )
+            return
+
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+
+    after_mb = os.path.getsize(path) / (1024 * 1024)
+    logger.info(
+        "retention: VACUUM %s %.0f MB -> %.0f MB (reclaimed %.0f MB)",
+        filename, size_mb, after_mb, size_mb - after_mb,
+    )
+
+
 def _collector_loop():
     """Background collector loop (daemon thread, low priority)"""
     global _collector_running
 
     logger.debug(f"Health monitoring collector started (interval: {HEALTH_SAMPLE_INTERVAL}s)")
 
+    last_maintenance = 0.0
     while _collector_running:
         try:
             collect_metrics()
         except Exception as e:
             logger.exception(f"Error in collector loop: {e}")
+
+        # Retention was startup-only. purge_old_metrics() ran once in
+        # init_health_monitoring() and never again, and SQLite does not return
+        # freed pages to the filesystem without VACUUM -- so db/health.db grew
+        # monotonically across restarts and reached 1.38 GB (202,863 rows, of
+        # which 23,816 were already past the 7-day window). Same shape in
+        # latency_monitor and traffic_logger. Run it on a schedule instead.
+        now = time.time()
+        if now - last_maintenance >= HEALTH_MAINTENANCE_SECS:
+            last_maintenance = now
+            _run_retention_maintenance()
 
         # Sleep for interval (releases GIL, zero impact on API/WebSocket)
         time.sleep(HEALTH_SAMPLE_INTERVAL)

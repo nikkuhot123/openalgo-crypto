@@ -1,0 +1,32 @@
+# Built frontend must never be resolved in upstream's favour.
+#
+# 2026-08-26: the Python Strategies page lost its lot-mode toggle, per-strategy
+# performance panel and armed-trade gauges. Nothing had been deleted from the
+# source -- the SERVED bundle was upstream's.
+#
+# Upstream (marketcalls/openalgo) commits its built frontend/dist to git and
+# auto-builds it in CI. This fork untracked dist at 615d8d59c precisely because
+# it is a build artifact. The 2.0.2.1 sync (merge 55c67c81a) then hit 36
+# conflicted frontend/dist/* files and they were resolved in UPSTREAM's favour,
+# documented at wiki/log.md:216-217:
+#
+#   "36 frontend/dist/* build artifacts -> took upstream's build, so the SPA
+#    matches 2.0.2.1 without needing npm on the VPS."
+#
+# That is why "without needing npm" was tempting: frontend/node_modules on the
+# VPS had gone stale (Jul 12) against package.json (Aug 25), which had gained
+# openalgo-charts@1.6.0, so `npm run build` could not run at all. Taking
+# upstream's prebuilt output looked like the cheap way out; it silently shipped
+# a UI compiled from source that never contained this fork's features.
+#
+# `merge=ours` is the built-in driver: on a merge conflict, keep our version.
+#
+# LIMITS, so nobody trusts this further than it goes:
+#   - It only applies when BOTH sides track the file. If dist is untracked here
+#     and tracked upstream, a merge ADDS upstream's files with no conflict, and
+#     this rule never fires. Re-run `git rm -r --cached frontend/dist` after any
+#     upstream sync that re-adds them.
+#   - It does not rebuild anything. After an upstream sync that changes
+#     package.json or frontend/src, the deploy MUST run `npm ci && npm run build`
+#     on the VPS. See wiki/log.md for the runbook entry.
+frontend/dist/** merge=ours

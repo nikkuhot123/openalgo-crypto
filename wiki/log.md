@@ -1,3 +1,81 @@
+## [2026-08-26] fix(frontend): the Python Strategies UI was serving upstream's bundle
+
+The page had lost its lot-mode toggle, per-strategy performance panel and
+armed-trade gauges. Nothing had been deleted: every one of those features was
+intact in `frontend/src` AND in the Flask API. The JavaScript being SERVED was
+upstream's.
+
+Two chunks sat side by side in frontend/dist/assets:
+
+| chunk | built | size | `lot_mode` hits | referenced by index.html |
+|---|---|---|---|---|
+| PythonStrategyIndex-8o0qzuZB.js | Jul 23 | 40,749 B | 3 | no -- orphaned |
+| PythonStrategyIndex-D5-EMX9X.js | Aug 25 | 24,582 B | **0** | **yes** |
+
+Cause, in our own log at wiki/log.md:216-217 (commit 5925f9471), during the
+2.0.2.1 sync (merge 55c67c81a):
+
+  "36 frontend/dist/* build artifacts -> took upstream's build, so the SPA
+   matches 2.0.2.1 without needing npm on the VPS."
+
+Upstream commits its built dist and auto-builds it in CI; this fork untracked
+dist at 615d8d59c because it is a build artifact. The merge conflicted on 36 of
+those files and they were resolved in upstream's favour, so the browser loaded a
+bundle compiled from source that never had these features. Confirmed genuinely
+upstream's build, not merely an older one of ours: the served API chunk carries
+upstream's `getExchanges` (0add0fffe) which our orphaned chunk lacks.
+
+### Why "without needing npm" was tempting -- and the real trap
+`npm run build` could not run on the VPS at all. `frontend/node_modules` was
+from Jul 12 while package.json was from Aug 25 and had gained
+`openalgo-charts@1.6.0`, so `tsc -b` died on TS2307 and never reached
+`vite build`. Taking a prebuilt bundle looked like the cheap way out.
+
+Worth keeping: because the build script is `tsc -b && vite build`, the stale
+dependency surfaced as a HARD FAILURE rather than a quietly incomplete bundle.
+That typecheck gate is load-bearing.
+
+### Fix
+- `npm ci` on the VPS (deterministic, from the committed lockfile), then
+  `npm run build`. New chunk `PythonStrategyIndex-CvcXFTPG.js` is 40,889 B and
+  contains Manual Lots / Auto Lots / Hard Cap / Risk % / lot_mode / Strategy
+  Live Monitor / Profit Factor / Active Positions / Win Rate. Verified over HTTP
+  against the live server, not just on disk: index.html -> index-DHCPsuDA.js ->
+  PythonStrategyIndex-CvcXFTPG.js, and the API chunk python-strategy-CmdR2Gnh.js
+  carries max-lots, /metrics and /status.
+- `.gitattributes`: `frontend/dist/** merge=ours`. Verified with
+  `git check-attr merge -- frontend/dist/index.html` -> `merge: ours`.
+- Old dist backed up to frontend/dist.bak.20260826_194517 for rollback.
+
+### Runbook, so this does not recur
+After ANY upstream sync that touches `package.json` or `frontend/src`:
+
+    cd /opt/openalgo/frontend && npm ci && npm run build
+
+and verify the SERVED chunk, not the source:
+
+    curl -s http://127.0.0.1:5000/python | grep -oE 'assets/index-[^"]+\.js'
+    curl -s http://127.0.0.1:5000/assets/<entry>.js | grep -oE 'PythonStrategyIndex-[^"]+\.js'
+    curl -s http://127.0.0.1:5000/assets/<chunk>.js | grep -c 'Auto Lots'
+
+### Still open, deliberately not bundled here
+`frontend/dist` is tracked LOCALLY again (257 files) -- .gitignore cannot affect
+already-tracked paths, and the merge re-added them. `merge=ours` only fires when
+both sides track a file, so if we untrack and upstream tracks, a merge ADDS
+theirs with no conflict. Restoring the fork's intent needs
+`git rm -r --cached frontend/dist` as its own deliberate commit; a 257-file
+deletion does not belong inside a UI fix.
+
+### Correction to the brief
+Of the four capabilities, only the LOG VIEWER ever existed in the old Jinja UI
+(templates/python_strategy/, deleted c81dfb417). Lot mode, per-strategy
+performance and armed-trade status were SPA-only fork additions from June-July
+2026 (0f01ca878, ca04f9306, daf6e1895, 034ed3b70). The regression window is the
+Aug 24-25 sync, not the Jinja-to-React migration.
+
+9 guard tests in test/test_frontend_build_guards.py, mutation-checked. 187
+strategy + 13 CI tests pass.
+
 ## [2026-08-26] fix(health): scheduled retention, alert escalation, and two 63-day-old orphans
 
 Follow-up to the FD-leak outage. Neither of these caused it; both are why it

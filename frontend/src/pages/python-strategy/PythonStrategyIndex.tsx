@@ -55,7 +55,7 @@ export default function PythonStrategyIndex() {
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [strategyToDelete, setStrategyToDelete] = useState<PythonStrategy | null>(null)
   const [currentTime, setCurrentTime] = useState(new Date())
-  const [settingsEdits, setSettingsEdits] = useState<Record<string, { nifty?: string; sensex?: string; underlying?: string; lotMode?: string; riskPct?: string }>>({})
+  const [settingsEdits, setSettingsEdits] = useState<Record<string, { nifty?: string; sensex?: string; underlying?: string; lotMode?: string; riskPct?: string; qty?: string }>>({})
 
   const getSettings = (strategy: PythonStrategy) => {
     const edit = settingsEdits[strategy.id]
@@ -65,6 +65,7 @@ export default function PythonStrategyIndex() {
       underlying: edit?.underlying ?? (strategy.underlying ?? 'NIFTY'),
       lotMode: edit?.lotMode ?? (strategy.lot_mode ?? 'manual'),
       riskPct: edit?.riskPct ?? String(strategy.risk_pct_per_trade ?? 1.0),
+      qty: edit?.qty ?? String(strategy.quantity ?? 1),
     }
   }
 
@@ -85,6 +86,7 @@ export default function PythonStrategyIndex() {
     const niftyVal = parseInt(s.nifty, 10)
     const sensexVal = parseInt(s.sensex, 10)
     const riskPctVal = parseFloat(s.riskPct)
+    const qtyVal = parseInt(s.qty, 10)
     if (isNaN(niftyVal) || niftyVal < 1 || isNaN(sensexVal) || sensexVal < 1) {
       showToast.error('Max lots must be at least 1')
       return
@@ -93,18 +95,22 @@ export default function PythonStrategyIndex() {
       showToast.error('Risk % must be between 0.1 and 10')
       return
     }
+    if (isNaN(qtyVal) || qtyVal < 1) {
+      showToast.error(strategy.exchange === 'CRYPTO' ? 'Contract size must be at least 1' : 'Quantity must be at least 1')
+      return
+    }
     try {
-      const payload: any = {
+      const res = await pythonStrategyApi.saveStrategySettings(strategy.id, {
         max_lots_nifty: niftyVal,
         max_lots_sensex: sensexVal,
         risk_pct_per_trade: riskPctVal,
-      }
-      await pythonStrategyApi.saveStrategySettings(strategy.id, payload)
-      showToast.success('Settings saved')
+        quantity: qtyVal,
+      })
+      showToast.success(res.applied ? `Settings saved - ${res.applied}` : 'Settings saved')
       setStrategies(prev =>
         prev.map(st =>
           st.id === strategy.id
-            ? { ...st, max_lots_nifty: niftyVal, max_lots_sensex: sensexVal, risk_pct_per_trade: riskPctVal }
+            ? { ...st, max_lots_nifty: niftyVal, max_lots_sensex: sensexVal, risk_pct_per_trade: riskPctVal, quantity: qtyVal }
             : st
         )
       )
@@ -591,6 +597,23 @@ export default function PythonStrategyIndex() {
                         onChange={(e) => handleSettingsChange(strategy.id, 'riskPct', e.target.value)}
                         onBlur={() => handleSettingsSave(strategy)}
                         disabled={(strategy.status === 'running' && !strategy.managed_by?.startsWith('systemd:')) || getSettings(strategy).lotMode !== 'auto'}
+                      />
+                    </div>
+                    <div className="col-span-2">
+                      <Label className={`text-[10px] ${getSettings(strategy).lotMode === 'manual' ? 'text-muted-foreground' : 'text-muted-foreground/40'}`}>
+                        {strategy.exchange === 'CRYPTO'
+                          ? 'Contract Size (manual) - 1 BTC ct = 0.001 BTC'
+                          : 'Quantity (manual)'}
+                      </Label>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={strategy.exchange === 'CRYPTO' ? 100000 : 100000}
+                        className="h-7 text-xs font-mono"
+                        value={getSettings(strategy).qty}
+                        onChange={(e) => handleSettingsChange(strategy.id, 'qty', e.target.value)}
+                        onBlur={() => handleSettingsSave(strategy)}
+                        disabled={getSettings(strategy).lotMode !== 'manual'}
                       />
                     </div>
                   </div>

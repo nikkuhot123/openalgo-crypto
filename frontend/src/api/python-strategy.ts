@@ -247,6 +247,7 @@ export const pythonStrategyApi = {
       underlying?: string
       lot_mode?: 'manual' | 'auto'
       risk_pct_per_trade?: number
+      quantity?: number
     }
   ): Promise<{
     status: string
@@ -255,6 +256,8 @@ export const pythonStrategyApi = {
     underlying: string
     lot_mode: string
     risk_pct_per_trade: number
+    quantity?: number
+    applied?: string | null
   }> => {
     const response = await webClient.post<{
       status: string
@@ -263,6 +266,8 @@ export const pythonStrategyApi = {
       underlying: string
       lot_mode: string
       risk_pct_per_trade: number
+      quantity?: number
+      applied?: string | null
     }>(`/python/api/strategy/${strategyId}/max-lots`, settings)
     return response.data
   },

@@ -455,6 +455,36 @@ def set_resource_limits():
         logger.warning(f"Could not set resource limits: {e}")
 
 
+def systemd_unit_for(strategy_id):
+    """systemd unit name owning this strategy, or None if the app owns it."""
+    managed_by = (STRATEGY_CONFIGS.get(strategy_id, {}) or {}).get("managed_by") or ""
+    return managed_by.split(":", 1)[1] if managed_by.startswith("systemd:") else None
+
+
+def _systemctl(unit, verb, timeout=25):
+    """Run one systemctl verb against a unit. Returns (ok, message).
+
+    Units carry Restart=always, so a plain SIGTERM to the process is pointless:
+    systemd resurrects it within RestartSec. Only `systemctl stop` actually
+    stops it, which is why the UI Stop button must route through here.
+    """
+    try:
+        proc = subprocess.run(
+            ["sudo", "-n", "systemctl", verb, unit],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+        if proc.returncode == 0:
+            logger.info(f"systemctl {verb} {unit}: ok")
+            return True, "ok"
+        err = (proc.stderr or proc.stdout or "").strip()[:300]
+        logger.error(f"systemctl {verb} {unit} failed rc={proc.returncode}: {err}")
+        return False, err or f"exit {proc.returncode}"
+    except subprocess.TimeoutExpired:
+        return False, f"systemctl {verb} {unit} timed out"
+    except Exception as e:
+        return False, str(e)
+
+
 def start_strategy_process(strategy_id):
     """Start a strategy in a new process - cross-platform implementation"""
     with PROCESS_LOCK:  # Thread-safe operation
@@ -465,20 +495,25 @@ def start_strategy_process(strategy_id):
         if not config:
             return False, "Strategy configuration not found"
 
-        # A systemd unit already owns this process. The app must ADOPT it and
-        # never spawn its own copy: on 2026-08-27 restore_strategy_states() saw
-        # an is_running config whose pid had changed (units were restarted),
-        # failed to adopt, and started three rival Judas runners alongside the
-        # systemd ones -- every signal would have been executed twice, at double
-        # size. This is the single choke point for every spawn path (startup
-        # restore, cron, and the manual start API), so the guard belongs here.
+        # A systemd unit owns this process. NEVER spawn a rival copy: on
+        # 2026-08-27 restore_strategy_states() saw an is_running config whose
+        # pid had changed, failed to adopt, and started three rival Judas
+        # runners alongside the systemd ones -- every signal would have been
+        # executed twice, at double size. Delegate to systemctl instead so the
+        # UI Start button still works and the unit stays the single owner.
         managed_by = config.get("managed_by") or ""
         if managed_by.startswith("systemd:"):
             unit = managed_by.split(":", 1)[1]
-            return False, (
-                f"Owned by systemd unit '{unit}'; the app must not spawn it. "
-                f"Use: sudo systemctl start {unit}"
-            )
+            ok, msg = _systemctl(unit, "start")
+            if ok:
+                config["manually_stopped"] = False
+                config.pop("error_message", None)
+                save_configs()
+                # cleanup_dead_processes() adopts the new MainPID on its next
+                # pass (or the next API call), so no pid bookkeeping here.
+                broadcast_status_update(strategy_id, "running", f"systemd unit {unit} started")
+                return True, f"Started systemd unit {unit}"
+            return False, f"systemctl start {unit} failed: {msg}"
 
         file_path = Path(config["file_path"])
         if not file_path.exists():
@@ -682,6 +717,25 @@ def start_strategy_process(strategy_id):
 def stop_strategy_process(strategy_id):
     """Stop a running strategy process - cross-platform implementation"""
     with PROCESS_LOCK:  # Thread-safe operation
+        # Restart=always means killing the PID is futile -- systemd brings it
+        # straight back after RestartSec. `systemctl stop` is the only thing
+        # that actually stops a unit-owned strategy, so route there first.
+        unit = systemd_unit_for(strategy_id)
+        if unit:
+            ok, msg = _systemctl(unit, "stop")
+            if not ok:
+                return False, f"systemctl stop {unit} failed: {msg}"
+            RUNNING_STRATEGIES.pop(strategy_id, None)
+            cfg = STRATEGY_CONFIGS.get(strategy_id)
+            if cfg is not None:
+                cfg["is_running"] = False
+                cfg["pid"] = None
+                cfg["manually_stopped"] = True
+                cfg["last_stopped"] = get_ist_time().isoformat()
+                save_configs()
+            broadcast_status_update(strategy_id, "stopped", f"systemd unit {unit} stopped")
+            return True, f"Stopped systemd unit {unit}"
+
         if strategy_id not in RUNNING_STRATEGIES:
             # Check if process is still running by PID
             if strategy_id in STRATEGY_CONFIGS:
@@ -1903,6 +1957,16 @@ def start_strategy(strategy_id):
     if not is_owner:
         return error_response
 
+    # A systemd unit owns this strategy: it is the single source of truth, so
+    # delegate straight to systemctl. Skipping the block below is deliberate --
+    # that path auto-imposes a Mon-Fri 09:00-16:00 IST schedule and then
+    # REFUSES to start outside it, which silently no-ops for a 24/7 crypto
+    # strategy (and its 16:00 stop job would kill one every evening).
+    if systemd_unit_for(strategy_id):
+        initialize_with_app_context()
+        success, message = start_strategy_process(strategy_id)
+        return jsonify({"status": "success" if success else "error", "message": message})
+
     # Check if scheduler is enabled - auto-enable with defaults for old strategies
     config = STRATEGY_CONFIGS.get(strategy_id, {})
     if not config.get("is_scheduled"):
@@ -2009,6 +2073,14 @@ def stop_strategy(strategy_id):
     is_owner, error_response = verify_strategy_ownership(strategy_id, user_id)
     if not is_owner:
         return error_response
+
+    # systemd-owned: stop the UNIT. Restart=always means the config's
+    # is_running flag is irrelevant here -- the old branch below only set
+    # manually_stopped and returned "auto-start cancelled" while the unit
+    # carried on trading.
+    if systemd_unit_for(strategy_id):
+        success, message = stop_strategy_process(strategy_id)
+        return jsonify({"status": "success" if success else "error", "message": message})
 
     config = STRATEGY_CONFIGS.get(strategy_id, {})
     is_running = config.get("is_running", False)
@@ -3243,21 +3315,36 @@ def api_save_max_lots(strategy_id):
         except (ValueError, TypeError):
             return jsonify({"status": "error", "message": "Invalid risk_pct_per_trade value"}), 400
 
-    # Check if this strategy is managed by systemd
-    managed_by = STRATEGY_CONFIGS[strategy_id].get("managed_by", "")
-    if managed_by.startswith("systemd:"):
-        service_name = managed_by.split(":", 1)[1]
-        # Restart the systemd service in a background thread to prevent API blocking
-        def restart_service():
-            try:
-                subprocess.run(["sudo", "systemctl", "restart", service_name], check=True)
-                logger.info(f"Systemd service {service_name} restarted successfully after settings change.")
-            except Exception as e:
-                logger.error(f"Failed to restart systemd service {service_name}: {e}")
-        
-        threading.Thread(target=restart_service).start()
+    # Save the MANUAL trade size. On crypto this is a contract count (1 BTC
+    # option contract = 0.001 BTC), so it is the only field that sets actual
+    # position size in manual mode -- max_lots is just the auto-mode cap.
+    # Without this the UI could not change size at all on a manual strategy.
+    quantity = data.get("quantity")
+    if quantity is not None:
+        try:
+            val = int(quantity)
+            if val < 1:
+                raise ValueError
+            STRATEGY_CONFIGS[strategy_id]["quantity"] = min(val, max_limit)
+        except (ValueError, TypeError):
+            return jsonify({"status": "error", "message": "quantity must be an integer >= 1"}), 400
 
     save_configs()
+
+    # The strategy reads strategy_configs.json only at startup, so a settings
+    # change is inert until the process restarts. save_configs() MUST land
+    # first, otherwise the restarted process re-reads the old values.
+    unit = systemd_unit_for(strategy_id)
+    restart_note = None
+    if unit:
+        if STRATEGY_CONFIGS[strategy_id].get("manually_stopped"):
+            restart_note = f"saved; {unit} is stopped, start it to apply"
+        else:
+            ok, msg = _systemctl(unit, "restart")
+            restart_note = (
+                f"restarted {unit} to apply" if ok else f"saved, but restart failed: {msg}"
+            )
+
     return jsonify({
         "status": "success",
         "max_lots_nifty": STRATEGY_CONFIGS[strategy_id].get("max_lots_nifty", 1),
@@ -3265,6 +3352,8 @@ def api_save_max_lots(strategy_id):
         "underlying": STRATEGY_CONFIGS[strategy_id].get("underlying", "NIFTY"),
         "lot_mode": STRATEGY_CONFIGS[strategy_id].get("lot_mode", "manual"),
         "risk_pct_per_trade": STRATEGY_CONFIGS[strategy_id].get("risk_pct_per_trade", 1.0),
+        "quantity": STRATEGY_CONFIGS[strategy_id].get("quantity", 1),
+        "applied": restart_note,
     })
 
 @python_strategy_bp.route("/edit/<strategy_id>")

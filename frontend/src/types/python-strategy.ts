@@ -23,6 +23,7 @@ export interface PythonStrategy {
   underlying: string
   lot_mode: 'manual' | 'auto'
   risk_pct_per_trade: number
+  quantity?: number
   managed_by?: string
 }
 

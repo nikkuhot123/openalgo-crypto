@@ -390,20 +390,45 @@ def contract_value_for(symbol):
     return cv
 
 
+def usd_inr_rate():
+    """Delta's own USD->INR reference rate (GET /v2/settings). Sizing must use
+    the venue's figure, not an external FX quote, or it drifts from the number
+    Delta itself uses to convert the INR wallet."""
+    try:
+        from broker.deltaexchange.api.reference import get_usd_inr_rate
+        return get_usd_inr_rate()
+    except Exception as e:
+        override = os.getenv('DELTA_USD_INR_RATE') or os.getenv('USDINR_RATE')
+        if override:
+            try:
+                return float(override)
+            except (TypeError, ValueError):
+                pass
+        log.warning(f"USD-INR unavailable from Delta ({e}); using 85.0")
+        return 85.0
+
+
 def compute_auto_lots(capital, risk_pct, max_loss_per_unit, contract_value, hard_cap_lots):
-    """Compute contract count from risk budget. max_loss_per_unit is in USD premium points."""
+    """Contract count from the risk budget.
+
+    capital is INR (Delta settles in INR); max_loss_per_unit is USD premium
+    points. Cash risk per contract = points x contract_value.
+    """
     if max_loss_per_unit <= 0 or contract_value <= 0:
         return 1
-    # Sandbox capital is in INR, but options and perps are priced in USD.
-    # Convert capital from INR to USD before applying the risk budget percentage.
-    USDINR = float(os.getenv('USDINR_RATE', '84.0'))
-    capital_usd = capital / USDINR
+    fx = usd_inr_rate()
+    capital_usd = capital / fx
     risk_budget = capital_usd * (risk_pct / 100.0)
     max_loss_per_contract = max_loss_per_unit * contract_value
     if max_loss_per_contract <= 0:
         return 1
     auto_lots = int(risk_budget / max_loss_per_contract)
-    log.info(f"AUTO-LOT: capital INR {capital:.2f} (USD ${capital_usd:.2f}) | risk {risk_pct}% | risk_budget ${risk_budget:.2f} | cash_loss/contract ${max_loss_per_contract:.4f} → {auto_lots} contracts")
+    log.info(
+        f"AUTO-LOT: capital INR {capital:,.2f} @ {fx} = ${capital_usd:,.2f} | "
+        f"risk {risk_pct}% = ${risk_budget:,.2f} | cv {contract_value} | "
+        f"stop {max_loss_per_unit:.2f}pt = ${max_loss_per_contract:.4f}/contract "
+        f"-> {auto_lots} (cap {hard_cap_lots})"
+    )
     return max(1, min(auto_lots, hard_cap_lots))
 
 

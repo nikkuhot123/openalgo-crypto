@@ -72,7 +72,38 @@ except Exception as e:
     log.warning(f"Could not load strategy_configs.json: {e}")
 
 TRADE_VALUE = float(config_override.get('quantity', os.getenv('TRADE_VALUE', '1000')))
-CONTRACT_VALUE = float(config_override.get('CONTRACT_VALUE', os.getenv('CONTRACT_VALUE', '0.001')))
+
+
+def _contract_value_from_master(symbol):
+    """contract_value as published by Delta.
+
+    broker/deltaexchange/database/master_contract_db.py writes Delta's own
+    /v2/products `contract_value` into symtoken, so the master contract IS the
+    venue's figure -- no second hardcoded table to drift out of sync.
+    """
+    db_path = Path(__file__).resolve().parents[2] / "db" / "openalgo.db"
+    if not db_path.exists():
+        return None
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT contract_value FROM symtoken WHERE symbol = ? AND exchange = ?",
+                (symbol, EXCHANGE),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row and row[0] and float(row[0]) > 0:
+            return float(row[0])
+    except Exception as e:
+        log.warning(f"contract_value lookup failed for {symbol}: {e}")
+    return None
+
+
+CONTRACT_VALUE = _contract_value_from_master(SYMBOL) or float(
+    config_override.get('CONTRACT_VALUE', os.getenv('CONTRACT_VALUE', '0.001'))
+)
 MAX_CONTRACTS = int(config_override.get('max_lots_nifty', os.getenv('MAX_CONTRACTS', '100')))
 LOT_MODE = str(config_override.get('lot_mode', os.getenv('LOT_MODE', 'manual'))).lower()
 RISK_PCT_PER_TRADE = float(config_override.get('risk_pct_per_trade', os.getenv('RISK_PCT_PER_TRADE', '1.0')))
@@ -318,21 +349,40 @@ def fetch_available_capital():
     return None
 
 
+def usd_inr_rate():
+    """Delta's own USD->INR reference rate (GET /v2/settings)."""
+    try:
+        from broker.deltaexchange.api.reference import get_usd_inr_rate
+        return get_usd_inr_rate()
+    except Exception as e:
+        override = os.getenv('DELTA_USD_INR_RATE') or os.getenv('USDINR_RATE')
+        if override:
+            try:
+                return float(override)
+            except (TypeError, ValueError):
+                pass
+        log.warning(f"USD-INR unavailable from Delta ({e}); using 85.0")
+        return 85.0
+
+
 def contracts_for(price, risk_per_contract=None):
     if price <= 0 or CONTRACT_VALUE <= 0:
         return 1
-    
+
     if LOT_MODE == "auto" and risk_per_contract is not None and risk_per_contract > 0:
         capital = fetch_available_capital()
         if capital is not None and capital > 0:
-            USDINR = float(os.getenv('USDINR_RATE', '84.0'))
-            capital_usd = capital / USDINR
+            fx = usd_inr_rate()
+            capital_usd = capital / fx
             risk_budget = capital_usd * (RISK_PCT_PER_TRADE / 100.0)
             auto_qty = int(risk_budget / risk_per_contract)
-            log.info(f"AUTO-LOT: capital INR {capital:.2f} (USD ${capital_usd:.2f}) | risk {RISK_PCT_PER_TRADE}% | risk_budget ${risk_budget:.2f} | risk/contract ${risk_per_contract:.4f} → {auto_qty} contracts")
+            log.info(
+                f"AUTO-LOT: capital INR {capital:,.2f} @ {fx} = ${capital_usd:,.2f} | "
+                f"risk {RISK_PCT_PER_TRADE}% = ${risk_budget:,.2f} | "
+                f"risk/contract ${risk_per_contract:.4f} -> {auto_qty} (cap {MAX_CONTRACTS})"
+            )
             return max(1, min(auto_qty, MAX_CONTRACTS))
-        else:
-            log.warning("AUTO-LOT: capital unavailable, falling back to manual TRADE_VALUE")
+        log.warning(f"AUTO-LOT: capital unavailable, falling back to notional {TRADE_VALUE}")
 
     n = int(TRADE_VALUE / (price * CONTRACT_VALUE))
     return max(1, min(n, MAX_CONTRACTS))

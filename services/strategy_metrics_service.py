@@ -16,6 +16,7 @@ requested strategy by (display_name, underlying-prefix). This makes the SELL tag
 irrelevant and reconciles to the account-level daily P&L.
 """
 
+import gzip
 import re
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
@@ -90,23 +91,36 @@ _TRADE_LINE_MARKERS = (
 def _strategy_log_files(strategy_id, logs_dir):
     """Every log file belonging to one strategy, whoever owns the process.
 
-    The Flask subprocess runner writes `{strategy_id}_{YYYYMMDD_HHMMSS}_IST.log`,
-    but a systemd unit appends to a flat `{strategy_id}.log`. Globbing only the
-    dated form silently attributed ZERO trades to systemd-managed strategies,
-    so the performance panel showed an empty book for a strategy that was
-    trading normally.
+    Three shapes exist and all must be read or trade attribution silently
+    under-reports:
+      {id}_{YYYYMMDD_HHMMSS}_IST.log   Flask subprocess runner
+      {id}.log                         systemd `StandardOutput=append:`
+      {id}.log-<date>-<epoch>[.gz]     logrotate copytruncate archives
+
+    Globbing only the dated form attributed ZERO trades to systemd-managed
+    strategies; ignoring the rotated archives would drop every trade older than
+    the current rotation window from a weekly/monthly view.
     """
     if not logs_dir:
         return []
     root = Path(logs_dir)
     try:
         files = list(root.glob(f"{strategy_id}_[0-9]*.log"))
+        files += list(root.glob(f"{strategy_id}_[0-9]*.log-*"))
+        files += list(root.glob(f"{strategy_id}.log-*"))
         flat = root / f"{strategy_id}.log"
         if flat.exists():
             files.append(flat)
         return files
     except Exception:
         return []
+
+
+def _open_log(fp):
+    """Text handle for a strategy log, transparently decompressing rotated .gz."""
+    if str(fp).endswith(".gz"):
+        return gzip.open(fp, "rt", encoding="utf-8", errors="ignore")
+    return open(fp, "r", encoding="utf-8", errors="ignore")
 
 
 def _strategy_log_symbols(strategy_id, start_date, logs_dir):
@@ -131,7 +145,7 @@ def _strategy_log_symbols(strategy_id, start_date, logs_dir):
         try:
             if cutoff is not None and datetime.fromtimestamp(fp.stat().st_mtime) < cutoff:
                 continue
-            with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+            with _open_log(fp) as f:
                 for line in f:
                     if "CE" not in line and "PE" not in line:
                         continue
@@ -167,7 +181,7 @@ def _strategy_log_orderids(strategy_id, start_date, logs_dir):
         try:
             if cutoff is not None and datetime.fromtimestamp(fp.stat().st_mtime) < cutoff:
                 continue
-            with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+            with _open_log(fp) as f:
                 for line in f:
                     if "orderid" in line:
                         oids.update(_ORDERID_RE.findall(line))

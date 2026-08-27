@@ -3431,10 +3431,26 @@ def save_strategy(strategy_id):
 
 # Cleanup on shutdown
 def cleanup_on_exit():
-    """Clean up all running processes on application exit"""
+    """Clean up all running processes on application exit.
+
+    Strategies owned by a systemd unit are DISOWNED, never stopped. The app
+    only adopts those processes for monitoring; it did not spawn them and its
+    own shutdown says nothing about whether they should keep trading. Killing
+    them here meant a routine web-app restart tore down every live strategy --
+    including in-process target / break-even / time-stop monitoring while a
+    position was open, leaving only the resting venue stop.
+    """
     logger.info("Cleaning up running strategies...")
     with PROCESS_LOCK:
         for strategy_id in list(RUNNING_STRATEGIES.keys()):
+            managed_by = (STRATEGY_CONFIGS.get(strategy_id, {}) or {}).get("managed_by") or ""
+            if managed_by.startswith("systemd:"):
+                RUNNING_STRATEGIES.pop(strategy_id, None)
+                logger.info(
+                    f"Disowned {strategy_id} on shutdown (owned by {managed_by}); "
+                    f"leaving it running"
+                )
+                continue
             try:
                 stop_strategy_process(strategy_id)
             except Exception:

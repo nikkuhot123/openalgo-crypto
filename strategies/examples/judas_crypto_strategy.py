@@ -36,6 +36,14 @@ from pathlib import Path
 import pandas as pd
 from openalgo import api
 
+# systemd launches this by absolute path, so sys.path[0] is strategies/scripts,
+# not the repo root -- `import broker...` then fails and the Delta-sourced
+# USD/INR rate silently degrades to a hardcoded constant. Put the root on the
+# path so the venue's own reference data is actually used.
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
@@ -122,7 +130,14 @@ BE_ARM_R = float(os.getenv('BE_ARM_R', '1.0'))
 MAX_HOLD_MINUTES = int(os.getenv('MAX_HOLD_MINUTES', '540'))
 MAX_TRADES_PER_DAY = int(os.getenv('MAX_TRADES_PER_DAY', '1'))
 COST_PCT = float(os.getenv('COST_PCT', '0.05'))
-DAILY_LOSS_LIMIT = float(os.getenv('DAILY_LOSS_LIMIT', '500.0'))
+# Percent-of-capital limits, not absolute USD: 500.0 was ~1.7x the entire
+# account at 25,000 INR, so it could never fire in time.
+DAILY_LOSS_PCT = float(os.getenv('DAILY_LOSS_PCT', '3.0'))
+DAILY_LOSS_LIMIT_ABS = os.getenv('DAILY_LOSS_LIMIT')
+# Perps are leveraged: risk-derived size says nothing about position notional.
+# Cap notional as a percent of capital so a tight stop cannot silently open a
+# 20x position on a small account.
+MAX_NOTIONAL_PCT = float(os.getenv('MAX_NOTIONAL_PCT', '300.0'))
 LOSS_STREAK_LIMIT = int(os.getenv('LOSS_STREAK_LIMIT', '3'))
 POLL_SECS = int(os.getenv('POLL_SECS', '15'))
 
@@ -365,7 +380,23 @@ def usd_inr_rate():
         return 85.0
 
 
+def daily_loss_limit(capital_inr, fx):
+    """Daily loss stop in USD, scaled to capital unless pinned absolutely."""
+    if DAILY_LOSS_LIMIT_ABS:
+        try:
+            return float(DAILY_LOSS_LIMIT_ABS)
+        except (TypeError, ValueError):
+            pass
+    if not capital_inr or capital_inr <= 0 or fx <= 0:
+        return float('inf')
+    return (capital_inr / fx) * (DAILY_LOSS_PCT / 100.0)
+
+
 def contracts_for(price, risk_per_contract=None):
+    """Contracts to trade. Two limits apply and the tighter one wins:
+      risk     -- stop distance x size <= RISK_PCT_PER_TRADE of capital
+      notional -- position value <= MAX_NOTIONAL_PCT of capital (leverage cap)
+    """
     if price <= 0 or CONTRACT_VALUE <= 0:
         return 1
 
@@ -375,14 +406,24 @@ def contracts_for(price, risk_per_contract=None):
             fx = usd_inr_rate()
             capital_usd = capital / fx
             risk_budget = capital_usd * (RISK_PCT_PER_TRADE / 100.0)
-            auto_qty = int(risk_budget / risk_per_contract)
+            by_risk = int(risk_budget / risk_per_contract)
+
+            notional_budget = capital_usd * (MAX_NOTIONAL_PCT / 100.0)
+            by_notional = int(notional_budget / (price * CONTRACT_VALUE))
+
+            qty = max(1, min(by_risk, by_notional, MAX_CONTRACTS))
+            binding = "risk" if qty == by_risk else ("notional" if qty == by_notional else "hard cap")
+            notional = qty * price * CONTRACT_VALUE
             log.info(
-                f"AUTO-LOT: capital INR {capital:,.2f} @ {fx} = ${capital_usd:,.2f} | "
+                f"AUTO-LOT: capital INR {capital:,.0f} @ {fx} = ${capital_usd:,.2f} | "
                 f"risk {RISK_PCT_PER_TRADE}% = ${risk_budget:,.2f} | "
-                f"risk/contract ${risk_per_contract:.4f} -> {auto_qty} (cap {MAX_CONTRACTS})"
+                f"risk/ct ${risk_per_contract:.4f} -> {by_risk} | "
+                f"notional<={MAX_NOTIONAL_PCT}% -> {by_notional} | cap {MAX_CONTRACTS} | "
+                f"BINDING={binding} | qty={qty} "
+                f"(notional ${notional:,.2f} = {notional / capital_usd:.2f}x capital)"
             )
-            return max(1, min(auto_qty, MAX_CONTRACTS))
-        log.warning(f"AUTO-LOT: capital unavailable, falling back to notional {TRADE_VALUE}")
+            return qty
+        log.warning(f"AUTO-LOT: capital unavailable, falling back to notional ${TRADE_VALUE}")
 
     n = int(TRADE_VALUE / (price * CONTRACT_VALUE))
     return max(1, min(n, MAX_CONTRACTS))
@@ -645,8 +686,12 @@ def main():
             if load_done_day() == str(utc_day):
                 time.sleep(POLL_SECS)
                 continue
-            if daily_loss >= DAILY_LOSS_LIMIT:
-                log.warning(f"Daily loss ${daily_loss:.2f} >= ${DAILY_LOSS_LIMIT:.2f} - standing down")
+            loss_cap = daily_loss_limit(fetch_available_capital(), usd_inr_rate())
+            if daily_loss >= loss_cap:
+                log.warning(
+                    f"Daily loss ${daily_loss:.2f} >= ${loss_cap:.2f} "
+                    f"({DAILY_LOSS_PCT}% of capital) - standing down"
+                )
                 time.sleep(60)
                 continue
             if losses_streak >= LOSS_STREAK_LIMIT:

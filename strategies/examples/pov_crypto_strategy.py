@@ -46,6 +46,14 @@ from pathlib import Path
 import pandas as pd
 from openalgo import api
 
+# systemd launches this by absolute path, so sys.path[0] is strategies/scripts,
+# not the repo root -- `import broker...` then fails and the Delta-sourced
+# USD/INR rate silently degrades to a hardcoded constant. Put the root on the
+# path so the venue's own reference data is actually used.
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
@@ -110,7 +118,16 @@ SL_LIMIT_BUFFER_PCT = float(os.getenv('SL_LIMIT_BUFFER_PCT', '2.0'))
 MAX_HOLD_MINUTES = int(os.getenv('MAX_HOLD_MINUTES', '540'))
 DECAY_EXIT_PCT = float(os.getenv('DECAY_EXIT_PCT', '0.60'))
 OPT_COST_PCT = float(os.getenv('OPT_COST_PCT', '0.05'))
-DAILY_LOSS_LIMIT = float(os.getenv('DAILY_LOSS_LIMIT', '500.0'))
+# Risk limits are expressed as a PERCENT OF CAPITAL, not absolute USD. An
+# absolute 500.0 was ~1.7x the whole account at 25,000 INR, so the limit could
+# never fire before the account was gone. DAILY_LOSS_LIMIT stays supported as
+# an explicit override for anyone who really wants a fixed dollar stop.
+DAILY_LOSS_PCT = float(os.getenv('DAILY_LOSS_PCT', '3.0'))
+DAILY_LOSS_LIMIT_ABS = os.getenv('DAILY_LOSS_LIMIT')
+# A long option's true cost is the premium paid, and a tight stop makes the
+# risk-derived size enormous: a 5pt stop at 1% risk buys 60% of the account in
+# one leg, and POV can hold a CE and a PE at once, up to 4 trades a day.
+MAX_PREMIUM_PCT = float(os.getenv('MAX_PREMIUM_PCT', '20.0'))
 LOSS_STREAK_LIMIT = int(os.getenv('LOSS_STREAK_LIMIT', '3'))
 POLL_SECS = int(os.getenv('POLL_SECS', '15'))
 
@@ -408,28 +425,66 @@ def usd_inr_rate():
         return 85.0
 
 
-def compute_auto_lots(capital, risk_pct, max_loss_per_unit, contract_value, hard_cap_lots):
-    """Contract count from the risk budget.
+def daily_loss_limit(capital_inr, fx):
+    """Daily loss stop in USD, scaled to capital unless pinned absolutely."""
+    if DAILY_LOSS_LIMIT_ABS:
+        try:
+            return float(DAILY_LOSS_LIMIT_ABS)
+        except (TypeError, ValueError):
+            pass
+    if not capital_inr or capital_inr <= 0 or fx <= 0:
+        return float('inf')  # unknown capital: never halt on a guessed number
+    return (capital_inr / fx) * (DAILY_LOSS_PCT / 100.0)
 
-    capital is INR (Delta settles in INR); max_loss_per_unit is USD premium
-    points. Cash risk per contract = points x contract_value.
+
+def compute_auto_lots(capital, risk_pct, max_loss_per_unit, contract_value,
+                      hard_cap_lots, entry_premium=None):
+    """Contract count from the risk budget, then clamped by premium affordability.
+
+    capital is INR (Delta settles in INR); max_loss_per_unit and entry_premium
+    are USD premium points. Cash per contract = points x contract_value.
+
+    Two independent limits apply and the tighter one wins:
+      risk   -- stop distance x size must not exceed risk_pct of capital
+      outlay -- premium paid must not exceed MAX_PREMIUM_PCT of capital
+    The outlay limit is what stops a 5pt stop from buying 60% of the account.
     """
     if max_loss_per_unit <= 0 or contract_value <= 0:
         return 1
     fx = usd_inr_rate()
     capital_usd = capital / fx
     risk_budget = capital_usd * (risk_pct / 100.0)
-    max_loss_per_contract = max_loss_per_unit * contract_value
-    if max_loss_per_contract <= 0:
+    loss_per_contract = max_loss_per_unit * contract_value
+    if loss_per_contract <= 0:
         return 1
-    auto_lots = int(risk_budget / max_loss_per_contract)
+
+    by_risk = int(risk_budget / loss_per_contract)
+    qty = by_risk
+    binding = "risk"
+
+    if qty > hard_cap_lots:
+        qty, binding = hard_cap_lots, "hard cap"
+
+    by_premium = None
+    if entry_premium and entry_premium > 0:
+        outlay_budget = capital_usd * (MAX_PREMIUM_PCT / 100.0)
+        cost_per_contract = entry_premium * contract_value
+        if cost_per_contract > 0:
+            by_premium = int(outlay_budget / cost_per_contract)
+            if by_premium < qty:
+                qty, binding = by_premium, "premium cap"
+
+    qty = max(1, qty)
+    outlay = qty * (entry_premium or 0.0) * contract_value
     log.info(
-        f"AUTO-LOT: capital INR {capital:,.2f} @ {fx} = ${capital_usd:,.2f} | "
+        f"AUTO-LOT: capital INR {capital:,.0f} @ {fx} = ${capital_usd:,.2f} | "
         f"risk {risk_pct}% = ${risk_budget:,.2f} | cv {contract_value} | "
-        f"stop {max_loss_per_unit:.2f}pt = ${max_loss_per_contract:.4f}/contract "
-        f"-> {auto_lots} (cap {hard_cap_lots})"
+        f"stop {max_loss_per_unit:.2f}pt = ${loss_per_contract:.4f}/ct -> {by_risk} | "
+        f"premium<={MAX_PREMIUM_PCT}% -> {by_premium if by_premium is not None else 'n/a'} | "
+        f"cap {hard_cap_lots} | BINDING={binding} | qty={qty} "
+        f"(outlay ${outlay:,.2f} = {outlay / capital_usd * 100:.1f}% of capital)"
     )
-    return max(1, min(auto_lots, hard_cap_lots))
+    return qty
 
 
 def statutory_cost(turnover):
@@ -684,8 +739,12 @@ def main():
                 log.info(f"Booked from stops: ${realized:.4f} | daily_loss=${daily_loss:.4f} "
                          f"| streak={losses_streak}")
 
-            if daily_loss >= DAILY_LOSS_LIMIT:
-                log.warning(f"Daily loss ${daily_loss:.2f} >= ${DAILY_LOSS_LIMIT:.2f} - standing down")
+            loss_cap = daily_loss_limit(fetch_available_capital(), usd_inr_rate())
+            if daily_loss >= loss_cap:
+                log.warning(
+                    f"Daily loss ${daily_loss:.2f} >= ${loss_cap:.2f} "
+                    f"({DAILY_LOSS_PCT}% of capital) - standing down"
+                )
                 time.sleep(60)
                 continue
             if losses_streak >= LOSS_STREAK_LIMIT:
@@ -791,7 +850,8 @@ def main():
                         cv = contract_value_for(symbol)
                         max_loss_per_unit = max(res["entry"] - res["sl"], TICK_SIZE * 2)
                         entry_qty = compute_auto_lots(
-                            capital, RISK_PCT_PER_TRADE, max_loss_per_unit, cv, MAX_LOTS
+                            capital, RISK_PCT_PER_TRADE, max_loss_per_unit, cv, MAX_LOTS,
+                            entry_premium=res["entry"],
                         )
                     else:
                         log.warning(f"AUTO-LOT: capital unavailable, falling back to manual {ENTRY_QTY}")

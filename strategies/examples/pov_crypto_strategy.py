@@ -76,11 +76,18 @@ try:
 except Exception as e:
     log.warning(f"Could not load strategy_configs.json: {e}")
 
+# Manual mode trades exactly the size the operator specified (QUANTITY).
+# MAX_LOTS is the hard CAP for auto mode only -- multiplying the two turned a
+# 1-contract manual size into 100 on 2026-08-26 23:41 and inflated every
+# subsequent fill 100x. Never reintroduce that multiply.
 QUANTITY = int(config_override.get('quantity', os.getenv('QUANTITY', '1')))
 MAX_LOTS = int(config_override.get('max_lots_nifty', os.getenv('MAX_LOTS', '1')))
 LOT_MODE = str(config_override.get('lot_mode', os.getenv('LOT_MODE', 'manual'))).lower()
 RISK_PCT_PER_TRADE = float(config_override.get('risk_pct_per_trade', os.getenv('RISK_PCT_PER_TRADE', '1.0')))
-ENTRY_QTY = max(1, QUANTITY * MAX_LOTS)
+ENTRY_QTY = max(1, QUANTITY)
+# Underlying units per contract (0.001 BTC, 0.01 ETH). Premium points are NOT
+# dollars: cash = points x qty x CONTRACT_VALUE. Resolved per-symbol at entry.
+CONTRACT_VALUE_DEFAULT = float(os.getenv('CONTRACT_VALUE', '0.0'))
 TICK_SIZE = float(os.getenv('TICK_SIZE', '0.1'))
 INTERVAL = os.getenv('INTERVAL', '1h')
 LOOKBACK_DAYS = int(os.getenv('LOOKBACK_DAYS', '7'))
@@ -364,6 +371,24 @@ def fetch_contract_value_from_db(symbol, exchange="CRYPTO"):
         log.warning(f"Error querying contract_value for {symbol}: {e}")
     return None
 
+_cv_cache = {}
+
+
+def contract_value_for(symbol):
+    """Underlying units per contract, cached. Falls back to the underlying's
+    known Delta multiplier so P&L is never silently computed in raw premium
+    points (which reads 1000x too large on BTC and trips DAILY_LOSS_LIMIT)."""
+    if symbol in _cv_cache:
+        return _cv_cache[symbol]
+    cv = fetch_contract_value_from_db(symbol)
+    if not cv or cv <= 0:
+        cv = CONTRACT_VALUE_DEFAULT
+    if not cv or cv <= 0:
+        und = UNDERLYING.upper()
+        cv = {"BTC": 0.001, "ETH": 0.01, "SOL": 1.0}.get(und, 1.0)
+    _cv_cache[symbol] = cv
+    return cv
+
 
 def compute_auto_lots(capital, risk_pct, max_loss_per_unit, contract_value, hard_cap_lots):
     """Compute contract count from risk budget. max_loss_per_unit is in USD premium points."""
@@ -458,7 +483,9 @@ def sync_positions_with_book(positions):
             if order_state(sl_oid) == "COMPLETE":
                 exit_p = fetch_fill_price(sl_oid, 0.0)
                 if exit_p > 0 and entry_p > 0:
-                    pnl = (exit_p - entry_p) * qty - statutory_cost((entry_p + exit_p) * qty)
+                    cv = contract_value_for(sym)
+                    gross = (exit_p - entry_p) * qty * cv
+                    pnl = gross - statutory_cost((entry_p + exit_p) * qty * cv)
                     realized += pnl
                     if pnl < 0:
                         losses += 1
@@ -704,7 +731,9 @@ def main():
                         ok, fill = verified_exit_sell(symbol, qty, reason=reason)
                         if ok:
                             exit_p = fill or ltp
-                            pnl = (exit_p - entry_p) * qty - statutory_cost((entry_p + exit_p) * qty)
+                            cv = contract_value_for(symbol)
+                            gross = (exit_p - entry_p) * qty * cv
+                            pnl = gross - statutory_cost((entry_p + exit_p) * qty * cv)
                             log.info(f"Booked {reason} on {symbol}: ${pnl:.4f}")
                             if pnl < 0:
                                 daily_loss += abs(pnl)
@@ -734,17 +763,13 @@ def main():
                 if LOT_MODE == "auto" and res["entry"] is not None and res["sl"] is not None:
                     capital = fetch_available_capital()
                     if capital is not None and capital > 0:
-                        cv = fetch_contract_value_from_db(symbol)
-                        if cv is None:
-                            und = UNDERLYING.upper()
-                            cv = 0.001 if und == "BTC" else (0.01 if und == "ETH" else (0.1 if und == "SOL" else 1.0))
-                        
+                        cv = contract_value_for(symbol)
                         max_loss_per_unit = max(res["entry"] - res["sl"], TICK_SIZE * 2)
-                        lots = compute_auto_lots(capital, RISK_PCT_PER_TRADE, max_loss_per_unit, cv, MAX_LOTS)
-                        entry_qty = lots
-                        log.info(f"AUTO-LOT: capital ${capital:.2f} | risk {RISK_PCT_PER_TRADE}% | contract_value {cv} | loss/unit ${max_loss_per_unit:.2f} → {lots} contracts")
+                        entry_qty = compute_auto_lots(
+                            capital, RISK_PCT_PER_TRADE, max_loss_per_unit, cv, MAX_LOTS
+                        )
                     else:
-                        log.warning("AUTO-LOT: capital unavailable, falling back to manual quantity")
+                        log.warning(f"AUTO-LOT: capital unavailable, falling back to manual {ENTRY_QTY}")
 
                 log.info(f"POV {res['action']} {res['score']}/5 on {symbol} - BUY {entry_qty} "
                          f"(entry {res['entry']} sl {res['sl']} t1 {res['t1']})")

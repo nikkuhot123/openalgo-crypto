@@ -87,6 +87,28 @@ _TRADE_LINE_MARKERS = (
 )
 
 
+def _strategy_log_files(strategy_id, logs_dir):
+    """Every log file belonging to one strategy, whoever owns the process.
+
+    The Flask subprocess runner writes `{strategy_id}_{YYYYMMDD_HHMMSS}_IST.log`,
+    but a systemd unit appends to a flat `{strategy_id}.log`. Globbing only the
+    dated form silently attributed ZERO trades to systemd-managed strategies,
+    so the performance panel showed an empty book for a strategy that was
+    trading normally.
+    """
+    if not logs_dir:
+        return []
+    root = Path(logs_dir)
+    try:
+        files = list(root.glob(f"{strategy_id}_[0-9]*.log"))
+        flat = root / f"{strategy_id}.log"
+        if flat.exists():
+            files.append(flat)
+        return files
+    except Exception:
+        return []
+
+
 def _strategy_log_symbols(strategy_id, start_date, logs_dir):
     """Set of option symbols THIS strategy actually TRADED or HELD, from its own logs.
 
@@ -98,11 +120,8 @@ def _strategy_log_symbols(strategy_id, start_date, logs_dir):
     available for open positions.
     """
     symbols = set()
-    if not logs_dir:
-        return symbols
-    try:
-        files = list(Path(logs_dir).glob(f"{strategy_id}_[0-9]*.log"))
-    except Exception:
+    files = _strategy_log_files(strategy_id, logs_dir)
+    if not files:
         return symbols
     cutoff = None
     if start_date is not None:
@@ -138,11 +157,8 @@ def _strategy_log_orderids(strategy_id, start_date, logs_dir):
     caller falls back to symbols, then to the opener tag.
     """
     oids = set()
-    if not logs_dir:
-        return oids
-    try:
-        files = list(Path(logs_dir).glob(f"{strategy_id}_[0-9]*.log"))
-    except Exception:
+    files = _strategy_log_files(strategy_id, logs_dir)
+    if not files:
         return oids
     cutoff = None
     if start_date is not None:

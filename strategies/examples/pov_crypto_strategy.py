@@ -54,7 +54,22 @@ _REPO_ROOT = str(Path(__file__).resolve().parents[2])
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+# Import repo modules BEFORE configuring logging: utils.logging (pulled in
+# transitively) reconfigures the root logger, which would rewrite our on-disk
+# line format mid-run. The /python Live Monitor parses
+# "<ts> [LEVEL] message", so a format flip blanks out state, active trades and
+# indicators on the strategy card. Import first, then reclaim the format with
+# force=True so the log contract is fixed for the whole process lifetime.
+try:
+    from broker.deltaexchange.api.reference import get_usd_inr_rate as _delta_usd_inr
+except Exception:  # repo layout unavailable -- usd_inr_rate() falls back
+    _delta_usd_inr = None
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    force=True,
+)
 log = logging.getLogger(__name__)
 
 api_key = os.getenv('OPENALGO_API_KEY')
@@ -411,18 +426,19 @@ def usd_inr_rate():
     """Delta's own USD->INR reference rate (GET /v2/settings). Sizing must use
     the venue's figure, not an external FX quote, or it drifts from the number
     Delta itself uses to convert the INR wallet."""
-    try:
-        from broker.deltaexchange.api.reference import get_usd_inr_rate
-        return get_usd_inr_rate()
-    except Exception as e:
-        override = os.getenv('DELTA_USD_INR_RATE') or os.getenv('USDINR_RATE')
-        if override:
-            try:
-                return float(override)
-            except (TypeError, ValueError):
-                pass
-        log.warning(f"USD-INR unavailable from Delta ({e}); using 85.0")
-        return 85.0
+    if _delta_usd_inr is not None:
+        try:
+            return _delta_usd_inr()
+        except Exception as e:
+            log.warning(f"Delta USD-INR lookup failed: {e}")
+    override = os.getenv('DELTA_USD_INR_RATE') or os.getenv('USDINR_RATE')
+    if override:
+        try:
+            return float(override)
+        except (TypeError, ValueError):
+            pass
+    log.warning("USD-INR unavailable from Delta; using 85.0")
+    return 85.0
 
 
 def daily_loss_limit(capital_inr, fx):

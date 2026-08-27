@@ -3074,12 +3074,19 @@ def api_get_strategy_status(strategy_id):
         except Exception:
             pass  # Fall through to log parsing
 
-    # Find the latest log file for this strategy
+    # Prefer the log the CURRENT owner is actually writing. systemd-managed
+    # strategies append to a flat file (pov_crypto_btc.log) which the dated
+    # `{id}_[0-9]*.log` glob cannot match, so the glob alone silently served a
+    # stale file from the old Flask-subprocess era -- the Live Monitor showed a
+    # termination line from a previous day while the strategy was scanning fine.
+    systemd_log = get_systemd_log_path(strategy_id)
     log_files = sorted(
         LOGS_DIR.glob(f"{strategy_id}_[0-9]*.log"),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
+    if systemd_log:
+        log_files = [systemd_log] + [p for p in log_files if p != systemd_log]
 
     if not log_files:
         return jsonify({

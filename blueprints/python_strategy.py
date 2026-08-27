@@ -2617,6 +2617,7 @@ def api_get_strategies():
                 "underlying": config.get("underlying", "NIFTY"),
                 "lot_mode": config.get("lot_mode", "manual"),
                 "risk_pct_per_trade": config.get("risk_pct_per_trade", 1.0),
+                "quantity": config.get("quantity", 1),
                 "managed_by": config.get("managed_by"),
             }
         )
@@ -2720,6 +2721,7 @@ def api_get_strategy(strategy_id):
                 "underlying": config.get("underlying", "NIFTY"),
                 "lot_mode": config.get("lot_mode", "manual"),
                 "risk_pct_per_trade": config.get("risk_pct_per_trade", 1.0),
+                "quantity": config.get("quantity", 1),
                 "managed_by": config.get("managed_by"),
             }
         }

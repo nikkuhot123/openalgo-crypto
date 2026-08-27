@@ -465,6 +465,21 @@ def start_strategy_process(strategy_id):
         if not config:
             return False, "Strategy configuration not found"
 
+        # A systemd unit already owns this process. The app must ADOPT it and
+        # never spawn its own copy: on 2026-08-27 restore_strategy_states() saw
+        # an is_running config whose pid had changed (units were restarted),
+        # failed to adopt, and started three rival Judas runners alongside the
+        # systemd ones -- every signal would have been executed twice, at double
+        # size. This is the single choke point for every spawn path (startup
+        # restore, cron, and the manual start API), so the guard belongs here.
+        managed_by = config.get("managed_by") or ""
+        if managed_by.startswith("systemd:"):
+            unit = managed_by.split(":", 1)[1]
+            return False, (
+                f"Owned by systemd unit '{unit}'; the app must not spawn it. "
+                f"Use: sudo systemctl start {unit}"
+            )
+
         file_path = Path(config["file_path"])
         if not file_path.exists():
             return False, f"Strategy file not found: {file_path}"

@@ -346,6 +346,9 @@ def compute_auto_lots(capital, risk_pct, max_loss_per_unit, lot_size, hard_cap_l
     if max_loss_per_lot <= 0:
         return 1
     auto_lots = int(risk_budget / max_loss_per_lot)
+    if auto_lots < 1:
+        log.warning("Risk budget Rs %.0f (%.1f%% of Rs %.0f) is below 1 lot max loss Rs %.0f -- taking 1 lot minimum floor",
+                    risk_budget, risk_pct, capital, max_loss_per_lot)
     return max(1, min(auto_lots, hard_cap_lots))
 
 def fetch_option_ltp(opt_symbol, opt_exchange, underlying_ltp=None, max_retries=3, retry_delay=1.0):

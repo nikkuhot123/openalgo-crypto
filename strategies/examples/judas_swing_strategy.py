@@ -268,6 +268,30 @@ STATE_DIR = Path("log") / "strategies" / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = STATE_DIR / f"judas_swing_{UNDERLYING.upper()}.json"
 
+
+# ---- Live Monitor status sidecar -------------------------------------------
+STATUS_FILE = (
+    Path("log") / "strategies" / f"{os.getenv('STRATEGY_ID', STRATEGY_NAME)}_status.json"
+)
+
+
+def write_status(state, active_trades=None, indicators=None, last_message=None):
+    """Publish a status snapshot for the Live Monitor. Best-effort by design."""
+    try:
+        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "state": state,
+            "active_trades": active_trades or [],
+            "indicators": indicators or {},
+            "last_updated": datetime.now().isoformat(),
+            "last_log_message": last_message,
+        }
+        tmp = STATUS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(STATUS_FILE)
+    except Exception:
+        pass
+
 def persist_trade(trade):
     """Snapshot the active trade to disk ({} when flat)."""
     try:
@@ -308,6 +332,33 @@ def load_done_date():
     except Exception as e:
         log.debug(f"load_done_date failed: {e}")
     return None
+
+
+def is_position_claimed_by_peer(symbol, my_strategy_name):
+    """Check if ANY peer strategy has claimed this symbol in its state file or holds its active lock."""
+    try:
+        # 1. Check lock file
+        lock_f = LOCKS_DIR / f"{symbol}.lock"
+        if lock_f.exists():
+            _owner, _ts, _pid = _read_lock(lock_f)
+            if _owner and _owner != my_strategy_name and not _lock_is_stale(_ts, _pid):
+                return True, f"lock held by '{_owner}' (pid {_pid})"
+        # 2. Check all state files in log/strategies/state/
+        state_dir = Path("log") / "strategies" / "state"
+        if state_dir.exists():
+            for sf in state_dir.glob("*.json"):
+                try:
+                    data = json.loads(sf.read_text())
+                    if isinstance(data, dict):
+                        if data.get("symbol") == symbol and not data.get("adopted"):
+                            return True, f"state file {sf.name}"
+                        if symbol in data and not (data[symbol] or {}).get("adopted"):
+                            return True, f"state file {sf.name}"
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False, None
 
 def reconcile_orphan_position(underlying):
     """Check positionbook for an open position matching this underlying. Returns adopted trade dict or None."""
@@ -367,6 +418,9 @@ def compute_auto_lots(capital, risk_pct, max_loss_per_unit, lot_size, hard_cap_l
     if max_loss_per_lot <= 0:
         return 1
     auto_lots = int(risk_budget / max_loss_per_lot)
+    if auto_lots < 1:
+        log.warning("Risk budget Rs %.0f (%.1f%% of Rs %.0f) is below 1 lot max loss Rs %.0f -- taking 1 lot minimum floor",
+                    risk_budget, risk_pct, capital, max_loss_per_lot)
     return max(1, min(auto_lots, hard_cap_lots))
 
 def fetch_option_ltp(opt_symbol, opt_exchange, underlying_ltp=None, max_retries=3, retry_delay=1.0):
@@ -1036,24 +1090,18 @@ def run_strategy():
     # Auto-detect lot size if QUANTITY not explicitly set
     if QUANTITY == 0:
         detected = fetch_lot_size(UNDERLYING, idx_exchange, opt_exchange)
+        while not detected and not _shutdown_requested:
+            now_t = datetime.now().time()
+            if now_t > ENTRY_END:
+                log.error("Lot size still undetectable at entry cutoff (%s) -- standing down.", ENTRY_END)
+                sys.exit(1)
+            log.info("Lot size not published yet for %s -- retrying in 5s...", UNDERLYING)
+            time.sleep(5)
+            detected = fetch_lot_size(UNDERLYING, idx_exchange, opt_exchange)
         if detected:
             QUANTITY = detected
             LOT_SIZE = detected
             log.info(f"Auto-detected lot size: {QUANTITY}")
-        else:
-            # NEVER guess. The old fallback was a hardcoded 75 -- the NIFTY lot
-            # size from before the 2025-12-31 change to 65, and never correct
-            # for SENSEX (20). On 2026-08-12 detection failed and that guess
-            # produced 51 rejected orders across both books:
-            #   "Quantity must be in multiples of lot size 65" / "... 20"
-            # Analyzer rejects a wrong size outright, which is the benign case.
-            # LIVE would risk a wrong-sized REAL position, so stand down instead.
-            log.error(
-                "Lot size undetectable for %s (both optionchain and symbol() "
-                "failed) -- standing down. Set QUANTITY explicitly to override.",
-                UNDERLYING,
-            )
-            sys.exit(1)
     else:
         LOT_SIZE = QUANTITY
         log.info(f"Using configured lot size: {QUANTITY}")
@@ -1078,19 +1126,25 @@ def run_strategy():
                 f"Adopting position with RESTORED context: {orphan['symbol']} qty={orphan['qty']} "
                 f"| SL: {active_trade.get('sl_spot')} | Target: {active_trade.get('target_spot')}")
         else:
-            log.warning(f"Adopting unknown orphan (EOD-exit-only): {orphan['symbol']} qty={orphan['qty']} @ {orphan['entry_price']}")
-            active_trade = {
-                "symbol": orphan["symbol"],
-                "direction": orphan["direction"],
-                "entry_spot": None,        # unknown — orphan from prior session
-                "sl_spot": None,
-                "target_spot": None,
-                "qty": orphan["qty"],
-                "adopted": True,
-            }
-        _active_trade = active_trade
-        state = "IN_TRADE"
-        acquire_symbol_lock(orphan["symbol"], STRATEGY_NAME)
+            is_claimed, peer_detail = is_position_claimed_by_peer(orphan["symbol"], STRATEGY_NAME)
+            if is_claimed:
+                log.info(f"Orphan {orphan['symbol']} is claimed by peer ({peer_detail}) — skipping adoption")
+                orphan = None
+            else:
+                log.warning(f"Adopting unknown orphan (EOD-exit-only): {orphan['symbol']} qty={orphan['qty']} @ {orphan['entry_price']}")
+                active_trade = {
+                    "symbol": orphan["symbol"],
+                    "direction": orphan["direction"],
+                    "entry_spot": None,        # unknown — orphan from prior session
+                    "sl_spot": None,
+                    "target_spot": None,
+                    "qty": orphan["qty"],
+                    "adopted": True,
+                }
+        if orphan:
+            _active_trade = active_trade
+            state = "IN_TRADE"
+            acquire_symbol_lock(orphan["symbol"], STRATEGY_NAME)
         # Re-establish the resting backstop on the ADOPTED position.
         #
         # Without this the protection exists only on the happy path: the
@@ -1164,6 +1218,31 @@ def run_strategy():
                 time.sleep(15)
                 continue
             underlying_ltp = float(quotes_resp["data"]["ltp"])
+
+            # Publish sidecar for Live Monitor on every poll
+            _j_trades = []
+            if active_trade and state == "IN_TRADE":
+                _sym = active_trade.get("symbol", "")
+                _dir = active_trade.get("direction") or ("CE" if _sym.upper().endswith("CE") else ("PE" if _sym.upper().endswith("PE") else "UNKNOWN"))
+                _j_trades = [{
+                    "symbol": _sym,
+                    "direction": _dir,
+                    "entry_price": float(active_trade.get("entry_spot") or 0.0) or None,
+                    "stop_loss": float(active_trade.get("sl_spot") or 0.0) or None,
+                    "target": float(active_trade.get("target_spot") or 0.0) or None,
+                    "current_price": float(underlying_ltp or 0.0) or None,
+                    "type": _dir,
+                }]
+            write_status(
+                state,
+                active_trades=_j_trades,
+                indicators={
+                    "phase": "IN_TRADE" if state == "IN_TRADE" else ("DONE" if state == "DONE" else "SCANNING"),
+                    "spot": float(underlying_ltp or 0.0) if underlying_ltp else None,
+                    "regime": "WAIT-SWEEP",
+                },
+                last_message=f"Underlying LTP: {underlying_ltp}"
+            )
 
             # State Machine: IN_TRADE (Active Exit Monitoring)
             if state == "IN_TRADE":
@@ -1310,6 +1389,18 @@ def run_strategy():
                         log.warning(f"{exit_reason}: cannot verify broker position for {symbol} — deferring exit")
                         time.sleep(5)
                         continue
+
+                    # CRITICAL RMS ORDERING: Cancel the resting disaster stop order FIRST.
+                    # In Flattrade RMS, 100% of open quantity is locked to the resting
+                    # stop order. Placing a MARKET SELL before cancelling the stop gets
+                    # rejected with "Insufficient Quantity to Sell".
+                    if active_trade.get("disaster_oid"):
+                        _ok, _m = safe_cancel_order(active_trade["disaster_oid"],
+                                                    f"before exit {symbol}")
+                        (log.info if _ok else log.error)(
+                            "disaster stop cancel on %s: %s", exit_reason, _m)
+                        active_trade["disaster_oid"] = None
+
                     pre_exit_opt_ltp = fetch_option_ltp(symbol, opt_exchange, underlying_ltp=underlying_ltp)
                     if bq > 0:
                         order_resp = client.placeorder(
@@ -1350,13 +1441,6 @@ def run_strategy():
                     else:
                         log.warning(f"{exit_reason}: broker flat on {symbol} — no long to close; skipping SELL to avoid naked short")
 
-                    # Cancel the resting backstop BEFORE releasing the symbol.
-                    # Left alive after the position closes it is a naked short.
-                    if active_trade.get("disaster_oid"):
-                        _ok, _m = safe_cancel_order(active_trade["disaster_oid"],
-                                                    f"exit {symbol}")
-                        (log.info if _ok else log.error)(
-                            "disaster stop cancel on %s: %s", exit_reason, _m)
                     release_symbol_lock(symbol, STRATEGY_NAME)
 
                     # Judas is one-trade-per-day — after any exit, done for the day
@@ -1415,6 +1499,31 @@ def run_strategy():
                 # Emit a parseable status line so the live monitor panel shows values each scan
                 _swp = "SWEPT-HIGH" if sig["swept_high"] else "SWEPT-LOW" if sig["swept_low"] else "WAIT-SWEEP"
                 _arm = ("ARMED-" + sig["signal"]) if sig.get("signal") else "SCANNING"
+                _j_trades = []
+                if active_trade:
+                    _sym = active_trade.get("symbol", "")
+                    _dir = "CE" if _sym.upper().endswith("CE") else ("PE" if _sym.upper().endswith("PE") else "UNKNOWN")
+                    _j_trades = [{
+                        "symbol": _sym,
+                        "direction": _dir,
+                        "entry_price": float(active_trade.get("entry_spot") or 0.0) or None,
+                        "stop_loss": float(active_trade.get("sl_spot") or 0.0) or None,
+                        "target": float(active_trade.get("target_spot") or 0.0) or None,
+                        "current_price": float(sig.get("spot") or 0.0) or None,
+                        "type": _dir,
+                    }]
+                write_status(
+                    state,
+                    active_trades=_j_trades,
+                    indicators={
+                        "regime": str(_swp),
+                        "phase": str(_arm),
+                        "velocity": f"{sig['spot']:.2f}",
+                        "atr": f"{sig['or_low']:.1f}-{sig['or_high']:.1f}",
+                        "spot": float(sig.get("spot") or 0.0) if sig.get("spot") else None,
+                    },
+                    last_message=f"Regime: {_swp} | Phase: {_arm} | Velocity: {sig['spot']:.2f}"
+                )
                 log.info(
                     f"Regime: {_swp} | Phase: {_arm} | Velocity: {sig['spot']:.2f} | "
                     f"ATR: {sig['or_low']:.2f}-{sig['or_high']:.2f}"

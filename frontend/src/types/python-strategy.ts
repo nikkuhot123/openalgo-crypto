@@ -24,6 +24,15 @@ export interface PythonStrategy {
   lot_mode: 'manual' | 'auto'
   risk_pct_per_trade: number
   quantity?: number
+  /** The SCRIPT honours LOT_MODE / RISK_PCT_PER_TRADE. When false the UI must
+   *  not offer an auto-lot toggle or a Risk % input: renko_engine_strategy.py
+   *  sizes as `lot * MAX_LOTS` and ignores both, so the toggle used to persist
+   *  and display a mode that changed nothing. */
+  supports_auto_lots?: boolean
+  /** QUANTITY actually reaches the process. True only for systemd-managed units,
+   *  whose save path restarts the unit to apply it. Platform-managed launches
+   *  never inject QUANTITY, so the manual-quantity field is inert there. */
+  quantity_settable?: boolean
   managed_by?: string
 }
 

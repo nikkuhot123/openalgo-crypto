@@ -1,3 +1,24 @@
+## [2026-08-27] fix(adoption): peer-aware orphan adoption and RMS exit cancellation ordering
+
+Diagnosed and fixed two critical multi-strategy interaction bugs during live market trading:
+
+1. **Restart Orphan-Adoption Race**:
+   - When the service restarted while Judas held `NIFTY01SEP2624200CE`, both POV and Judas queried `positionbook`.
+   - POV booted a fraction of a second earlier, saw the open position in the positionbook, and jumped to the fallback branch (`Adopting unknown orphan`), claiming `NIFTY01SEP2624200CE.lock`.
+   - Judas booted right after, saw the lock held by POV, and logged `CONTRACT LOCKED: held by 'POV Wall-Squeeze'`.
+   - Added `is_position_claimed_by_peer(symbol, strategy_name)` across all 4 strategy files (`POV`, `Judas`, `Renko`, `PDH`).
+   - A strategy now inspects peer state files (`log/strategies/state/*.json`) and active peer locks before adopting any unknown position. If a peer legitimately owns the trade, it skips adoption cleanly.
+   - Cleared `pov_wall_squeeze_NIFTY.json` to `{}` and assigned contract lock ownership back to Judas.
+
+2. **Flattrade RMS Exit Cancellation Ordering**:
+   - In `judas_swing_strategy.py`, the exit sequence called `client.placeorder(SELL)` *before* cancelling the active `disaster_oid`.
+   - In Flattrade RMS, 100% of open quantity is locked to the resting stop-loss order. Sending a `MARKET SELL` prior to cancelling the resting stop triggered `RMS: Insufficient Quantity to Sell`.
+   - Reordered the exit sequence in `judas_swing_strategy.py` so `safe_cancel_order(disaster_oid)` is confirmed and executed *before* firing the market exit order (matching the pattern in POV and Renko).
+
+3. **Judas Lot Detection Retry Loop**:
+   - Added the startup retry wait loop (`while not detected and not _shutdown_requested`) to `judas_swing_strategy.py` matching Renko and PDH.
+
+Verified live: all positions are currently FLAT (0 open qty, 0 pending orders).
 ## [2026-08-26] review-remediation: unbreak merge=ours, untrack dist, guard served artifacts
 
 Following independent code review of `4c74a935e` (which rebuilt the SPA on the

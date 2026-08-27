@@ -291,6 +291,30 @@ STATE_DIR = Path("log") / "strategies" / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = STATE_DIR / f"pov_wall_squeeze_{UNDERLYING.upper()}.json"
 
+
+# ---- Live Monitor status sidecar -------------------------------------------
+STATUS_FILE = (
+    Path("log") / "strategies" / f"{os.getenv('STRATEGY_ID', STRATEGY_NAME)}_status.json"
+)
+
+
+def write_status(state, active_trades=None, indicators=None, last_message=None):
+    """Publish a status snapshot for the Live Monitor. Best-effort by design."""
+    try:
+        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "state": state,
+            "active_trades": active_trades or [],
+            "indicators": indicators or {},
+            "last_updated": datetime.now().isoformat(),
+            "last_log_message": last_message,
+        }
+        tmp = STATUS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(STATUS_FILE)
+    except Exception:
+        pass
+
 def persist_positions(positions):
     """Snapshot tracked positions to disk (called on every open/close)."""
     try:
@@ -321,6 +345,33 @@ def load_persisted_positions():
     except Exception as e:
         log.warning(f"load_persisted_positions failed: {e}")
     return {}
+
+
+def is_position_claimed_by_peer(symbol, my_strategy_name):
+    """Check if ANY peer strategy has claimed this symbol in its state file or holds its active lock."""
+    try:
+        # 1. Check lock file
+        lock_f = LOCKS_DIR / f"{symbol}.lock"
+        if lock_f.exists():
+            _owner, _ts, _pid = _read_lock(lock_f)
+            if _owner and _owner != my_strategy_name and not _lock_is_stale(_ts, _pid):
+                return True, f"lock held by '{_owner}' (pid {_pid})"
+        # 2. Check all state files in log/strategies/state/
+        state_dir = Path("log") / "strategies" / "state"
+        if state_dir.exists():
+            for sf in state_dir.glob("*.json"):
+                try:
+                    data = json.loads(sf.read_text())
+                    if isinstance(data, dict):
+                        if data.get("symbol") == symbol and not data.get("adopted"):
+                            return True, f"state file {sf.name}"
+                        if symbol in data and not (data[symbol] or {}).get("adopted"):
+                            return True, f"state file {sf.name}"
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False, None
 
 def reconcile_orphan_positions(underlying):
     """Check positionbook for open positions matching this underlying. Returns list of dicts."""
@@ -657,6 +708,9 @@ def compute_auto_lots(capital, risk_pct, max_loss_per_unit, lot_size, hard_cap_l
     if max_loss_per_lot <= 0:
         return 1
     auto_lots = int(risk_budget / max_loss_per_lot)
+    if auto_lots < 1:
+        log.warning("Risk budget Rs %.0f (%.1f%% of Rs %.0f) is below 1 lot max loss Rs %.0f -- taking 1 lot minimum floor",
+                    risk_budget, risk_pct, capital, max_loss_per_lot)
     return max(1, min(auto_lots, hard_cap_lots))
 
 def fetch_option_ltp(opt_symbol, opt_exchange, underlying_ltp=None, max_retries=3, retry_delay=1.0):
@@ -1000,6 +1054,7 @@ def _graceful_shutdown(signum, frame):
     else:
         log.info("No active positions — nothing to close.")
 
+    write_status("INACTIVE")
     log.info("Shutdown complete. Exiting.")
     sys.exit(0)
 
@@ -1093,6 +1148,10 @@ def run_strategy():
                 f"@ {pos.get('entry_opt_price')} | SL: {pos.get('sl_price')} | T1: {pos.get('target_price')}")
             positions[sym] = pos
         else:
+            is_claimed, peer_detail = is_position_claimed_by_peer(sym, STRATEGY_NAME)
+            if is_claimed:
+                log.info(f"Orphan {sym} is claimed by peer ({peer_detail}) — skipping adoption")
+                continue
             log.warning(f"Adopting unknown orphan (EOD-exit-only): {sym} qty={orphan['qty']} @ {orphan['entry_price']}")
             positions[sym] = {
                 "qty": orphan["qty"],
@@ -1102,7 +1161,7 @@ def run_strategy():
                 "entry_candle_fp": None,
                 "adopted": True,
             }
-        acquire_symbol_lock(sym, STRATEGY_NAME)
+            acquire_symbol_lock(sym, STRATEGY_NAME)
     # Rewrite snapshot to current reality (drops stale entries broker no longer holds)
     persist_positions(positions)
     sync_direction_locks(positions, STRATEGY_NAME, UNDERLYING)
@@ -1154,6 +1213,30 @@ def run_strategy():
             underlying_ltp = float(quotes_resp["data"]["ltp"])
             atm_strike = round(underlying_ltp / strike_gap) * strike_gap
             log.info(f"Underlying LTP: {underlying_ltp}, ATM Strike: {atm_strike}, Expiry: {expiry}")
+            # Publish sidecar for Live Monitor
+            _pov_trades = []
+            for _sym, _pos in positions.items():
+                _dir = "CE" if _sym.upper().endswith("CE") else ("PE" if _sym.upper().endswith("PE") else "UNKNOWN")
+                _pov_trades.append({
+                    "symbol": _sym,
+                    "direction": _dir,
+                    "entry_price": float(_pos.get("entry_opt_price") or 0.0) or None,
+                    "stop_loss": float(_pos.get("sl_price") or 0.0) or None,
+                    "target": float(_pos.get("target_price") or _pos.get("t1") or 0.0) or None,
+                    "current_price": float(_pos.get("live_ltp") or _pos.get("entry_opt_price") or 0.0) or None,
+                    "type": _dir,
+                })
+            _pov_st = "IN_TRADE" if positions else "IDLE"
+            write_status(
+                _pov_st,
+                active_trades=_pov_trades,
+                indicators={
+                    "regime": f"ATM {atm_strike}",
+                    "phase": "IN_TRADE" if positions else "SCANNING",
+                    "spot": float(underlying_ltp or 0.0) if underlying_ltp else None,
+                },
+                last_message=f"Underlying LTP: {underlying_ltp}, ATM Strike: {atm_strike}"
+            )
 
             # Define 6 option legs to track (ATM-2 to ATM+2)
             legs = [

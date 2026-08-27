@@ -534,6 +534,33 @@ def confirm_entry_fill(order_id, context="", retries=6, delay=0.7):
     return "unknown", None
 
 
+
+def is_position_claimed_by_peer(symbol, my_strategy_name):
+    """Check if ANY peer strategy has claimed this symbol in its state file or holds its active lock."""
+    try:
+        # 1. Check lock file
+        lock_f = LOCKS_DIR / f"{symbol}.lock"
+        if lock_f.exists():
+            _owner, _ts, _pid = _read_lock(lock_f)
+            if _owner and _owner != my_strategy_name and not _lock_is_stale(_ts, _pid):
+                return True, f"lock held by '{_owner}' (pid {_pid})"
+        # 2. Check all state files in log/strategies/state/
+        state_dir = Path("log") / "strategies" / "state"
+        if state_dir.exists():
+            for sf in state_dir.glob("*.json"):
+                try:
+                    data = json.loads(sf.read_text())
+                    if isinstance(data, dict):
+                        if data.get("symbol") == symbol and not data.get("adopted"):
+                            return True, f"state file {sf.name}"
+                        if symbol in data and not (data[symbol] or {}).get("adopted"):
+                            return True, f"state file {sf.name}"
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False, None
+
 def live_position_qty(symbol):
     """Quantity the broker actually holds for `symbol`. None when unverifiable --
     which is NOT the same as flat and must never be treated as flat."""
@@ -664,6 +691,30 @@ def hhmm(s):
     h, m = s.split(":")
     return int(h) * 60 + int(m)
 
+
+
+# ---- Live Monitor status sidecar -------------------------------------------
+STATUS_FILE = (
+    Path("log") / "strategies" / f"{os.getenv('STRATEGY_ID', STRATEGY_NAME)}_status.json"
+)
+
+
+def write_status(state, active_trades=None, indicators=None, last_message=None):
+    """Publish a status snapshot for the Live Monitor. Best-effort by design."""
+    try:
+        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "state": state,
+            "active_trades": active_trades or [],
+            "indicators": indicators or {},
+            "last_updated": datetime.now().isoformat(),
+            "last_log_message": last_message,
+        }
+        tmp = STATUS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(STATUS_FILE)
+    except Exception:
+        pass
 
 def append_shadow(row):
     """One CSV row per simulated round trip -- the record the pass condition
@@ -1219,6 +1270,7 @@ def main():
         if pos is not None:
             release_symbol_lock(pos["symbol"])
         release_direction_lock()
+    write_status("INACTIVE")
     log.info("Shutdown complete.")
     return 0
 

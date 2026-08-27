@@ -353,6 +353,30 @@ def release_direction_lock(underlying, strategy_name, side=None):
         pass
 
 
+
+# ---- Live Monitor status sidecar -------------------------------------------
+STATUS_FILE = (
+    Path("log") / "strategies" / f"{os.getenv('STRATEGY_ID', STRATEGY_NAME)}_status.json"
+)
+
+
+def write_status(state, active_trades=None, indicators=None, last_message=None):
+    """Publish a status snapshot for the Live Monitor. Best-effort by design."""
+    try:
+        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "state": state,
+            "active_trades": active_trades or [],
+            "indicators": indicators or {},
+            "last_updated": datetime.now().isoformat(),
+            "last_log_message": last_message,
+        }
+        tmp = STATUS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(STATUS_FILE)
+    except Exception:
+        pass
+
 def persist_state(trade, day):
     try:
         STATE_FILE.write_text(json.dumps({"trade": trade or {}, "day": day or {}}))
@@ -390,6 +414,33 @@ def mark_entry(day_state, day):
     day_state[str(day)] = used + 1
     return day_state
 
+
+
+def is_position_claimed_by_peer(symbol, my_strategy_name):
+    """Check if ANY peer strategy has claimed this symbol in its state file or holds its active lock."""
+    try:
+        # 1. Check lock file
+        lock_f = LOCKS_DIR / f"{symbol}.lock"
+        if lock_f.exists():
+            _owner, _ts, _pid = _read_lock(lock_f)
+            if _owner and _owner != my_strategy_name and not _lock_is_stale(_ts, _pid):
+                return True, f"lock held by '{_owner}' (pid {_pid})"
+        # 2. Check all state files in log/strategies/state/
+        state_dir = Path("log") / "strategies" / "state"
+        if state_dir.exists():
+            for sf in state_dir.glob("*.json"):
+                try:
+                    data = json.loads(sf.read_text())
+                    if isinstance(data, dict):
+                        if data.get("symbol") == symbol and not data.get("adopted"):
+                            return True, f"state file {sf.name}"
+                        if symbol in data and not (data[symbol] or {}).get("adopted"):
+                            return True, f"state file {sf.name}"
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False, None
 
 def reconcile_orphan_position(underlying):
     """Adopt an open broker position on this underlying after a restart."""
@@ -943,6 +994,7 @@ def _graceful_shutdown(signum, frame):
         if outcome == "sold":
             release_symbol_lock(symbol, STRATEGY_NAME)
             release_direction_lock(UNDERLYING, STRATEGY_NAME, (_active_trade or {}).get("side"))
+    write_status("INACTIVE")
     release_instance_lock(UNDERLYING, STRATEGY_NAME)
     sys.exit(0)
 
@@ -1080,6 +1132,19 @@ def _enter_position(side, reason, levels, df_1m, intraday=False):
         }
         _active_trade = trade
         persist_state(_active_trade, _day_state)
+        _e_dir = side or ("CE" if sym.upper().endswith("CE") else "PE")
+        _e_sp = float(entry_spot or 0.0)
+        _sl_sp = _e_sp * (1 - SL_FRAC) if _e_dir == "CE" else _e_sp * (1 + SL_FRAC)
+        _tgt_sp = _e_sp * (1 + TGT_FRAC) if _e_dir == "CE" else _e_sp * (1 - TGT_FRAC)
+        write_status("IN_TRADE", active_trades=[{
+            "symbol": sym,
+            "direction": _e_dir,
+            "entry_price": _e_sp or None,
+            "stop_loss": _sl_sp or None,
+            "target": _tgt_sp or None,
+            "current_price": _e_sp or None,
+            "type": _e_dir,
+        }], indicators={"phase": "CARRY", "regime": f"OVERNIGHT {UNDERLYING}"})
         log.info(
             "Phase: CARRY %s %s qty=%s fill=%.2f spot=%.1f SL@%.2f (%s)",
             side,
@@ -1113,6 +1178,8 @@ def _exit_position(reason):
         release_symbol_lock(sym, STRATEGY_NAME)
         release_direction_lock(UNDERLYING, STRATEGY_NAME, trade.get("side"))
         log.info("Phase: FLAT reason=%s qty=%s fill=%s", reason, qty, sell)
+        _pdh_after = "DONE" if not day_budget_left(_day_state, date.today()) else "IDLE"
+        write_status(_pdh_after, indicators={"phase": "FLAT", "regime": f"OVERNIGHT {UNDERLYING}"})
     else:
         log.warning("exit incomplete (%s) -> retry", outcome)
 
@@ -1163,9 +1230,14 @@ def run_strategy():
     if not _active_trade:
         adopted = reconcile_orphan_position(UNDERLYING)
         if adopted:
-            log.warning("adopting orphan: %s", adopted)
-            _active_trade = adopted
-            persist_state(_active_trade, _day_state)
+            is_claimed, peer_detail = is_position_claimed_by_peer(adopted["symbol"], STRATEGY_NAME)
+            if is_claimed:
+                log.info(f"Orphan {adopted['symbol']} is claimed by peer ({peer_detail}) — skipping adoption")
+                adopted = None
+            else:
+                log.warning("adopting orphan: %s", adopted)
+                _active_trade = adopted
+                persist_state(_active_trade, _day_state)
     if LOT_SIZE <= 0:
         LOT_SIZE = fetch_lot_size(UNDERLYING, _opt_exchange) or 0
     # The 09:10 schedule start lands before the exchange master answers, so a
@@ -1220,6 +1292,24 @@ def _overnight_tick(now):
     global _active_trade
     t = now.time()
     carry = _active_trade
+    # Publish sidecar for Live Monitor
+    if carry:
+        _c_dir = carry.get("side") or ("CE" if str(carry.get("symbol", "")).upper().endswith("CE") else "PE")
+        _e_spot = float(carry.get("entry_spot") or 0.0)
+        _sl_spot = _e_spot * (1 - SL_FRAC) if _c_dir == "CE" else _e_spot * (1 + SL_FRAC)
+        _tgt_spot = _e_spot * (1 + TGT_FRAC) if _c_dir == "CE" else _e_spot * (1 - TGT_FRAC)
+        write_status("IN_TRADE", active_trades=[{
+            "symbol": carry.get("symbol"),
+            "direction": _c_dir,
+            "entry_price": _e_spot or None,
+            "stop_loss": _sl_spot or None,
+            "target": _tgt_spot or None,
+            "current_price": None,
+            "type": _c_dir,
+        }], indicators={"phase": "CARRY", "regime": f"OVERNIGHT {UNDERLYING}"})
+    else:
+        _pdh_st = "DONE" if not day_budget_left(_day_state, now.date()) else "IDLE"
+        write_status(_pdh_st, indicators={"phase": _pdh_st, "regime": f"OVERNIGHT {UNDERLYING}"})
     if carry:
         spot = _latest_spot(fetch_minute_history(UNDERLYING, _index_exchange(UNDERLYING)))
         entry_day = carry.get("entry_day")

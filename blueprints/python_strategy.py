@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from datetime import date, datetime
+from functools import lru_cache
 from pathlib import Path
 from time import monotonic, sleep
 
@@ -97,6 +98,11 @@ def broadcast_status_update(strategy_id: str, status: str, message: str = None):
 # File paths - use Path for cross-platform compatibility
 STRATEGIES_DIR = Path("strategies") / "scripts"
 LOGS_DIR = Path("log") / "strategies"  # Using existing log folder
+# A status sidecar is returned VERBATIM to the Live Monitor, so a strategy that
+# was SIGKILLed mid-trade would keep drawing an armed position -- with stop and
+# target -- that no longer exists. A live strategy rewrites it every poll, so
+# anything older than this means nobody is home.
+STATUS_SIDECAR_MAX_AGE_SECS = int(os.getenv("STATUS_SIDECAR_MAX_AGE_SECS", "90"))
 CONFIG_FILE = Path("strategies") / "strategy_configs.json"
 
 def get_systemd_log_path(strategy_id):
@@ -2571,6 +2577,42 @@ def api_get_exchanges():
     return jsonify({"exchanges": exchanges, "default": DEFAULT_STRATEGY_EXCHANGE})
 
 
+@lru_cache(maxsize=256)
+def _script_supports_auto_lots(path_str, mtime):
+    """Does this strategy script actually honour LOT_MODE / RISK_PCT_PER_TRADE?
+
+    start_strategy_process() injects both into every strategy, but a script is
+    free to ignore them. renko_engine_strategy.py does exactly that: it sizes as
+    `lot * MAX_LOTS` and contains zero references to either name. The UI still
+    rendered a Manual/Auto toggle and a Risk % input for it, so flipping Renko to
+    "Auto" persisted, displayed, and changed nothing -- a real-money control that
+    misrepresented itself on 2 of 8 registrations.
+
+    Probing the source is deliberate: the capability lives in the script, so
+    asking the script is the only answer that cannot drift. Keyed on mtime so an
+    edited script is re-probed without an app restart.
+    """
+    try:
+        src = Path(path_str).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return False        # unreadable -> never offer a control we cannot verify
+    return "LOT_MODE" in src and "RISK_PCT_PER_TRADE" in src
+
+
+def _supports_auto_lots(config):
+    """True when the strategy file honours auto-lot sizing. False on any doubt."""
+    fp = config.get("file_path")
+    if not fp:
+        fn = config.get("file_name")
+        fp = str(STRATEGIES_DIR / fn) if fn else None
+    if not fp:
+        return False
+    try:
+        return _script_supports_auto_lots(str(fp), Path(fp).stat().st_mtime)
+    except OSError:
+        return False
+
+
 @python_strategy_bp.route("/api/strategies")
 @check_session_validity
 def api_get_strategies():
@@ -2618,6 +2660,19 @@ def api_get_strategies():
                 "lot_mode": config.get("lot_mode", "manual"),
                 "risk_pct_per_trade": config.get("risk_pct_per_trade", 1.0),
                 "quantity": config.get("quantity", 1),
+                # Whether the SCRIPT honours LOT_MODE/RISK_PCT_PER_TRADE. The UI
+                # must not offer an auto-lot toggle to a script that ignores it.
+                "supports_auto_lots": _supports_auto_lots(config),
+                # QUANTITY reaches a strategy only for systemd-managed units,
+                # whose save path restarts the unit to apply it (api_save_max_lots).
+                # start_strategy_process() does NOT inject QUANTITY, so on a
+                # platform-managed strategy the manual-quantity field is inert --
+                # and wiring it would be worse than useless: these scripts read
+                # QUANTITY as the LOT SIZE, not a lot count, so a value of 1 emits
+                # 1-unit orders the exchange rejects outright.
+                "quantity_settable": bool(
+                    str(config.get("managed_by") or "").startswith("systemd:")
+                ),
                 "managed_by": config.get("managed_by"),
             }
         )
@@ -2722,6 +2777,19 @@ def api_get_strategy(strategy_id):
                 "lot_mode": config.get("lot_mode", "manual"),
                 "risk_pct_per_trade": config.get("risk_pct_per_trade", 1.0),
                 "quantity": config.get("quantity", 1),
+                # Whether the SCRIPT honours LOT_MODE/RISK_PCT_PER_TRADE. The UI
+                # must not offer an auto-lot toggle to a script that ignores it.
+                "supports_auto_lots": _supports_auto_lots(config),
+                # QUANTITY reaches a strategy only for systemd-managed units,
+                # whose save path restarts the unit to apply it (api_save_max_lots).
+                # start_strategy_process() does NOT inject QUANTITY, so on a
+                # platform-managed strategy the manual-quantity field is inert --
+                # and wiring it would be worse than useless: these scripts read
+                # QUANTITY as the LOT SIZE, not a lot count, so a value of 1 emits
+                # 1-unit orders the exchange rejects outright.
+                "quantity_settable": bool(
+                    str(config.get("managed_by") or "").startswith("systemd:")
+                ),
                 "managed_by": config.get("managed_by"),
             }
         }
@@ -3154,12 +3222,21 @@ def api_get_strategy_status(strategy_id):
     sidecar_path = LOGS_DIR / f"{strategy_id}_status.json"
     if sidecar_path.exists():
         try:
-            with open(sidecar_path, "r", encoding="utf-8") as f:
-                sidecar_data = json.load(f)
-            sidecar_data["status"] = "success"
-            sidecar_data["strategy_id"] = strategy_id
-            sidecar_data["is_running"] = is_running
-            return jsonify(sidecar_data)
+            age = time.time() - sidecar_path.stat().st_mtime
+            if age <= STATUS_SIDECAR_MAX_AGE_SECS:
+                with open(sidecar_path, "r", encoding="utf-8") as f:
+                    sidecar_data = json.load(f)
+                sidecar_data["status"] = "success"
+                sidecar_data["strategy_id"] = strategy_id
+                sidecar_data["is_running"] = is_running
+                sidecar_data["source"] = "sidecar"
+                return jsonify(sidecar_data)
+            # Stale: the writer is gone. Showing its last armed snapshot would
+            # be a phantom position on a panel used to decide interventions.
+            logger.debug(
+                "status sidecar for %s is %.0fs stale (> %ss) -- parsing logs",
+                strategy_id, age, STATUS_SIDECAR_MAX_AGE_SECS,
+            )
         except Exception:
             pass  # Fall through to log parsing
 

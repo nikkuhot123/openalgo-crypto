@@ -547,6 +547,15 @@ export default function PythonStrategyIndex() {
                   </div>
 
                   {/* Lot Mode Toggle */}
+                  {/* Auto-lot sizing is only offered when the SCRIPT honours
+                      LOT_MODE/RISK_PCT_PER_TRADE. renko_engine_strategy.py sizes
+                      as lot * MAX_LOTS and ignores both, so the toggle used to
+                      persist and display a mode that changed nothing. */}
+                  {strategy.supports_auto_lots === false ? (
+                    <div className="text-[10px] px-2 py-1 rounded border border-amber-500/30 text-amber-700 dark:text-amber-400">
+                      Fixed lots — this strategy sizes by Max Lots only
+                    </div>
+                  ) : (
                   <div className="flex rounded-md overflow-hidden border border-amber-500/30 text-[10px]">
                     {(['manual', 'auto'] as const).map((mode) => (
                       <button
@@ -564,6 +573,7 @@ export default function PythonStrategyIndex() {
                       </button>
                     ))}
                   </div>
+                  )}
 
                   <div className="grid grid-cols-2 gap-2">
                     <div>
@@ -596,9 +606,16 @@ export default function PythonStrategyIndex() {
                         value={getSettings(strategy).riskPct}
                         onChange={(e) => handleSettingsChange(strategy.id, 'riskPct', e.target.value)}
                         onBlur={() => handleSettingsSave(strategy)}
-                        disabled={(strategy.status === 'running' && !strategy.managed_by?.startsWith('systemd:')) || getSettings(strategy).lotMode !== 'auto'}
+                        disabled={(strategy.status === 'running' && !strategy.managed_by?.startsWith('systemd:')) || getSettings(strategy).lotMode !== 'auto' || strategy.supports_auto_lots === false}
                       />
                     </div>
+                    {/* QUANTITY is injected only for systemd-managed units, whose
+                        save path restarts the unit to apply it. Platform-managed
+                        launches never inject it, so this field was inert -- and
+                        these scripts read QUANTITY as the LOT SIZE, not a lot
+                        count, so a value of 1 would emit 1-unit orders that the
+                        exchange rejects. Show it only where it works. */}
+                    {strategy.quantity_settable !== false && (
                     <div className="col-span-2">
                       <Label className={`text-[10px] ${getSettings(strategy).lotMode === 'manual' ? 'text-muted-foreground' : 'text-muted-foreground/40'}`}>
                         {strategy.exchange === 'CRYPTO'
@@ -613,9 +630,14 @@ export default function PythonStrategyIndex() {
                         value={getSettings(strategy).qty}
                         onChange={(e) => handleSettingsChange(strategy.id, 'qty', e.target.value)}
                         onBlur={() => handleSettingsSave(strategy)}
-                        disabled={getSettings(strategy).lotMode !== 'manual'}
+                        disabled={
+                          getSettings(strategy).lotMode !== 'manual' ||
+                          (strategy.status === 'running' &&
+                            !strategy.managed_by?.startsWith('systemd:'))
+                        }
                       />
                     </div>
+                    )}
                   </div>
                 </div>
 
